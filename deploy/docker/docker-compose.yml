@@ -1,0 +1,203 @@
+# Production example. From the checkout: docker compose -f deploy/docker/docker-compose.yml up -d
+# Supply the required values in a private --env-file; see docs/deployment.md.
+name: razbor-production
+
+services:
+  postgres:
+    image: ghcr.io/next-hat/razbor-postgres:${RAZBOR_IMAGE_TAG:-0.1.11}
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    environment:
+      POSTGRES_DB: razbor
+      POSTGRES_USER: razbor_bootstrap
+      POSTGRES_PASSWORD: ${RAZBOR_DB_BOOTSTRAP_PASSWORD:?Set bootstrap database password}
+      RAZBOR_DB_MIGRATION_PASSWORD: ${RAZBOR_DB_MIGRATION_PASSWORD:?Set migration database password}
+      RAZBOR_DB_RUNTIME_PASSWORD: ${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [database]
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U razbor_bootstrap -d razbor"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    image: ghcr.io/next-hat/razbor-migrate:${RAZBOR_IMAGE_TAG:-0.1.11}
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 128
+    environment:
+      RAZBOR_MIGRATION_DATABASE_URL: postgresql://razbor_migrator:${RAZBOR_DB_MIGRATION_PASSWORD:?Set migration database password}@postgres:5432/razbor
+    networks: [database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  embeddings:
+    image: ghcr.io/next-hat/razbor-embeddings:${RAZBOR_IMAGE_TAG:-0.1.11}
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 128
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=256m"]
+    environment:
+      EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:?Set the embedding service token}
+      EMBEDDINGS_CPU_THREADS: "2"
+    healthcheck:
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).close()",
+        ]
+      interval: 5s
+      timeout: 4s
+      start_period: 30s
+      retries: 12
+    networks: [embeddings]
+
+  indexer:
+    image: ghcr.io/next-hat/razbor-indexer:${RAZBOR_IMAGE_TAG:-0.1.11}
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 45s
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 2g
+    cpus: 2
+    pids_limit: 256
+    volumes:
+      - ${RAZBOR_INDEX_CONFIG:-../../config/indexer.example.toml}:/index-config/indexer.toml:ro
+      - index_data:/index-data
+    environment:
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+      RAZBOR_INDEX_MANAGEMENT_TOKEN: ${RAZBOR_INDEX_MANAGEMENT_TOKEN:?Set the index management token}
+      RAZBOR_EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:?Set the embedding service token}
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:8790/health', {headers: {authorization: 'Bearer ' + process.env.RAZBOR_INDEX_MANAGEMENT_TOKEN}}).then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 12
+    networks: [control, database, embeddings]
+    depends_on:
+      embeddings:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  web:
+    image: ghcr.io/next-hat/razbor-web:${RAZBOR_WEB_IMAGE_TAG:-${RAZBOR_IMAGE_TAG:-0.1.12}}
+    restart: unless-stopped
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 1g
+    cpus: 2
+    pids_limit: 256
+    ports: ["127.0.0.1:${RAZBOR_WEB_PORT:-3000}:3000"]
+    environment:
+      RAZBOR_ADMIN_USERNAME: ${RAZBOR_ADMIN_USERNAME:-admin}
+      RAZBOR_ADMIN_PASSWORD: ${RAZBOR_ADMIN_PASSWORD:?Set a bootstrap administrator password of at least 12 characters}
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+      RAZBOR_INDEX_OWNER: local-indexer
+      RAZBOR_INDEX_ENDPOINT: http://indexer:8790
+      RAZBOR_INDEX_MANAGEMENT_TOKEN: ${RAZBOR_INDEX_MANAGEMENT_TOKEN:?Set the index management token}
+      RAZBOR_WEBHOOK_CALLBACK_BASE: ${RAZBOR_PUBLIC_URL:?Set the public HTTPS origin}
+      REVIEW_QUEUE: reviews
+    healthcheck:
+      test:
+        [
+          CMD,
+          node,
+          -e,
+          "fetch('http://127.0.0.1:3000/api/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 12
+    networks:
+      control: {}
+      database: {}
+      runner_control:
+        ipv4_address: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.251}.6
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      indexer:
+        condition: service_healthy
+
+  # Create a runner in the UI, then start this optional profile with its token.
+  runner:
+    image: ghcr.io/next-hat/razbor-runner:${RAZBOR_IMAGE_TAG:-0.1.11}
+    profiles: [runner]
+    restart: unless-stopped
+    runtime: kata
+    privileged: false
+    cap_add: [ALL]
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - writable-cgroups=true
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.default.forwarding: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    mem_limit: 6g
+    memswap_limit: 6g
+    cpus: 4
+    pids_limit: 2048
+    tmpfs:
+      - /var/lib/docker:rw,nosuid,size=4g
+    command: [--url, http://web:3000, --allow-http]
+    init: true
+    stop_grace_period: 45s
+    volumes:
+      - runner_data:/job-data
+      - ${RAZBOR_RUNNER_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}:/etc/resolv.conf:ro
+    extra_hosts:
+      web: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.251}.6
+    environment:
+      RAZBOR_RUNNER_ENROLLMENT_TOKEN: ${RAZBOR_RUNNER_ENROLLMENT_TOKEN:-}
+    networks:
+      control: {}
+      runner_control:
+        ipv4_address: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.251}.5
+    depends_on:
+      web:
+        condition: service_healthy
+
+networks:
+  embeddings:
+    internal: true
+  database:
+    internal: true
+  control: {}
+  runner_control:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.251}.0/24
+
+volumes:
+  postgres_data: {}
+  index_data: {}
+  runner_data: {}

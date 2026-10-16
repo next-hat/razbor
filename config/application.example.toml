@@ -1,0 +1,58 @@
+[registry]
+key = "application"
+
+[forges.github]
+type = "github"
+api_url = "https://api.github.com"
+web_url = "https://github.com"
+credential = { env = "RAZBOR_GITHUB_TOKEN" }
+
+[forges.gitlab]
+type = "gitlab"
+api_url = "https://gitlab.example.com/api/v4"
+web_url = "https://gitlab.example.com"
+credential = { env = "RAZBOR_GITLAB_TOKEN" }
+
+[forges.forgejo]
+type = "forgejo"
+api_url = "https://forgejo.example.com/api/v1"
+web_url = "https://forgejo.example.com"
+credential = { file = "/forge-secrets/razbor.forgejo.token" }
+
+# Plain Git remains supported without a hosted forge binding.
+[repositories.razbor.indexing]
+owner = "local-indexer"
+persistent = true
+
+[repositories.razbor.git]
+branch = "master"
+upstream = "refs/remotes/origin/master"
+remotes = { origin = "https://example.com/team/razbor.git" }
+
+[repositories.github-example]
+forge = "github"
+selector = "example/project"
+indexing = { owner = "local-indexer", persistent = false }
+[repositories.github-example.git]
+branch = "main"
+upstream = "refs/remotes/origin/main"
+remotes = { origin = "https://github.com/example/project.git" }
+
+[repositories.gitlab-example]
+forge = "gitlab"
+selector = "team/subgroup/project"
+indexing = { owner = "local-indexer", persistent = false }
+[repositories.gitlab-example.git]
+branch = "main"
+upstream = "refs/remotes/origin/main"
+remotes = { origin = "https://gitlab.example.com/team/subgroup/project.git" }
+
+[repositories.forgejo-example]
+forge = "forgejo"
+selector = "team/project"
+indexing = { owner = "local-indexer", persistent = false }
+[repositories.forgejo-example.git]
+branch = "main"
+upstream = "refs/remotes/origin/main"
+remotes = { origin = "https://forgejo.example.com/team/project.git" }
+credentials = { kind = "https", username = "razbor", token_file = "/forge-secrets/razbor.forgejo.token" }

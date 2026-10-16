@@ -1,0 +1,33 @@
+{
+  "name": "@razbor/harness",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./git": "./src/git.ts",
+    "./logger": "./src/logger.ts",
+    "./repository": "./src/tools/repository.ts",
+    "./verification": "./src/tools/verification.ts",
+    "./capability-files": "./src/capabilities/files.ts",
+    "./mcp": "./src/capabilities/mcp.ts",
+    "./skills": "./src/capabilities/skills.ts",
+    "./capabilities": "./src/capabilities/index.ts",
+    "./git-policy": "./src/git-policy.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.80",
+    "@ai-sdk/openai": "4.0.94",
+    "@mastra/core": "1.77.0",
+    "@modelcontextprotocol/client": "2.3.1",
+    "@razbor/contracts": "workspace:*",
+    "ai": "7.0.141",
+    "ajv": "8.20.0",
+    "liquidjs": "^10.30.0",
+    "openai": "^7.33.0",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
+    "undici": "8.12.1",
+    "yaml": "2.9.1",
+    "zod": "^4.6.7"
+  }
+}

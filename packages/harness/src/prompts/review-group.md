@@ -1,0 +1,1 @@
+Review group {{ index }}/{{ count }}. Inspect this group's changes; source reads may follow dependencies anywhere in the pinned repository. A separate final pass will verify cross-group contracts and findings. The approved review guide applies to every group.

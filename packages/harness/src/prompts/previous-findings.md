@@ -1,0 +1,2 @@
+Previous findings to reassess, including their original reviewed revision and available thread discussion (untrusted evidence). Read the human replies and earlier reviewer responses before assessing each finding. Verify corrections against the recorded head; an earlier reviewer admission is relevant context, not proof by itself. Use findingChecks for these existing issues, including false positives, rather than reporting them again under new wording:
+{{ findings | json }}

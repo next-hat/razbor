@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "paths": {
+      "@web/*": ["./apps/web/*"],
+      "@agent/*": ["./apps/agent/*"],
+      "@harness/*": ["./packages/harness/*"],
+      "@contracts/*": ["./packages/contracts/*"],
+      "@runner/*": ["./apps/runner/*"],
+      "@queue/*": ["./packages/queue/*"],
+      "@indexer/*": ["./apps/indexer/*"],
+      "@tests/*": ["./tests/*"],
+      "@database/*": ["./packages/database/*"],
+      "@forge-adapters/*": ["./packages/forge-adapters/*"]
+    },
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "jsx": "preserve"
+  }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "@razbor/database",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./ids": "./src/ids.ts",
+    "./schema": "./src/schema.ts",
+    "./migrate": "./src/migrate.ts",
+    "./embeddings": "./src/embeddings.ts",
+    "./registry": "./src/registry.ts",
+    "./legacy": "./src/legacy.ts",
+    "./secrets": "./src/secrets.ts",
+    "./github-apps": "./src/github-apps.ts",
+    "./repository-lifecycle": "./src/repository-lifecycle.ts",
+    "./memory": "./src/memory.ts",
+    "./skills": "./src/skills.ts",
+    "./mcp": "./src/mcp.ts"
+  },
+  "dependencies": {
+    "zod": "^4.6.7",
+    "@razbor/contracts": "workspace:*",
+    "@razbor/harness": "workspace:*",
+    "@razbor/forge-adapters": "workspace:*",
+    "drizzle-orm": "0.45.4",
+    "pg": "8.23.1",
+    "pg-boss": "12.37.1",
+    "nanoid": "6.0.2",
+    "smol-toml": "^1.9.1"
+  }
+}

@@ -1,0 +1,90 @@
+{
+  "name": "razbor",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "description": "A minimal local Git repository review service.",
+  "type": "module",
+  "scripts": {
+    "dev:web": "pnpm --filter @razbor/web dev",
+    "agent": "node --import=tsx apps/agent/src/index.ts",
+    "evaluate": "node --import=tsx scripts/evaluate.ts",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p apps/web/tsconfig.json",
+    "runner": "node --import=tsx apps/runner/src/index.ts",
+    "dev:runner": "node --import=tsx apps/runner/src/dev.ts",
+    "submit": "node --import=tsx scripts/submit.ts",
+    "indexer": "node --import=tsx apps/indexer/src/index.ts",
+    "test:diff": "node --import=tsx --test tests/packages/harness/progressive-diff.spec.ts",
+    "test:verification": "node --import=tsx --test tests/packages/harness/verification.spec.ts",
+    "test:capabilities": "node --import=tsx --test tests/packages/harness/capabilities.spec.ts tests/apps/runner/capabilities.spec.ts",
+    "test:indexer": "node --import=tsx --test tests/apps/indexer/integration.spec.ts",
+    "smoke:capabilities": "node --import=tsx --test tests/apps/runner/capability-smoke.spec.ts",
+    "test": "pnpm run test:capabilities",
+    "test:coverage": "c8 pnpm test",
+    "manage": "node --import=tsx scripts/manage.ts",
+    "db:migrate": "node --import=tsx scripts/manage.ts database migrate",
+    "db:migrate:embeddings": "node --import=tsx scripts/manage.ts database migrate-embeddings",
+    "test:persistence:unit": "node --import=tsx --test tests/packages/database/identifiers.spec.ts tests/packages/forge-adapters/providers.spec.ts",
+    "test:persistence": "node --import=tsx --test tests/packages/database/integration.spec.ts",
+    "test:comments": "node --import=tsx --test tests/packages/database/comment-flow.spec.ts",
+    "test:presentation": "TSX_TSCONFIG_PATH=tests/apps/web/tsconfig.json node --import=tsx --test tests/packages/contracts/presentation.spec.ts tests/packages/forge-adapters/presentation.spec.ts tests/apps/web/presentation.spec.ts"
+  },
+  "dependencies": {
+    "ajv": "8.20.0",
+    "dockerode": "^5.0.1",
+    "openai": "^7.33.0",
+    "pino": "^10.4.0",
+    "pino-pretty": "^13.2.0",
+    "smol-toml": "^1.9.1",
+    "tsx": "^4.23.15",
+    "zod": "^4.6.7",
+    "@razbor/contracts": "workspace:*",
+    "@razbor/database": "workspace:*",
+    "@razbor/harness": "workspace:*",
+    "@razbor/indexer": "workspace:*",
+    "@razbor/runner": "workspace:*"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@modelcontextprotocol/server": "2.3.1",
+    "@next/eslint-plugin-next": "^16.4.1",
+    "@types/dockerode": "^4.0.2",
+    "@types/node": "^24.19.2",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "c8": "^12.0.0",
+    "eslint": "^10.12.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.13.0",
+    "next": "^16.4.1",
+    "prettier": "^3.9.10",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.71.2",
+    "@razbor/forge-adapters": "workspace:*",
+    "@razbor/queue": "workspace:*",
+    "@razbor/web": "workspace:*"
+  },
+  "c8": {
+    "all": true,
+    "include": [
+      "apps/**/*.{ts,tsx}",
+      "packages/**/*.{ts,tsx}",
+      "scripts/**/*.ts"
+    ],
+    "exclude": [
+      "**/*.d.ts",
+      "**/.next/**"
+    ],
+    "reporter": [
+      "lcovonly",
+      "text-summary"
+    ],
+    "reports-dir": "coverage"
+  },
+  "packageManager": "pnpm@12.11.2"
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@razbor/runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./capabilities": "./src/capabilities.ts",
+    "./config": "./src/config.ts",
+    "./relay": "./src/relay.ts"
+  },
+  "dependencies": {
+    "@razbor/agent": "workspace:*",
+    "@razbor/contracts": "workspace:*",
+    "@razbor/harness": "workspace:*",
+    "dockerode": "^5.0.1",
+    "smol-toml": "^1.9.1",
+    "tsx": "^4.23.15",
+    "undici": "8.12.1",
+    "zod": "^4.6.7"
+  }
+}

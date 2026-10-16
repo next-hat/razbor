@@ -1,0 +1,61 @@
+# Apply after creating a runner in https://razbor.next-hat.com/runners.
+# Requires Kata, registry.ghcr.io and /run/systemd/resolve/resolv.conf on this host.
+# The runner keeps its enrolled identity and attempts in a named Docker volume.
+ApiVersion: v0.18
+Namespace: global
+Group: razbor-runner
+
+Metadata:
+  Name: Razbor runner
+  About: An enrolled runner with a nested Docker daemon inside a Kata VM.
+
+Args:
+  - Name: enrollment-token
+    Kind: String
+    Required: false
+    Default: ""
+    Description: One-time token required for initial enrollment; omit for an enrolled runner.
+
+Secrets:
+  - Name: razbor-runner.enrollment
+    Kind: nanocl.io/env
+    Data:
+      - 'RAZBOR_RUNNER_ENROLLMENT_TOKEN=${{ Args["enrollment-token"] }}'
+
+Cargoes:
+  - Name: razbor-runner
+    Replicas: 1
+    Hostname: razbor-runner
+    Containers:
+      - Name: runner
+        Image: ghcr.io/next-hat/razbor-runner:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-runner.enrollment]
+        Cmd: [--url, "https://razbor.next-hat.com"]
+        StopTimeout: 45
+        HostConfig:
+          Init: true
+          Runtime: kata
+          Privileged: false
+          CapAdd: [ALL]
+          SecurityOpt:
+            - seccomp=unconfined
+            - apparmor=unconfined
+            - writable-cgroups=true
+          Sysctls:
+            net.ipv4.ip_forward: "1"
+            net.ipv6.conf.default.forwarding: "1"
+            net.ipv6.conf.all.forwarding: "1"
+          # Only the nested daemon uses this socket; the host socket is not mounted.
+          Binds:
+            - razbor-runner-data:/job-data
+            # Kata needs upstream DNS addresses, not a host-loopback resolver.
+            - /run/systemd/resolve/resolv.conf:/etc/resolv.conf:ro
+          Tmpfs: { /var/lib/docker: "rw,nosuid,size=4g" }
+          Memory: 6442450944
+          MemorySwap: 6442450944
+          NanoCpus: 4000000000
+          PidsLimit: 2048
+          LogConfig:
+            Type: json-file
+            Config: { max-size: 10m, max-file: "3" }

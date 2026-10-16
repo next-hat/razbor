@@ -1,0 +1,5 @@
+torch==2.14.1
+# CodeSage imports Conv1D from modeling_utils, removed in Transformers 4.56.
+transformers==4.55.4
+# Transformers 4.55 requires huggingface-hub below 1.0.
+huggingface-hub==0.36.2

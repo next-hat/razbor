@@ -1,0 +1,257 @@
+# Public template. Replace __...__ values in a private copy before applying.
+# Requires Nanocl 0.18.1, Docker 28+, ncproxy 0.15.1+, registry.ghcr.io and cert.next-hat.com.
+ApiVersion: v0.18
+Namespace: global
+Group: razbor-platform
+
+Metadata:
+  Name: Razbor platform
+  About: PostgreSQL, migrations, embeddings, indexer and web UI on one Nanocl node.
+
+# Use independent credentials for bootstrap, migrations and runtime access.
+# Runtime containers never receive bootstrap or migration credentials.
+Secrets:
+  - Name: razbor-platform.postgres
+    Kind: nanocl.io/env
+    Data:
+      - POSTGRES_DB=razbor
+      - POSTGRES_USER=razbor_bootstrap
+      - POSTGRES_PASSWORD=__DB_BOOTSTRAP_PASSWORD__
+      - RAZBOR_DB_MIGRATION_PASSWORD=__DB_MIGRATION_PASSWORD__
+      - RAZBOR_DB_RUNTIME_PASSWORD=__DB_RUNTIME_PASSWORD__
+  - Name: razbor-platform.migrations
+    Kind: nanocl.io/env
+    Data:
+      - RAZBOR_MIGRATION_DATABASE_URL=postgresql://razbor_migrator:__DB_MIGRATION_PASSWORD__@razbor-postgres:5432/razbor
+  - Name: razbor-platform.web
+    Kind: nanocl.io/env
+    Data:
+      - RAZBOR_DATABASE_URL=postgresql://razbor_runtime:__DB_RUNTIME_PASSWORD__@razbor-postgres:5432/razbor
+      - RAZBOR_ADMIN_USERNAME=admin
+      - RAZBOR_ADMIN_PASSWORD=__ADMIN_PASSWORD__
+      - RAZBOR_INDEX_MANAGEMENT_TOKEN=__INDEX_MANAGEMENT_TOKEN__
+  - Name: razbor-platform.indexer
+    Kind: nanocl.io/env
+    Data:
+      - RAZBOR_DATABASE_URL=postgresql://razbor_runtime:__DB_RUNTIME_PASSWORD__@razbor-postgres:5432/razbor
+      - RAZBOR_INDEX_MANAGEMENT_TOKEN=__INDEX_MANAGEMENT_TOKEN__
+      - RAZBOR_EMBEDDINGS_TOKEN=__EMBEDDINGS_TOKEN__
+  - Name: razbor-platform.embeddings
+    Kind: nanocl.io/env
+    Data:
+      - EMBEDDINGS_TOKEN=__EMBEDDINGS_TOKEN__
+
+# Nanocl starts Cargoes in declaration order. InitContainers gate application
+# startup; these are not Jobs, which state apply starts without awaiting success.
+Cargoes:
+  - Name: razbor-postgres
+    Replicas: 1
+    NetworkMode: razbor-platform
+    Hostname: razbor-postgres
+    Containers:
+      - Name: postgres
+        Image: ghcr.io/next-hat/razbor-postgres:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-platform.postgres]
+        StopTimeout: 45
+        Healthcheck:
+          Test: [CMD-SHELL, "pg_isready -U razbor_bootstrap -d razbor"]
+          Interval: 5000000000
+          Timeout: 3000000000
+          StartPeriod: 10000000000
+          Retries: 12
+        HostConfig:
+          Binds: ["razbor_postgres_data:/var/lib/postgresql/data"]
+          Memory: 2147483648
+          NanoCpus: 2000000000
+          PidsLimit: 256
+          LogConfig:
+            Type: json-file
+            Config: { max-size: 10m, max-file: "3" }
+
+  - Name: razbor-embeddings
+    Replicas: 1
+    NetworkMode: razbor-platform
+    Hostname: razbor-embeddings
+    Containers:
+      - Name: embeddings
+        Image: ghcr.io/next-hat/razbor-embeddings:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-platform.embeddings]
+        Env: [EMBEDDINGS_CPU_THREADS=4]
+        Healthcheck:
+          Test:
+            - CMD
+            - python
+            - -c
+            - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).close()"
+          Interval: 5000000000
+          Timeout: 4000000000
+          StartPeriod: 30000000000
+          Retries: 12
+        HostConfig:
+          Init: true
+          ReadonlyRootfs: true
+          CapDrop: [ALL]
+          SecurityOpt: [no-new-privileges:true]
+          Tmpfs: { /tmp: "rw,nosuid,noexec,size=256m" }
+          Memory: 4294967296
+          NanoCpus: 4000000000
+          PidsLimit: 128
+          LogConfig:
+            Type: json-file
+            Config: { max-size: 10m, max-file: "3" }
+
+  - Name: razbor-web
+    Replicas: 1
+    NetworkMode: razbor-platform
+    Hostname: razbor-web
+    InitContainers:
+      - Name: migrate
+        Image: ghcr.io/next-hat/razbor-migrate:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-platform.migrations]
+        HostConfig:
+          CapDrop: [ALL]
+          SecurityOpt: [no-new-privileges:true]
+          Memory: 536870912
+          NanoCpus: 1000000000
+          PidsLimit: 128
+    Containers:
+      - Name: web
+        Image: ghcr.io/next-hat/razbor-web:0.1.12
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-platform.web]
+        Env:
+          - NODE_ENV=production
+          - HOSTNAME=0.0.0.0
+          - PORT=3000
+          - RAZBOR_INDEX_OWNER=production-indexer
+          - RAZBOR_INDEX_ENDPOINT=http://razbor-indexer:8790
+          - RAZBOR_WEBHOOK_CALLBACK_BASE=https://razbor.next-hat.com
+          - REVIEW_QUEUE=reviews
+        Healthcheck:
+          Test:
+            - CMD
+            - node
+            - -e
+            - "fetch('http://127.0.0.1:3000/api/health', {signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+          Interval: 10000000000
+          Timeout: 5000000000
+          StartPeriod: 30000000000
+          Retries: 6
+        HostConfig:
+          Init: true
+          CapDrop: [ALL]
+          SecurityOpt: [no-new-privileges:true]
+          Memory: 1073741824
+          NanoCpus: 2000000000
+          PidsLimit: 256
+          LogConfig:
+            Type: json-file
+            Config: { max-size: 10m, max-file: "3" }
+
+  - Name: razbor-indexer
+    Replicas: 1
+    NetworkMode: razbor-platform
+    Hostname: razbor-indexer
+    InitContainers:
+      - Name: configure
+        Image: ghcr.io/next-hat/razbor-migrate:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        User: "0:0"
+        Entrypoint: [node, --input-type=module, -e]
+        Cmd:
+          - |
+            import { mkdirSync, writeFileSync, chmodSync, chownSync } from 'node:fs';
+            mkdirSync('/index-config', { recursive: true });
+            mkdirSync('/index-data', { recursive: true });
+            writeFileSync('/index-config/indexer.toml', `[service]
+            owner = "production-indexer"
+            host = "0.0.0.0"
+            port = 8790
+            data_root = "/index-data"
+            management_token = { env = "RAZBOR_INDEX_MANAGEMENT_TOKEN" }
+            sync_ms = 60000
+            max_reviews = 8
+
+            [memory]
+            executable = "/cbm/codebase-memory-mcp"
+            mode = "full"
+            startup_ms = 15000
+            index_ms = 300000
+            query_ms = 15000
+            tool_output_bytes = 32768
+
+            [embeddings]
+            endpoint = "http://razbor-embeddings:8090"
+            token = { env = "RAZBOR_EMBEDDINGS_TOKEN" }
+            request_ms = 60000
+            index_ms = 3600000
+            max_chunks = 20000
+            `);
+            chmodSync('/index-config/indexer.toml', 0o644);
+            chownSync('/index-data', 1000, 1000);
+        HostConfig:
+          Binds:
+            - razbor_index_config:/index-config
+            - razbor_index_data:/index-data
+          CapDrop: [ALL]
+          CapAdd: [CHOWN]
+          SecurityOpt: [no-new-privileges:true]
+          Memory: 268435456
+          NanoCpus: 1000000000
+          PidsLimit: 64
+      - Name: wait-schema
+        Image: ghcr.io/next-hat/razbor-migrate:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-platform.migrations]
+        Cmd: [--wait-schema]
+        HostConfig:
+          CapDrop: [ALL]
+          SecurityOpt: [no-new-privileges:true]
+          Memory: 536870912
+          NanoCpus: 1000000000
+          PidsLimit: 128
+    Containers:
+      - Name: indexer
+        Image: ghcr.io/next-hat/razbor-indexer:0.1.11
+        ImagePullSecret: registry.ghcr.io
+        Secrets: [razbor-platform.indexer]
+        Cmd: [--config, /index-config/indexer.toml]
+        StopTimeout: 45
+        HostConfig:
+          Init: true
+          Binds:
+            - razbor_index_config:/index-config:ro
+            - razbor_index_data:/index-data
+          CapDrop: [ALL]
+          SecurityOpt: [no-new-privileges:true]
+          Memory: 2147483648
+          NanoCpus: 2000000000
+          PidsLimit: 256
+          LogConfig:
+            Type: json-file
+            Config: { max-size: 10m, max-file: "3" }
+
+Resources:
+  - Name: razbor.next-hat.com
+    Kind: ncproxy.io/rule
+    Data:
+      Rules:
+        - Domain: razbor.next-hat.com
+          Network: Public
+          Ssl: cert.next-hat.com
+          Locations:
+            - Path: /
+              Version: 1.1
+              ClientMaxBodySize: 10m
+              RequestBuffering: false
+              ResponseBuffering: false
+              Cache: false
+              ReadTimeout: 3600s
+              SendTimeout: 3600s
+              ConnectTimeout: 5s
+              Target:
+                Key: global.razbor-web.c
+                Port: 3000

@@ -1,0 +1,11 @@
+{
+  "name": "@razbor/agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@razbor/contracts": "workspace:*",
+    "@razbor/harness": "workspace:*",
+    "tsx": "^4.23.15"
+  }
+}

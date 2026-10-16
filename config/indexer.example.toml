@@ -1,0 +1,26 @@
+[service]
+owner = "local-indexer"
+host = "0.0.0.0"
+port = 8790
+data_root = "/index-data"
+management_token = { env = "RAZBOR_INDEX_MANAGEMENT_TOKEN" }
+sync_ms = 60000
+max_reviews = 8
+
+[memory]
+executable = "/cbm/codebase-memory-mcp"
+mode = "full"
+startup_ms = 15000
+index_ms = 90000
+query_ms = 15000
+tool_output_bytes = 32768
+
+# Compose provisions the model and database extension automatically.
+[embeddings]
+endpoint = "http://embeddings:8090"
+token = { env = "RAZBOR_EMBEDDINGS_TOKEN" }
+request_ms = 60000
+index_ms = 600000
+max_chunks = 20000
+
+# Repository policies and access tokens live in PostgreSQL and are managed in the UI.

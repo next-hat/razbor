@@ -1,0 +1,10 @@
+node_modules
+.next
+.git
+.env*
+job-data
+results
+coverage
+
+# pnpm owns the generated lockfile formatting.
+pnpm-lock.yaml

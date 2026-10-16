@@ -1,0 +1,336 @@
+name: razbor
+
+services:
+  embedding-model:
+    image: razbor-embeddings:local
+    build:
+      context: .
+      dockerfile: docker/embeddings.dev.Dockerfile
+    command: provision
+    init: true
+    volumes:
+      - razbor_embedding_models:/models
+    networks: [control]
+
+  embeddings:
+    image: razbor-embeddings:local
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 4g
+    cpus: 2
+    pids_limit: 128
+    tmpfs: ["/tmp:rw,nosuid,noexec,size=256m"]
+    volumes:
+      - razbor_embedding_models:/models:ro
+    environment:
+      EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:?Set the embedding service token in .env}
+      EMBEDDINGS_CPU_THREADS: "2"
+    healthcheck:
+      test:
+        [
+          CMD,
+          python,
+          -c,
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=3).close()",
+        ]
+      interval: 5s
+      timeout: 4s
+      start_period: 30s
+      retries: 12
+    networks: [embeddings]
+    depends_on:
+      embedding-model:
+        condition: service_completed_successfully
+
+  dependencies:
+    image: node:24-bookworm
+    working_dir: /workspace
+    command: node scripts/install-dependencies.mjs
+    volumes:
+      - .:/workspace
+      - razbor_node_modules:/workspace/node_modules
+      - razbor_web_node_modules:/workspace/apps/web/node_modules
+
+  web:
+    image: node:24-bookworm
+    working_dir: /workspace/apps/web
+    command: node /workspace/node_modules/next/dist/bin/next dev --webpack --hostname 0.0.0.0
+    ports: ["127.0.0.1:${RAZBOR_WEB_PORT:-3000}:3000"]
+    volumes:
+      - ${RAZBOR_FORGEJO_TOKEN_FILE:-./config/razbor.forgejo.token}:/forge-secrets/razbor.forgejo.token:ro
+      - ${RAZBOR_WEBHOOK_SECRET_FILE:-./config/razbor.webhook.secret}:/forge-secrets/razbor.webhook.secret:ro
+      - .:/workspace
+      - razbor_node_modules:/workspace/node_modules:ro
+      - razbor_web_node_modules:/workspace/apps/web/node_modules:ro
+      - razbor_next:/workspace/apps/web/.next
+      - ${RAZBOR_CONFIG_FILE:-./config/razbor.example.toml}:/razbor-config/config.toml:ro
+    environment:
+      NODE_ENV: development
+      RAZBOR_ADMIN_USERNAME: ${RAZBOR_ADMIN_USERNAME:-admin}
+      RAZBOR_ADMIN_PASSWORD: ${RAZBOR_ADMIN_PASSWORD:-admin}
+      RAZBOR_CONFIG_FILE: /razbor-config/config.toml
+      RAZBOR_OIDC_CLIENT_SECRET: ${RAZBOR_OIDC_CLIENT_SECRET:-}
+      RAZBOR_OIDC_TRANSACTION_SECRET: ${RAZBOR_OIDC_TRANSACTION_SECRET:-}
+      RAZBOR_INDEX_OWNER: ${RAZBOR_INDEX_OWNER:-local-indexer}
+      RAZBOR_WEBHOOK_CALLBACK_BASE: ${RAZBOR_WEBHOOK_CALLBACK_BASE:-}
+      RAZBOR_INDEX_ENDPOINT: http://indexer:8790
+      RAZBOR_INDEX_MANAGEMENT_TOKEN: ${RAZBOR_INDEX_MANAGEMENT_TOKEN:-}
+      REVIEW_QUEUE: reviews
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+    networks:
+      control: {}
+      database: {}
+      runner_control:
+        ipv4_address: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.250}.6
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      dependencies:
+        condition: service_completed_successfully
+
+  runner-registration:
+    image: node:24-bookworm
+    working_dir: /workspace
+    command:
+      [
+        node,
+        --import=tsx,
+        scripts/manage.ts,
+        runner,
+        provision,
+        /runner-config/runner.toml,
+      ]
+    volumes:
+      - .:/workspace:ro
+      - razbor_node_modules:/workspace/node_modules:ro
+      - ${RAZBOR_RUNNER_CONFIG:-./config/runner.example.toml}:/runner-config/runner.toml:ro
+      - razbor_runner_registration:/runner-registration
+    environment:
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+    networks: [database]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      dependencies:
+        condition: service_completed_successfully
+
+  runner:
+    image: razbor-runner:0.1.0
+    build:
+      context: .
+      dockerfile: docker/runner.dev.Dockerfile
+    runtime: kata
+    privileged: false
+    cap_add: [ALL]
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - writable-cgroups=true
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.default.forwarding: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    mem_limit: 6g
+    memswap_limit: 6g
+    cpus: 4
+    pids_limit: 2048
+    tmpfs:
+      - /var/lib/docker:rw,nosuid,size=4g
+    command: [--config, /runner-config/runner.toml]
+    init: true
+    stop_grace_period: 45s
+    volumes:
+      - ${RAZBOR_STORAGE_HOST:?Set an absolute storage path outside the repository}:/job-data
+      - ${RAZBOR_RUNNER_CONFIG:-./config/runner.example.toml}:/runner-config/runner.toml:ro
+      - razbor_runner_registration:/runner-registration:ro
+      - ${RAZBOR_RUNNER_RESOLV_CONF:-/run/systemd/resolve/resolv.conf}:/etc/resolv.conf:ro
+    extra_hosts:
+      web: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.250}.6
+    environment:
+      RAZBOR_RUNNER_ENROLLMENT_TOKEN: ${RAZBOR_RUNNER_ENROLLMENT_TOKEN:-}
+    networks:
+      control: {}
+      runner_control:
+        ipv4_address: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.250}.5
+    depends_on:
+      runner-registration:
+        condition: service_completed_successfully
+      web:
+        condition: service_started
+
+  indexer:
+    image: node:24-bookworm
+    user: "${RAZBOR_UID:-1000}:${RAZBOR_GID:-1000}"
+    working_dir: /workspace
+    command: node --import=tsx apps/indexer/src/index.ts --config /index-config/indexer.toml
+    init: true
+    stop_grace_period: 45s
+    ports: ["127.0.0.1:${RAZBOR_INDEX_PORT:-8790}:8790"]
+    volumes:
+      - .:/workspace:ro
+      - razbor_node_modules:/workspace/node_modules:ro
+      - ${RAZBOR_INDEX_CONFIG:-./config/indexer.example.toml}:/index-config/indexer.toml:ro
+      - ${RAZBOR_INDEX_DATA:?Set a persistent absolute index data path}:/index-data
+      - ${RAZBOR_CBM_BUNDLE:?Set the pinned Codebase Memory bundle directory}:/cbm:ro
+      - ${RAZBOR_FORGEJO_TOKEN_FILE:-./config/razbor.forgejo.token}:/forge-secrets/razbor.forgejo.token:ro
+    environment:
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+      RAZBOR_INDEX_MANAGEMENT_TOKEN: ${RAZBOR_INDEX_MANAGEMENT_TOKEN:-}
+      RAZBOR_EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:?Set the embedding service token in .env}
+    networks:
+      control: {}
+      database: {}
+      embeddings: {}
+    depends_on:
+      embeddings:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      dependencies:
+        condition: service_completed_successfully
+
+  tooling:
+    image: node:24-bookworm
+    profiles: [tools]
+    working_dir: /workspace
+    command: tail -f /dev/null
+    volumes:
+      - .:/workspace
+      - razbor_node_modules:/workspace/node_modules
+    depends_on:
+      dependencies:
+        condition: service_completed_successfully
+
+  postgres:
+    image: razbor-postgres:local
+    build:
+      context: .
+      dockerfile: docker/postgres.dev.Dockerfile
+    environment:
+      POSTGRES_DB: razbor
+      POSTGRES_USER: razbor_bootstrap
+      POSTGRES_PASSWORD: ${RAZBOR_DB_BOOTSTRAP_PASSWORD:?Set bootstrap database password}
+      RAZBOR_DB_MIGRATION_PASSWORD: ${RAZBOR_DB_MIGRATION_PASSWORD:?Set migration database password}
+      RAZBOR_DB_RUNTIME_PASSWORD: ${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/postgres/bootstrap.sh:/docker-entrypoint-initdb.d/10-razbor.sh:ro
+    networks:
+      database: {}
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U razbor_bootstrap -d razbor"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  database-extensions:
+    image: razbor-postgres:local
+    entrypoint: [psql]
+    command:
+      [
+        -h,
+        postgres,
+        -U,
+        razbor_bootstrap,
+        -d,
+        razbor,
+        -v,
+        ON_ERROR_STOP=1,
+        -c,
+        "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;",
+      ]
+    environment:
+      PGPASSWORD: ${RAZBOR_DB_BOOTSTRAP_PASSWORD:?Set bootstrap database password}
+    networks: [database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  migrate:
+    image: node:24-bookworm
+    working_dir: /workspace
+    command:
+      [
+        sh,
+        -c,
+        "node --import=tsx scripts/manage.ts database migrate && node --import=tsx scripts/manage.ts database migrate-embeddings",
+      ]
+    volumes:
+      - .:/workspace:ro
+      - razbor_node_modules:/workspace/node_modules:ro
+    environment:
+      RAZBOR_MIGRATION_DATABASE_URL: postgresql://razbor_migrator:${RAZBOR_DB_MIGRATION_PASSWORD:?Set migration database password}@postgres:5432/razbor
+    networks: [database]
+    depends_on:
+      database-extensions:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      dependencies:
+        condition: service_completed_successfully
+
+  manage:
+    image: node:24-bookworm
+    profiles: [tools]
+    working_dir: /workspace
+    entrypoint: [node, --import=tsx, scripts/manage.ts]
+    command: [repository, list]
+    volumes:
+      - ${RAZBOR_FORGEJO_TOKEN_FILE:-./config/razbor.forgejo.token}:/forge-secrets/razbor.forgejo.token:ro
+      - ${RAZBOR_WEBHOOK_SECRET_FILE:-./config/razbor.webhook.secret}:/forge-secrets/razbor.webhook.secret:ro
+      - .:/workspace:ro
+      - razbor_node_modules:/workspace/node_modules:ro
+      - ${RAZBOR_REGISTRY_CONFIG:-./config/application.example.toml}:/registry/application.toml:ro
+    environment:
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+    networks: [control, database]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      dependencies:
+        condition: service_completed_successfully
+
+  registry:
+    image: node:24-bookworm
+    profiles: [registry-import]
+    working_dir: /workspace
+    command: node --import=tsx scripts/manage.ts config apply /registry/application.toml
+    volumes:
+      - .:/workspace:ro
+      - razbor_node_modules:/workspace/node_modules:ro
+      - ${RAZBOR_REGISTRY_CONFIG:-./config/application.local.toml}:/registry/application.toml:ro
+      - ${RAZBOR_FORGEJO_TOKEN_FILE:-./config/razbor.forgejo.token}:/forge-secrets/razbor.forgejo.token:ro
+      - ${RAZBOR_WEBHOOK_SECRET_FILE:-./config/razbor.webhook.secret}:/forge-secrets/razbor.webhook.secret:ro
+    environment:
+      RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
+    networks: [control, database]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+networks:
+  embeddings:
+    internal: true
+  database:
+    internal: true
+  control: {}
+  runner_control:
+    internal: true
+    ipam:
+      config:
+        - subnet: ${RAZBOR_RUNNER_NETWORK_PREFIX:-172.30.250}.0/24
+
+volumes:
+  razbor_embedding_models: {}
+  razbor_node_modules:
+    name: ${COMPOSE_PROJECT_NAME:-razbor}_razbor_node_modules
+  razbor_web_node_modules: {}
+  razbor_next: {}
+  razbor_runner_registration: {}
+  postgres_data: {}

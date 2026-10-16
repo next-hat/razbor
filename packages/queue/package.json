@@ -1,0 +1,13 @@
+{
+  "name": "@razbor/queue",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@razbor/database": "workspace:*",
+    "@razbor/contracts": "workspace:*",
+    "pg-boss": "12.37.1",
+    "drizzle-orm": "0.45.4"
+  }
+}

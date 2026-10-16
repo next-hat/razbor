@@ -1,0 +1,25 @@
+# Select this server configuration with RAZBOR_CONFIG_FILE. Restart after edits.
+# Local login remains the default until OIDC is enabled and credentials supplied.
+[authentication]
+local_enabled = true
+
+# To bypass password login: local_enabled = false, enabled = true,
+# auto_redirect = true. Register the exact redirect_uri with the provider.
+[authentication.oidc]
+enabled = false
+issuer = "https://identity.example.com/realms/example"
+client_id = "razbor"
+client_secret = { env = "RAZBOR_OIDC_CLIENT_SECRET" }
+transaction_secret = { env = "RAZBOR_OIDC_TRANSACTION_SECRET" }
+client_authentication = "client_secret_basic"
+redirect_uri = "http://localhost:3000/api/auth/oidc/callback"
+scopes = ["openid", "profile", "email", "groups"]
+auto_redirect = true
+allow_http = false
+groups_claim = "groups"
+default_role = "user"
+
+# Exact group membership matches; an admin match takes precedence.
+# Nested claims can be selected with a dotted path, e.g. organization.groups.
+[authentication.oidc.group_roles]
+admin = "admin"

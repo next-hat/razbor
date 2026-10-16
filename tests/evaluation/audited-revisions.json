@@ -1,0 +1,364 @@
+{
+  "version": 1,
+  "name": "audited-revisions",
+  "scope": "Maintained source-adjudicated calibration cases from the2026-10-15 closed-PR audit. These labels are bounded known defects and refuted claims, not exhaustive ground truth. Do not supply this answer-bearing dataset, reviewer comments, or future fixes to the review model. Keep newly discovered findings and uncertain judgments separate.",
+  "issues": [
+    {
+      "id": "proxy-reset-direction",
+      "title": "Response reset loses operation direction",
+      "mechanism": "Non-cancellation H2 resets observed while writing record read failure first; the first-error record prevents a later write error from correcting the outcome.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/76b60e5f3b2f8877dbcad4bee4433e03a6f5285f/vendor/pingora-core/src/protocols/http/v2/progress.rs#L116",
+        "https://github.com/next-hat/proxy/commit/14f3e4ece9d110c3955f7ab6778beca697f0d7ac"
+      ]
+    },
+    {
+      "id": "proxy-connect-provenance",
+      "title": "Real connector failure disappears after authorization expiry",
+      "mechanism": "Accounting gates a real connector acquisition failure on current authorization state. Distinguish a causal synthetic authorization denial from a genuine connector error so counters and diagnostics preserve the latter.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/commit/14f3e4ece9d110c3955f7ab6778beca697f0d7ac"
+      ]
+    },
+    {
+      "id": "proxy-panic-precedence",
+      "title": "Handler cancellation hides a request panic",
+      "mechanism": "supervise_connection checks handler join Err before request_panicked, classifying a request panic plus concurrent handler abort as cancellation. Request panic must win after shutdown joins.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/fcce0dd6b798aae9a1bb561818df3d789f29330c/src/listener/stream_cohort.rs#L325",
+        "https://github.com/next-hat/proxy/commit/6b93bf38aa206fbce4d5ac45babb1787711e37a7"
+      ]
+    },
+    {
+      "id": "proxy-reset-route-outcome",
+      "title": "Reset cancellation bypasses route metrics",
+      "mechanism": "The outer reset select drops proxy work before logging records selected route counters. A retained exactly-once completion owner must preserve the route outcome even when logging is never entered.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/ed8f1e57a7f5c80b1491ad761b92380dcad20329/src/listener/http.rs#L1012",
+        "https://github.com/next-hat/proxy/blob/ed8f1e57a7f5c80b1491ad761b92380dcad20329/src/proxy.rs#L926",
+        "https://github.com/next-hat/proxy/commit/8e4f2f3a6d76de209d2470271fe676a53e165848"
+      ]
+    },
+    {
+      "id": "proxy-reset-finalization",
+      "title": "Late reset destroys pending finalization",
+      "mechanism": "After forwarding completes, a late reset can win the outer select during asynchronous logging, skipping result finalization. The source-supported defect is finalization cancellation; the original claim of losing an already reusable upstream H1 pool entry was not reproduced.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/ed8f1e57a7f5c80b1491ad761b92380dcad20329/vendor/pingora-core/src/protocols/http/v2/reset.rs#L123",
+        "https://github.com/next-hat/proxy/commit/8e4f2f3a6d76de209d2470271fe676a53e165848",
+        "https://github.com/next-hat/proxy/blob/8e4f2f3a6d76de209d2470271fe676a53e165848/vendor/pingora-proxy/PATCH.md#L141"
+      ],
+      "unsafeRemediation": "Disarming reset solely on response END_STREAM is too broad: early responses may leave upload or callbacks pending. Preserve cancellation until application/forwarding completion, and retain already-observed resets."
+    },
+    {
+      "id": "proxy-h1-drain",
+      "title": "H2 drain watch changes H1 keepalive",
+      "mechanism": "A process watch intended for H2 is passed to all accepted protocols. Both Pingora H1 consumers disable keepalive on drain and Nitka's apply_keepalive does not re-enable it, contradicting preserved H1 policy.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/077dfc87d2e70dafdd5da043c509cdbc09e9c623/src/listener/http.rs#L975",
+        "https://github.com/next-hat/proxy/blob/077dfc87d2e70dafdd5da043c509cdbc09e9c623/vendor/pingora-proxy/src/lib.rs#L1643",
+        "https://github.com/next-hat/proxy/blob/077dfc87d2e70dafdd5da043c509cdbc09e9c623/src/proxy/connection.rs#L418",
+        "https://github.com/next-hat/proxy/commit/b3855b98d1cb5aa5d712b3748e550514ed7c45e7"
+      ]
+    },
+    {
+      "id": "proxy-drain-fixture-budget",
+      "title": "H1 fixture grace expires before permitted observations",
+      "mechanism": "The one-second forced-shutdown grace precedes multiple post-drain operations whose waits can each take three seconds. This is a source-supported scheduling hazard introduced by the H1 repair, not present in the original H2 drain revision. No timing reproduction is claimed.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/b3855b98d1cb5aa5d712b3748e550514ed7c45e7/tests/integration/http/h1_process_drain.rs#L132",
+        "https://github.com/next-hat/proxy/commit/bff1de97b4b79524cae00a6e17ceb98c4dd46210"
+      ]
+    },
+    {
+      "id": "proxy-duplex-compile-claim",
+      "title": "Refuted DuplexStream constructor mismatch",
+      "mechanism": "Do not report Box<DuplexStream> as an incompatible concrete transport: protocols::Stream is Box<dyn IO> and this exact source unconditionally implements the required traits for DuplexStream. This refutes that specific type mismatch, not every possible compilation error.",
+      "evidence": [
+        "https://github.com/next-hat/proxy/blob/b01703d80647828c5ded84caca7424f64166c64f/tests/integration/http/websocket_upgrade_ordering.rs#L223",
+        "https://github.com/next-hat/proxy/blob/b01703d80647828c5ded84caca7424f64166c64f/vendor/pingora-core/src/protocols/http/server.rs#L65",
+        "https://github.com/next-hat/proxy/blob/b01703d80647828c5ded84caca7424f64166c64f/vendor/pingora-core/src/protocols/mod.rs#L136",
+        "https://github.com/next-hat/proxy/blob/b01703d80647828c5ded84caca7424f64166c64f/vendor/pingora-core/src/protocols/mod.rs#L200"
+      ]
+    },
+    {
+      "id": "platform-stacked-mounts",
+      "title": "Collector uniqueness disagrees with report validation",
+      "mechanism": "The collector deduplicates only by device; distinct devices can share a mount path. Server validation requires unique mount paths and rejects the entire report.",
+      "evidence": [
+        "https://github.com/next-hat/landing/blob/55e8d19f198863e89ff5126f6672e157e1ea49ff/host_agent/src/collector.rs#L213",
+        "https://github.com/next-hat/landing/commit/c4520b991739b62b8f7e81d03d60fbe94048c620"
+      ]
+    },
+    {
+      "id": "platform-refresh-ownership",
+      "title": "Mutation refresh loses to older GET",
+      "mechanism": "refresh returns while an earlier GET is pending, skipping the observation required after a mutation and allowing older state to be displayed.",
+      "evidence": [
+        "https://github.com/next-hat/landing/commit/c4520b991739b62b8f7e81d03d60fbe94048c620"
+      ]
+    },
+    {
+      "id": "platform-sync-interval",
+      "title": "Successful sync ignores server scheduling",
+      "mechanism": "Successful sync matches Ok(_) and discards sync_after_seconds, so the agent continues its fixed local interval instead of the server's requested schedule.",
+      "evidence": [
+        "https://github.com/next-hat/landing/commit/c4520b991739b62b8f7e81d03d60fbe94048c620"
+      ]
+    },
+    {
+      "id": "platform-clock-terminal",
+      "title": "Clock-window rejection permanently stops agent",
+      "mechanism": "The permanent-400 retry fix interacts with temporal timestamp-window400 and systemd RestartPreventExitStatus=78. Boot/NTP skew becomes a terminal stop; distinguish temporal409 from structurally invalid reports while preserving authentication precedence.",
+      "evidence": [
+        "https://github.com/next-hat/landing/commit/748ae804170b923db96c98bfa1d9a0da99027009"
+      ]
+    },
+    {
+      "id": "platform-chart-buckets",
+      "title": "Chart gap is based on elapsed samples rather than UTC buckets",
+      "mechanism": "A 90-second sample threshold misses the empty minute for12:00:50 to12:02:00 and inserts a false gap for adjacent occupied minutes12:00:00 to12:01:59. Compare UTC minute indexes.",
+      "evidence": [
+        "https://github.com/next-hat/landing/pull/10#discussion_r4277515609",
+        "https://github.com/next-hat/landing/commit/748ae804170b923db96c98bfa1d9a0da99027009"
+      ]
+    },
+    {
+      "id": "platform-clock-renewal",
+      "title": "Local clock skew repeatedly rotates credentials",
+      "mechanism": "After the temporal-conflict repair, routine renewal still compares server deadlines to local Utc::now. A far-ahead host can renew before each rejected sync; routine renewal must use authenticated server time while preserving pending-rotation recovery.",
+      "evidence": [
+        "https://github.com/next-hat/landing/commit/fd73da2c528ac028e6ea744cd5301f6923464f4e"
+      ]
+    },
+    {
+      "id": "platform-route-guard-claim",
+      "title": "Refuted absent-route crash",
+      "mechanism": "The no-route path safely returns before dereferencing the route. A hypothetical future guard bypass is not a reachable current crash.",
+      "evidence": [
+        "https://github.com/next-hat/landing/blob/c9e38e3d40be03bad261eca96a662246805ab718/webapp/components/network/network-route-editor.tsx#L161",
+        "https://github.com/next-hat/landing/pull/5#issuecomment-6145681842"
+      ]
+    },
+    {
+      "id": "platform-owner-prop-claim",
+      "title": "Refuted owner prop loss",
+      "mechanism": "The former overview no longer owns the mutation and the new creation page passes owner.id to NetworkDomainCreate. A future mutation feature does not make the current flow invalid.",
+      "evidence": [
+        "https://github.com/next-hat/landing/blob/c9e38e3d40be03bad261eca96a662246805ab718/webapp/app/console/%5Borganization_slug%5D/network/domains/new/page.tsx#L19",
+        "https://github.com/next-hat/landing/pull/5#issuecomment-6145681842"
+      ]
+    },
+    {
+      "id": "platform-symlink-claim",
+      "title": "Refuted parent traversal exploit at final head",
+      "mechanism": "At the pinned final revision a normal target component sets normal_seen; any subsequent ParentDir is rejected. The claimed x/../../../../etc/passwd exploit is rejected. This is not an exhaustive archive-security assessment or a judgment about an unavailable earlier revision.",
+      "evidence": [
+        "https://github.com/next-hat/landing/blob/02d22bea6d8dc9dd1453b072b15e2c2ee5c1efb3/home_agent/src/archive.rs#L507",
+        "https://github.com/next-hat/landing/pull/2#discussion_r4249080964"
+      ]
+    }
+  ],
+  "cases": [
+    {
+      "id": "c01",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/9",
+      "baseSha": "3b8660a620b88a0a2844252c273d1afa7c15e17f",
+      "headSha": "76b60e5f3b2f8877dbcad4bee4433e03a6f5285f",
+      "kind": "defective",
+      "expectedIssues": ["proxy-reset-direction", "proxy-connect-provenance"],
+      "forbiddenClaims": [],
+      "notes": "Original accounting revision. Source-verified mechanisms; production frequency was not measured."
+    },
+    {
+      "id": "c02",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/9",
+      "baseSha": "3b8660a620b88a0a2844252c273d1afa7c15e17f",
+      "headSha": "14f3e4ece9d110c3955f7ab6778beca697f0d7ac",
+      "kind": "corrected",
+      "expectedIssues": [],
+      "forbiddenClaims": ["proxy-reset-direction", "proxy-connect-provenance"],
+      "notes": "Corrected-head negative controls cover only the listed original defects."
+    },
+    {
+      "id": "c03",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/10",
+      "baseSha": "29757573e06ce5587d93c0df0e3de7d077079ab8",
+      "headSha": "fcce0dd6b798aae9a1bb561818df3d789f29330c",
+      "kind": "defective",
+      "expectedIssues": ["proxy-panic-precedence"],
+      "forbiddenClaims": [],
+      "notes": "After independently scheduled requests, before panic precedence repair. Do not label the earlier local scheduling architecture as present here."
+    },
+    {
+      "id": "c04",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/10",
+      "baseSha": "29757573e06ce5587d93c0df0e3de7d077079ab8",
+      "headSha": "6b93bf38aa206fbce4d5ac45babb1787711e37a7",
+      "kind": "corrected",
+      "expectedIssues": [],
+      "forbiddenClaims": ["proxy-panic-precedence"],
+      "notes": "Request panic now wins over handler cancellation."
+    },
+    {
+      "id": "c05",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/11",
+      "baseSha": "ca76e24446cb74520c274671a7ab0c24045980d3",
+      "headSha": "ed8f1e57a7f5c80b1491ad761b92380dcad20329",
+      "kind": "defective",
+      "expectedIssues": [
+        "proxy-reset-route-outcome",
+        "proxy-reset-finalization"
+      ],
+      "forbiddenClaims": [],
+      "notes": "Adjudicate detection separately from remedy safety; END_STREAM alone cannot disarm unfinished work."
+    },
+    {
+      "id": "c06",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/11",
+      "baseSha": "ca76e24446cb74520c274671a7ab0c24045980d3",
+      "headSha": "8e4f2f3a6d76de209d2470271fe676a53e165848",
+      "kind": "corrected",
+      "expectedIssues": [],
+      "forbiddenClaims": [
+        "proxy-reset-route-outcome",
+        "proxy-reset-finalization"
+      ],
+      "notes": "Route completion is retained and finalization is explicit. Newly discovered issues remain separately adjudicable."
+    },
+    {
+      "id": "c07",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/12",
+      "baseSha": "38b2d10f2ab347a7454b71309055d7af50b606b5",
+      "headSha": "077dfc87d2e70dafdd5da043c509cdbc09e9c623",
+      "kind": "defective",
+      "expectedIssues": ["proxy-h1-drain"],
+      "forbiddenClaims": [],
+      "notes": "Initial reviewed head. The later H1 fixture does not yet exist."
+    },
+    {
+      "id": "c08",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/12",
+      "baseSha": "38b2d10f2ab347a7454b71309055d7af50b606b5",
+      "headSha": "b3855b98d1cb5aa5d712b3748e550514ed7c45e7",
+      "kind": "defective",
+      "expectedIssues": ["proxy-drain-fixture-budget"],
+      "forbiddenClaims": ["proxy-h1-drain"],
+      "notes": "H1 behavior repaired; the newly added fixture has a distinct timing hazard."
+    },
+    {
+      "id": "c09",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/12",
+      "baseSha": "38b2d10f2ab347a7454b71309055d7af50b606b5",
+      "headSha": "bff1de97b4b79524cae00a6e17ceb98c4dd46210",
+      "kind": "corrected",
+      "expectedIssues": [],
+      "forbiddenClaims": ["proxy-h1-drain", "proxy-drain-fixture-budget"],
+      "notes": "Fixture now shares absolute functional and shutdown observation windows."
+    },
+    {
+      "id": "c10",
+      "repository": "next-hat/proxy",
+      "pullRequest": "https://github.com/next-hat/proxy/pull/6",
+      "baseSha": "b55eb6edbb268e2d9866405b4738f3c814c279e1",
+      "headSha": "b01703d80647828c5ded84caca7424f64166c64f",
+      "kind": "refuted_claim",
+      "expectedIssues": [],
+      "forbiddenClaims": ["proxy-duplex-compile-claim"],
+      "notes": "Refuted claim only; other changes or diagnostics in this large PR are not declared clean."
+    },
+    {
+      "id": "c11",
+      "repository": "next-hat/landing",
+      "pullRequest": "https://github.com/next-hat/landing/pull/10",
+      "baseSha": "bc0661d8cf482bd7eef7011b6c1d3720021585c4",
+      "headSha": "55e8d19f198863e89ff5126f6672e157e1ea49ff",
+      "kind": "defective",
+      "expectedIssues": [
+        "platform-stacked-mounts",
+        "platform-refresh-ownership",
+        "platform-sync-interval"
+      ],
+      "forbiddenClaims": [],
+      "notes": "A bounded subset of independently source-checked initial defects; not all published Qodo claims."
+    },
+    {
+      "id": "c12",
+      "repository": "next-hat/landing",
+      "pullRequest": "https://github.com/next-hat/landing/pull/10",
+      "baseSha": "bc0661d8cf482bd7eef7011b6c1d3720021585c4",
+      "headSha": "c4520b991739b62b8f7e81d03d60fbe94048c620",
+      "kind": "defective",
+      "expectedIssues": ["platform-clock-terminal", "platform-chart-buckets"],
+      "forbiddenClaims": [
+        "platform-stacked-mounts",
+        "platform-refresh-ownership",
+        "platform-sync-interval"
+      ],
+      "notes": "The chart finding was Razbor-only. The temporal retry interaction arose after the initial fixes."
+    },
+    {
+      "id": "c13",
+      "repository": "next-hat/landing",
+      "pullRequest": "https://github.com/next-hat/landing/pull/10",
+      "baseSha": "bc0661d8cf482bd7eef7011b6c1d3720021585c4",
+      "headSha": "748ae804170b923db96c98bfa1d9a0da99027009",
+      "kind": "defective",
+      "expectedIssues": ["platform-clock-renewal"],
+      "forbiddenClaims": ["platform-clock-terminal", "platform-chart-buckets"],
+      "notes": "Clock-window rejection repaired; local-time renewal remains a separate defect."
+    },
+    {
+      "id": "c14",
+      "repository": "next-hat/landing",
+      "pullRequest": "https://github.com/next-hat/landing/pull/10",
+      "baseSha": "bc0661d8cf482bd7eef7011b6c1d3720021585c4",
+      "headSha": "fd73da2c528ac028e6ea744cd5301f6923464f4e",
+      "kind": "corrected",
+      "expectedIssues": [],
+      "forbiddenClaims": [
+        "platform-clock-renewal",
+        "platform-clock-terminal",
+        "platform-chart-buckets",
+        "platform-stacked-mounts",
+        "platform-refresh-ownership",
+        "platform-sync-interval"
+      ],
+      "notes": "Corrected controls are claim-specific; no blanket declaration of correctness."
+    },
+    {
+      "id": "c15",
+      "repository": "next-hat/landing",
+      "pullRequest": "https://github.com/next-hat/landing/pull/5",
+      "baseSha": "a425d5650a82f25cf165ac2de18603cbb052c107",
+      "headSha": "c9e38e3d40be03bad261eca96a662246805ab718",
+      "kind": "refuted_claim",
+      "expectedIssues": [],
+      "forbiddenClaims": [
+        "platform-route-guard-claim",
+        "platform-owner-prop-claim"
+      ],
+      "notes": "Two speculative current-bug claims refuted by guards and the intentional creation flow."
+    },
+    {
+      "id": "c16",
+      "repository": "next-hat/landing",
+      "pullRequest": "https://github.com/next-hat/landing/pull/2",
+      "baseSha": "72b8ccec71439e01b7b85680d1d605a9f4cb1487",
+      "headSha": "02d22bea6d8dc9dd1453b072b15e2c2ee5c1efb3",
+      "kind": "refuted_claim",
+      "expectedIssues": [],
+      "forbiddenClaims": ["platform-symlink-claim"],
+      "notes": "Only the cited exploit at the final SHA is refuted; other PR security claims are outside these labels."
+    }
+  ]
+}
