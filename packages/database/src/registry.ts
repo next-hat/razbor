@@ -23,7 +23,10 @@ import {
   verifyRepository,
 } from "@razbor/forge-adapters";
 
-import { AgentInputError } from "@database/src/agents.js";
+import {
+  AgentInputError,
+  snapshotRepositoryAgent,
+} from "@database/src/agents.js";
 import {
   defaultImportContextId,
   requireContextSession,
@@ -37,6 +40,7 @@ import {
   githubApps,
   repositories,
   repositoryWebhooks,
+  reviews,
   storedSecrets,
   type SecretReference,
 } from "@database/src/schema.js";
@@ -500,8 +504,8 @@ export async function getRepository(
 }
 
 /**
- * Assign or clear a reviewer profile for future submissions, locking the
- * active repository and validating the selected profile still exists.
+ * Assign or clear a reviewer profile for future submissions and fill missing
+ * snapshots on queued reviews. Keep existing snapshots and running reviews pinned.
  */
 export async function assignRepositoryAgent(
   database: Database,
@@ -564,6 +568,28 @@ export async function assignRepositoryAgent(
       .update(repositories)
       .set({ agentId: savedAgentId, updatedAt: new Date() })
       .where(eq(repositories.id, repository.id));
+    const snapshot = await snapshotRepositoryAgent(
+      tx,
+      savedAgentId,
+      repository.contextId,
+    );
+    if (snapshot) {
+      // Conditional row updates serialize with attempt reservation without
+      // replacing a pinned agent or changing an attempt that already started.
+      await tx
+        .update(reviews)
+        .set({
+          source: sql`jsonb_set(${reviews.source}, '{agent}', ${JSON.stringify(snapshot)}::jsonb)`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(reviews.repositoryId, repository.id),
+            eq(reviews.status, "queued"),
+            sql`${reviews.source}->'agent' is null`,
+          ),
+        );
+    }
     const [row] = await tx
       .select(repositorySelection)
       .from(repositories)

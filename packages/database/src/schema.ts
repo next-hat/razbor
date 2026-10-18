@@ -739,6 +739,9 @@ export const reviews = pgTable(
   (t) => [
     format("review", t.publicId, "review"),
     index("reviews_created").on(t.createdAt),
+    index("reviews_queued_without_agent")
+      .on(t.repositoryId)
+      .where(sql`${t.status} = 'queued' and ${t.source}->'agent' is null`),
     check(
       "reviews_status",
       sql`${t.status} in ('queued','running','completed','failed')`,
