@@ -101,16 +101,60 @@ function retryDelay(headers: Headers, now: number) {
   return Number.isFinite(date) ? Math.max(0, date - now) : undefined;
 }
 
-/** Honor explicit retry hints before falling back to transient HTTP status codes. */
-function retryableResponse(response: Response) {
-  if (response.ok) return false;
-  const hint = response.headers.get("x-should-retry");
-  if (hint === "false") return false;
-  return (
-    hint === "true" ||
-    [408, 409, 429].includes(response.status) ||
-    response.status >= 500
-  );
+/**
+ * Accept only known pre-generation rate rejections. HTTP429 and retry hints alone
+ * cannot establish this: billing, subscription and unknown compatible-provider
+ * errors may use the same status. Usage or output makes a rejection ambiguous.
+ */
+function retryableThrottle(
+  response: Response,
+  body: Buffer,
+  provider: ResolvedConfig["model"]["provider"],
+) {
+  if (
+    response.status !== 429 ||
+    response.headers.get("x-should-retry") === "false"
+  )
+    return false;
+  let payload: {
+    error?: { code?: unknown; type?: unknown; usage?: unknown };
+    usage?: unknown;
+    output?: unknown;
+  };
+  try {
+    payload = JSON.parse(body.toString("utf8"));
+  } catch {
+    return false;
+  }
+  const error = payload?.error;
+  if (
+    !error ||
+    typeof error !== "object" ||
+    payload.usage !== undefined ||
+    payload.output !== undefined ||
+    error.usage !== undefined
+  )
+    return false;
+  // Claude monthly spend caps share this type but omit Retry-After.
+  if (provider === "anthropic")
+    return (
+      error.type === "rate_limit_error" &&
+      error.code === undefined &&
+      retryDelay(response.headers, Date.now()) !== undefined
+    );
+  if (error.code === "slow_down")
+    return error.type === undefined || error.type === "rate_limit_error";
+  if (error.code === "rate_limit_exceeded")
+    return (
+      error.type === undefined ||
+      [
+        "requests",
+        "tokens",
+        "rate_limit_error",
+        "rate_limit_exceeded",
+      ].includes(String(error.type))
+    );
+  return false;
 }
 
 type RateBudget = {
@@ -1043,9 +1087,9 @@ export class ModelRelay {
   }
 
   /**
-   * Pace model requests without automatically repeating any provider dispatch.
-   * Failed HTTP responses and timeouts may be billed; a new review attempt must own any retry.
-   * Bound returned bodies, and refuse results after capability revocation.
+   * Retry only positively classified nonbillable throttle rejections when opted in.
+   * One fixed deadline includes quota waits, every dispatch and response reading.
+   * Ambiguous failures, transport errors and timeouts never repeat a paid request.
    */
   private async forwardModel(
     access: Access,
@@ -1059,87 +1103,111 @@ export class ModelRelay {
     const estimatedTokens =
       Math.ceil(Buffer.byteLength(requestBody) / 3) +
       access.model.max_output_tokens;
-    operation.signal = signal;
-    const reservation = await this.waitForQuota(
-      access,
+    operation.signal = AbortSignal.any([
       signal,
-      estimatedTokens,
-    );
+      AbortSignal.timeout(access.model.timeout_ms),
+    ]);
     try {
-      operation.signal = AbortSignal.any([
-        signal,
-        AbortSignal.timeout(access.model.timeout_ms),
-      ]);
-      const upstream = await fetch(access.endpoint, {
-        method: "POST",
-        redirect: "error",
-        dispatcher: modelDispatcher,
-        signal: operation.signal,
-        headers: {
-          ...(access.model.provider === "anthropic"
-            ? {
-                "x-api-key": access.apiKey,
-                "anthropic-version": "2023-06-01",
-              }
-            : { authorization: `Bearer ${access.apiKey}` }),
-          "content-type": "application/json",
-        },
-        body: requestBody,
-      } as RequestInit & Pick<UndiciRequestInit, "dispatcher">);
-      operation.signal.throwIfAborted();
-      const now = Date.now();
-      const retryMs = retryableResponse(upstream)
-        ? Math.max(250, retryDelay(upstream.headers, now) ?? 1000)
-        : undefined;
-      this.observeLimits(
-        quota,
-        access.model.provider === "anthropic"
-          ? anthropicQuotaHeaders(upstream.headers, now)
-          : upstream.headers,
-        now,
-        reservation,
-        retryMs,
-      );
-      if (retryMs !== undefined) {
-        quota.blockedUntil = Math.max(quota.blockedUntil, now + retryMs);
-        await upstream.body?.cancel().catch(() => {});
-        signal.throwIfAborted();
-        access.diagnostic?.(
-          `Model upstream returned HTTP ${upstream.status} · automatic retries disabled`,
+      for (let retries = 0; ; retries++) {
+        const reservation = await this.waitForQuota(
+          access,
+          operation.signal,
+          estimatedTokens,
         );
-        return {
-          ...failure(upstream.status === 429 ? 429 : 502),
-          headers: {
-            "x-should-retry": "false",
-            "retry-after": String(Math.ceil(retryMs / 1000)),
-          },
-        };
+        try {
+          operation.signal.throwIfAborted();
+          const upstream = await fetch(access.endpoint, {
+            method: "POST",
+            redirect: "error",
+            dispatcher: modelDispatcher,
+            signal: operation.signal,
+            headers: {
+              ...(access.model.provider === "anthropic"
+                ? {
+                    "x-api-key": access.apiKey,
+                    "anthropic-version": "2023-06-01",
+                  }
+                : { authorization: `Bearer ${access.apiKey}` }),
+              "content-type": "application/json",
+            },
+            body: requestBody,
+          } as RequestInit & Pick<UndiciRequestInit, "dispatcher">);
+          operation.signal.throwIfAborted();
+          // Parse only a bounded rejection envelope; raw errors never leave the relay.
+          const rejected =
+            upstream.status === 429 && upstream.body
+              ? await boundedBody(
+                  upstream.body,
+                  access.model.max_response_bytes,
+                )
+              : undefined;
+          operation.signal.throwIfAborted();
+          const transient =
+            rejected !== undefined &&
+            retryableThrottle(upstream, rejected, access.model.provider);
+          const now = Date.now();
+          const retryMs = transient
+            ? Math.max(
+                1,
+                retryDelay(upstream.headers, now) ?? 1000 * 2 ** retries,
+              )
+            : undefined;
+          this.observeLimits(
+            quota,
+            access.model.provider === "anthropic"
+              ? anthropicQuotaHeaders(upstream.headers, now)
+              : upstream.headers,
+            now,
+            reservation,
+            retryMs,
+          );
+          if (retryMs !== undefined)
+            quota.blockedUntil = Math.max(quota.blockedUntil, now + retryMs);
+          if (transient && retries < access.model.max_retries) {
+            access.diagnostic?.(
+              `Model upstream rejected a transient nonbillable rate request · retry ${retries + 1}/${access.model.max_retries} after at least ${Math.ceil(retryMs!)}ms within the original request deadline`,
+              "info",
+            );
+            continue;
+          }
+          if (!upstream.ok || !upstream.body) {
+            access.diagnostic?.(
+              `Model upstream returned HTTP ${upstream.status} · ${transient ? "transient retry limit reached" : "not an eligible nonbillable throttle"}`,
+            );
+            if (!rejected) await upstream.body?.cancel().catch(() => {});
+            operation.signal.throwIfAborted();
+            return {
+              ...failure(upstream.status === 429 ? 429 : 502),
+              ...(retryMs === undefined
+                ? {}
+                : {
+                    headers: {
+                      "x-should-retry": "false",
+                      "retry-after": String(Math.ceil(retryMs / 1000)),
+                    },
+                  }),
+            };
+          }
+          const body = await boundedBody(
+            upstream.body,
+            access.model.max_response_bytes,
+          );
+          operation.signal.throwIfAborted();
+          if (!this.active.has(token)) return failure(401);
+          return {
+            status: 200,
+            body,
+            headers:
+              upstream.headers.get("x-razbor-usage-incomplete") === "true"
+                ? { "x-razbor-usage-incomplete": "true" }
+                : undefined,
+          };
+        } finally {
+          quota.inFlightRequests--;
+          this.retireQuota(quota);
+        }
       }
-      if (!upstream.ok || !upstream.body) {
-        access.diagnostic?.(
-          `Model upstream returned HTTP ${upstream.status}${!upstream.body ? " with no response body" : ""} · outgoing JSON ${Buffer.byteLength(requestBody)} bytes`,
-        );
-        await upstream.body?.cancel().catch(() => {});
-        signal.throwIfAborted();
-        return failure(upstream.status === 429 ? 429 : 502);
-      }
-      const body = await boundedBody(
-        upstream.body,
-        access.model.max_response_bytes,
-      );
-      operation.signal.throwIfAborted();
-      if (!this.active.has(token!)) return failure(401);
-      return {
-        status: 200,
-        body,
-        headers:
-          upstream.headers.get("x-razbor-usage-incomplete") === "true"
-            ? { "x-razbor-usage-incomplete": "true" }
-            : undefined,
-      };
     } catch (error) {
-      // Attempt cancellation, revocation, payload limits and arbitrary transport errors
-      // are not a provider timeout and must not be retried as one.
       if (
         signal.aborted ||
         !operation.signal.aborted ||
@@ -1147,14 +1215,10 @@ export class ModelRelay {
         !["AbortError", "TimeoutError"].includes(error.name)
       )
         throw error;
-      const reason = `Model upstream request timed out after ${access.model.timeout_ms}ms`;
       access.diagnostic?.(
-        `${reason} · no automatic retry because token usage is unknown`,
+        `Model upstream request timed out after ${access.model.timeout_ms}ms · no retry beyond the original request deadline`,
       );
       return failure(502);
-    } finally {
-      quota.inFlightRequests--;
-      this.retireQuota(quota);
     }
   }
 }

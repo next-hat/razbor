@@ -381,3 +381,57 @@ test("bounded files reject symlinks/oversize and outputs declare truncation", as
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("optional startup and final cleanup failures stay sanitized, nonfatal and idempotent", async (t) => {
+  let closes = 0;
+  const config = optionalCapabilities();
+  delete config.mcpServers;
+  delete config.memory;
+  t.mock.method(RemoteMemory.prototype, "start", async () => {
+    throw new Error("private startup token");
+  });
+  t.mock.method(RemoteMemory.prototype, "close", async () => {
+    closes++;
+    throw new Error("private cleanup token");
+  });
+  const capabilities = new ReviewCapabilities(
+    config,
+    log,
+    new AbortController().signal,
+  );
+  await capabilities.start();
+  await capabilities.close();
+  await capabilities.close();
+  assert.equal(closes, 1);
+  assert.equal(
+    capabilities.limitations.filter((value) => /cleanup/.test(value)).length,
+    1,
+  );
+  assert.match(capabilities.limitations.join(" "), /unavailable/);
+  assert.doesNotMatch(capabilities.limitations.join(" "), /private|token/);
+  await assert.rejects(capabilities.call("cbm_search_graph", {}), /disabled/);
+});
+
+test("optional final cleanup failure cannot replace a successful startup or swallow cancellation", async (t) => {
+  const config = optionalCapabilities();
+  delete config.mcpServers;
+  delete config.memory;
+  let closes = 0;
+  t.mock.method(RemoteMemory.prototype, "start", async () => {});
+  t.mock.method(RemoteMemory.prototype, "close", async () => {
+    closes++;
+    throw new Error("private cleanup token");
+  });
+  const abort = new AbortController();
+  const capabilities = new ReviewCapabilities(config, log, abort.signal);
+  await capabilities.start();
+  await capabilities.close();
+  await capabilities.close();
+  assert.equal(closes, 1);
+  assert.equal(capabilities.limitations.length, 1);
+  abort.abort(new Error("review cancelled"));
+  await assert.rejects(
+    capabilities.close(),
+    (error) => error === abort.signal.reason,
+  );
+});

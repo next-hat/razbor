@@ -456,6 +456,7 @@ export const agentJobSchema = z.object({
   supportsTools: z.boolean().default(true),
   maxTurns: reviewMaxTurnsSchema,
   reviewBudget: reviewBudgetSchema.optional(),
+  contextWindowTokens: z.number().int().min(1024).max(10000000).optional(),
   compactionThresholdTokens: z
     .number()
     .int()

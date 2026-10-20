@@ -1,6 +1,8 @@
 import {
   reviewBudgetSchema,
   reviewMaxTurnsSchema,
+  type ModelProvider,
+  type ReviewPricing,
   type ReviewAttemptMetrics,
   type ReviewBudgetOptions as ConfiguredReviewBudget,
 } from "@razbor/contracts";
@@ -35,6 +37,7 @@ function count(value: unknown): number | undefined {
 export class ReviewBudget {
   readonly options: ReturnType<typeof reviewBudgetSchema.parse>;
   readonly maxTurns: number;
+  readonly pricing?: ReviewPricing;
   private reservation?: Reservation;
   private turns = 0;
   private calls = 0;
@@ -45,44 +48,81 @@ export class ReviewBudget {
   private measured: ModelTurn["usage"] = {};
   private missing = new Set<keyof ModelTurn["usage"]>();
 
-  /** Rejects unpriced monetary limits and pricing that does not match the selected model. */
+  /** Selects exact provider/model prices; only monetary caps require a matching entry. */
   constructor(
-    options: ReviewBudgetOptions & { maxTurns?: number; model?: string } = {},
+    options: ReviewBudgetOptions & {
+      maxTurns?: number;
+      model?: string;
+      provider?: ModelProvider;
+    } = {},
   ) {
-    const { maxTurns, model, ...limits } = options;
+    const { maxTurns, model, provider = "openai", ...limits } = options;
     this.options = reviewBudgetSchema.parse(limits);
     this.maxTurns = reviewMaxTurnsSchema.parse(maxTurns);
-    if (this.options.pricing && this.options.pricing.model !== model)
-      throw new Error("Review pricing must match the selected model exactly");
+    const entries = Array.isArray(this.options.pricing)
+      ? this.options.pricing
+      : this.options.pricing
+        ? [this.options.pricing]
+        : [];
+    this.pricing = entries.find(
+      (entry) => entry.model === model && entry.provider === provider,
+    );
+    if (this.options.maxCostUsd !== undefined && !this.pricing)
+      throw new Error(
+        "Review pricing must match the selected provider and model exactly",
+      );
+  }
+
+  /** Reports remaining hard limits, including any currently active model reservation. */
+  remaining(): {
+    modelTurns: number;
+    toolCalls: number;
+    tokens: number;
+    costUsd?: number;
+  } {
+    return {
+      modelTurns: Math.max(0, this.maxTurns - this.turns),
+      toolCalls: Math.max(0, this.options.maxToolCalls - this.calls),
+      tokens: Math.max(
+        0,
+        this.options.maxTokens - this.tokens - (this.reservation?.tokens ?? 0),
+      ),
+      ...(this.options.maxCostUsd !== undefined
+        ? {
+            costUsd: Math.max(
+              0,
+              this.options.maxCostUsd -
+                this.cost -
+                (this.reservation?.cost ?? 0),
+            ),
+          }
+        : {}),
+    };
+  }
+
+  /** Forecasts capped calls using dispatch admission's reservation without spending budget. */
+  canReserveModelTurns(inputEstimate: number, turns = 1): boolean {
+    if (!Number.isSafeInteger(turns) || turns < 0)
+      throw new Error("Invalid model-turn count");
+    const reservation = this.modelReservation(inputEstimate);
+    const remaining = this.remaining();
+    return (
+      turns <= remaining.modelTurns &&
+      reservation.tokens * turns <= remaining.tokens &&
+      (remaining.costUsd === undefined ||
+        (reservation.cost ?? 0) * turns <= remaining.costUsd)
+    );
   }
 
   /** Reserves conservatively before dispatch; rejected calls consume no provider request. */
   beginModelTurn(inputEstimate: number): void {
     if (this.reservation) throw new Error("A model turn is already active");
-    if (!Number.isSafeInteger(inputEstimate) || inputEstimate < 0)
-      throw new Error("Invalid model input estimate");
     if (this.turns >= this.maxTurns)
       throw new ReviewBudgetExceeded("model turns");
-    const output = this.options.maxOutputTokens;
-    const tokens = inputEstimate + output;
-    const pricing = this.options.pricing;
-    const cost = pricing
-      ? (inputEstimate *
-          Math.max(
-            pricing.inputUsdPerMillion,
-            pricing.cachedInputUsdPerMillion,
-            pricing.cacheWriteUsdPerMillion,
-          ) +
-          output * pricing.outputUsdPerMillion) /
-        1000000
-      : undefined;
-    if (this.tokens + tokens > this.options.maxTokens)
-      throw new ReviewBudgetExceeded("tokens");
-    if (
-      cost !== undefined &&
-      this.options.maxCostUsd !== undefined &&
-      this.cost + cost > this.options.maxCostUsd
-    )
+    const { output, tokens, cost } = this.modelReservation(inputEstimate);
+    const remaining = this.remaining();
+    if (tokens > remaining.tokens) throw new ReviewBudgetExceeded("tokens");
+    if (remaining.costUsd !== undefined && (cost ?? 0) > remaining.costUsd)
       throw new ReviewBudgetExceeded("estimated monetary cost");
     this.reservation = { input: inputEstimate, output, tokens, cost };
     this.turns++;
@@ -135,22 +175,44 @@ export class ReviewBudget {
       if (value === undefined) this.missing.add(key);
       else this.measured[key] = (this.measured[key] ?? 0) + value;
     }
-    const measuredTokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+    const measuredInput = Math.max(
+      usage.inputTokens ?? 0,
+      (usage.uncachedInputTokens ?? 0) +
+        (usage.cachedInputTokens ?? 0) +
+        (usage.cacheWriteTokens ?? 0),
+    );
+    const measuredTokens = measuredInput + (usage.outputTokens ?? 0);
     this.tokens += measuredComplete
       ? measuredTokens
       : Math.max(reservation.tokens, measuredTokens);
-    const pricing = this.options.pricing;
+    const pricing = this.pricing;
     if (pricing) {
       const pricedComplete =
         measuredComplete &&
         usage.uncachedInputTokens !== undefined &&
         usage.cachedInputTokens !== undefined &&
         usage.cacheWriteTokens !== undefined;
+      const knownInput =
+        (usage.uncachedInputTokens ?? 0) +
+        (usage.cachedInputTokens ?? 0) +
+        (usage.cacheWriteTokens ?? 0);
+      const estimatedInput = Math.max(
+        usage.inputTokens ?? reservation.input,
+        knownInput,
+      );
+      const unknownInput = estimatedInput - knownInput;
       const measuredCost =
         ((usage.uncachedInputTokens ?? 0) * pricing.inputUsdPerMillion +
           (usage.cachedInputTokens ?? 0) * pricing.cachedInputUsdPerMillion +
           (usage.cacheWriteTokens ?? 0) * pricing.cacheWriteUsdPerMillion +
-          (usage.outputTokens ?? 0) * pricing.outputUsdPerMillion) /
+          unknownInput *
+            Math.max(
+              pricing.inputUsdPerMillion,
+              pricing.cachedInputUsdPerMillion,
+              pricing.cacheWriteUsdPerMillion,
+            ) +
+          (usage.outputTokens ?? reservation.output) *
+            pricing.outputUsdPerMillion) /
         1000000;
       this.cost += pricedComplete
         ? measuredCost
@@ -195,7 +257,7 @@ export class ReviewBudget {
       toolCalls: this.calls,
       budgetTokens: this.tokens,
       tokenUsageComplete: this.complete,
-      ...(this.options.pricing
+      ...(this.pricing
         ? {
             estimatedCostUsd: this.cost,
             costEstimateComplete: this.costComplete,
@@ -210,6 +272,30 @@ export class ReviewBudget {
     ] as const)
       if (this.missing.has(key)) delete snapshot[key];
     return snapshot;
+  }
+
+  /** Builds the shared worst-case reservation used for forecasting and dispatch admission. */
+  private modelReservation(inputEstimate: number): Reservation {
+    if (!Number.isSafeInteger(inputEstimate) || inputEstimate < 0)
+      throw new Error("Invalid model input estimate");
+    const output = this.options.maxOutputTokens;
+    const pricing = this.pricing;
+    const cost = pricing
+      ? (inputEstimate *
+          Math.max(
+            pricing.inputUsdPerMillion,
+            pricing.cachedInputUsdPerMillion,
+            pricing.cacheWriteUsdPerMillion,
+          ) +
+          output * pricing.outputUsdPerMillion) /
+        1000000
+      : undefined;
+    return {
+      input: inputEstimate,
+      output,
+      tokens: inputEstimate + output,
+      cost,
+    };
   }
 
   /** Fails immediately if a provider's actual usage exceeds the conservative reservation. */

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  agentJobSchema,
   reviewAttemptMetricsSchema,
   reviewBudgetSchema,
 } from "@razbor/contracts";
@@ -112,7 +113,11 @@ test("actual provider overruns halt immediately while preserving final metrics",
 
 test("pricing is explicit and bound to the selected model", () => {
   assert.equal(reviewBudgetSchema.safeParse({ maxCostUsd: 1 }).success, false);
-  assert.throws(() => new ReviewBudget({ model: "other", pricing }), /match/);
+  assert.doesNotThrow(() => new ReviewBudget({ model: "other", pricing }));
+  assert.throws(
+    () => new ReviewBudget({ model: "other", pricing, maxCostUsd: 1 }),
+    /match/,
+  );
   assert.equal(new ReviewBudget().metrics().estimatedCostUsd, undefined);
   assert.equal(runnerConfigSchema.parse({}).model.max_retries, 0);
   assert.equal(
@@ -177,4 +182,223 @@ test("inconsistent provider splits cannot produce a precise monetary estimate", 
   assert.equal(budget.metrics().costEstimateComplete, false);
   assert.equal(budget.metrics().cachedInputTokens, undefined);
   assert.equal(budget.metrics().estimatedCostUsd, 0.0013);
+});
+
+test("partial usage charges measured input beyond the reservation at the highest unknown-category rate", () => {
+  const budget = new ReviewBudget({
+    model: "fixture",
+    pricing,
+    maxOutputTokens: 10,
+    maxCostUsd: 0.01,
+  });
+  budget.beginModelTurn(1);
+  assert.throws(
+    () =>
+      budget.observeModelTurn({
+        usage: { inputTokens: 100000, outputTokens: 1 },
+      }),
+    /monetary/,
+  );
+  assert.equal(budget.metrics().estimatedCostUsd, 0.250008);
+  assert.equal(budget.metrics().costEstimateComplete, false);
+});
+
+test("partial known categories charge every remaining measured token at the highest rate", () => {
+  const budget = new ReviewBudget({
+    model: "fixture",
+    pricing,
+    maxOutputTokens: 10,
+  });
+  budget.beginModelTurn(1);
+  budget.observeModelTurn({
+    usage: { inputTokens: 1000, cachedInputTokens: 100, outputTokens: 2 },
+  });
+  assert.equal(budget.metrics().estimatedCostUsd, 0.002286);
+  assert.equal(budget.metrics().costEstimateComplete, false);
+});
+
+test("per-model pricing selects the assigned provider and model without blocking unpriced uncapped reviews", () => {
+  const entries = [
+    { ...pricing, provider: "openai" as const },
+    {
+      ...pricing,
+      provider: "anthropic" as const,
+      model: "claude-fixture",
+      inputUsdPerMillion: 20,
+      cachedInputUsdPerMillion: 2,
+      cacheWriteUsdPerMillion: 25,
+      outputUsdPerMillion: 80,
+    },
+  ];
+  assert.equal(
+    reviewBudgetSchema.safeParse({ pricing: entries }).success,
+    true,
+  );
+  const claude = new ReviewBudget({
+    model: "claude-fixture",
+    provider: "anthropic",
+    pricing: entries,
+    maxOutputTokens: 100,
+    maxCostUsd: 1,
+  });
+  claude.beginModelTurn(100);
+  claude.observeModelTurn({ usage });
+  assert.equal(claude.metrics().estimatedCostUsd, 0.00275);
+  assert.doesNotThrow(
+    () =>
+      new ReviewBudget({
+        model: "unpriced",
+        provider: "anthropic",
+        pricing: entries,
+      }),
+  );
+  assert.throws(
+    () =>
+      new ReviewBudget({
+        model: "unpriced",
+        provider: "anthropic",
+        pricing: entries,
+        maxCostUsd: 1,
+      }),
+    /match/,
+  );
+  assert.throws(
+    () =>
+      new ReviewBudget({
+        model: "fixture",
+        provider: "anthropic",
+        pricing,
+        maxCostUsd: 1,
+      }),
+    /match/,
+  );
+});
+
+test("budget headroom forecasts model calls without mutation at exact boundaries", () => {
+  const budget = new ReviewBudget({
+    model: "fixture",
+    pricing,
+    maxTurns: 3,
+    maxToolCalls: 2,
+    maxTokens: 300,
+    maxOutputTokens: 10,
+    maxCostUsd: 1,
+  });
+  assert.deepEqual(budget.remaining(), {
+    modelTurns: 3,
+    toolCalls: 2,
+    tokens: 300,
+    costUsd: 1,
+  });
+  assert.equal(budget.canReserveModelTurns(90, 3), true);
+  assert.equal(budget.canReserveModelTurns(91, 3), false);
+  assert.equal(budget.canReserveModelTurns(1, 4), false);
+  assert.equal(budget.metrics().modelTurns, 0);
+  budget.beginModelTurn(90);
+  assert.equal(budget.remaining().tokens, 200);
+  budget.observeModelTurn({
+    usage: {
+      inputTokens: 90,
+      uncachedInputTokens: 90,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 10,
+    },
+  });
+  budget.useToolCalls(2);
+  assert.equal(budget.remaining().modelTurns, 2);
+  assert.equal(budget.remaining().tokens, 200);
+  assert.equal(budget.remaining().toolCalls, 0);
+  assert.equal(budget.canReserveModelTurns(90, 2), true);
+  assert.equal(budget.canReserveModelTurns(90, 3), false);
+});
+
+test("monetary headroom uses the same worst-case rates as dispatch admission", () => {
+  const budget = new ReviewBudget({
+    model: "fixture",
+    pricing,
+    maxTurns: 3,
+    maxOutputTokens: 10,
+    maxCostUsd: 0.00066,
+  });
+  assert.equal(budget.canReserveModelTurns(100, 2), true);
+  assert.equal(budget.canReserveModelTurns(101, 2), false);
+  assert.equal(budget.remaining().costUsd, 0.00066);
+});
+
+test("runner configuration preserves all prices until the assigned agent identity is known", () => {
+  const prices = [
+    { ...pricing, provider: "openai" },
+    { ...pricing, provider: "anthropic", model: "claude-fixture" },
+  ];
+  const config = runnerConfigSchema.parse({
+    harness: { contextWindowTokens: 64000, reviewBudget: { pricing: prices } },
+  });
+  const job = agentJobSchema.parse({
+    version: 1,
+    reviewId: "rev_0123456789ABCDEF",
+    repository: "/tmp/review",
+    base: "a".repeat(40),
+    head: "b".repeat(40),
+    reviewBudget: config.harness.reviewBudget,
+    contextWindowTokens: config.harness.contextWindowTokens,
+  });
+  assert.deepEqual(job.reviewBudget?.pricing, prices);
+  assert.equal(job.contextWindowTokens, 64000);
+  assert.equal(
+    runnerConfigSchema.parse({}).harness.contextWindowTokens,
+    undefined,
+  );
+  assert.equal(
+    agentJobSchema.parse({
+      version: 1,
+      reviewId: "rev_0123456789ABCDEF",
+      repository: "/tmp/review",
+      base: "a".repeat(40),
+      head: "b".repeat(40),
+    }).contextWindowTokens,
+    undefined,
+  );
+  assert.equal(
+    runnerConfigSchema.safeParse({ harness: { contextWindowTokens: 1023 } })
+      .success,
+    false,
+  );
+  assert.equal(
+    runnerConfigSchema.safeParse({ harness: { contextWindowTokens: 10000001 } })
+      .success,
+    false,
+  );
+});
+
+test("duplicate provider/model price entries are rejected instead of selecting arbitrary rates", () => {
+  assert.equal(
+    reviewBudgetSchema.safeParse({
+      pricing: [pricing, { ...pricing, inputUsdPerMillion: 99 }],
+    }).success,
+    false,
+  );
+  const unpriced = new ReviewBudget({
+    provider: "anthropic",
+    model: "fixture",
+    pricing,
+  });
+  unpriced.beginModelTurn(10);
+  unpriced.observeModelTurn({ usage });
+  assert.equal(unpriced.metrics().estimatedCostUsd, undefined);
+  assert.equal(unpriced.metrics().budgetTokens, 120);
+});
+
+test("known input categories still consume the token budget when the provider omits its input total", () => {
+  const budget = new ReviewBudget({ maxTokens: 1000, maxOutputTokens: 10 });
+  budget.beginModelTurn(1);
+  assert.throws(
+    () =>
+      budget.observeModelTurn({
+        usage: { cachedInputTokens: 100000, outputTokens: 1 },
+      }),
+    /tokens/,
+  );
+  assert.equal(budget.metrics().budgetTokens, 100001);
+  assert.equal(budget.metrics().tokenUsageComplete, false);
 });

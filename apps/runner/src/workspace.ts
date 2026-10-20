@@ -374,6 +374,7 @@ export async function prepareWorkspace(
         ),
       },
       compactionThresholdTokens: c.harness.compactionThresholdTokens,
+      contextWindowTokens: c.harness.contextWindowTokens,
       supportsTools: c.model.supports_tools,
       previousFindings: job.previousFindings,
       conversation: job.conversation,

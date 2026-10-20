@@ -46,10 +46,13 @@ test("context estimation conservatively counts serialized UTF-8 and escaping", (
   ];
   assert.equal(
     estimateContextTokens(messages),
-    Buffer.byteLength(JSON.stringify(messages), "utf8"),
+    Math.ceil(Buffer.byteLength(JSON.stringify(messages), "utf8") / 3),
   );
-  assert.ok(estimateContextTokens(messages) > messages[0].content.length);
-  assert.equal(estimateContextTokens([]), 2);
+  assert.ok(
+    estimateContextTokens(messages) <
+      Buffer.byteLength(JSON.stringify(messages), "utf8"),
+  );
+  assert.equal(estimateContextTokens([]), 1);
 });
 
 test("compaction preserves immutable objective, revisions and previous-finding obligations intact", async () => {
@@ -130,6 +133,73 @@ test("oversized Unicode history is consumed once in bounded sequential fragments
   assert.doesNotMatch(fragments.join(""), /�/);
   assert.equal(result.length, 2);
   assert.ok(Buffer.byteLength(String(result[1].content), "utf8") < 34_000);
+});
+
+test("compaction fragments fit the configured estimated input allowance without losing transcript bytes", async () => {
+  const original: ModelMessage[] = [
+    {
+      role: "user",
+      content: "tool-1 failed; caller unresolved. " + '💡"\\\n'.repeat(12_000),
+    },
+  ];
+  const fragments: string[] = [];
+  const sizes: number[] = [];
+  const maxInputTokens = 6000;
+  const result = await compactReviewContext({
+    history: original,
+    retained: [{ role: "system", content: "Stable instructions" }],
+    knownEvidenceIds: new Set(["tool-1"]),
+    maxInputTokens,
+    /** Check the complete estimated request, including its growing continuation envelope. */
+    async generate(messages) {
+      assert.ok(estimateContextTokens(messages) + 1024 <= maxInputTokens);
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(messages), "utf8") <=
+          MAX_COMPACTION_INPUT_BYTES,
+      );
+      const payload = JSON.parse(String(messages[1].content));
+      fragments.push(payload.transcriptFragment);
+      sizes.push(Buffer.byteLength(payload.transcriptFragment));
+      assert.equal(payload.sequence, fragments.length);
+      if (fragments.length > 1)
+        assert.match(payload.previousSummary.notes, /unresolved/);
+      return response(
+        "tool-1 remains unresolved. " + "relevant context ".repeat(350),
+        ["tool-1"],
+      );
+    },
+  });
+  assert.ok(fragments.length > 2);
+  assert.ok(
+    sizes[1] < sizes[0],
+    "the previous note must reduce the next fragment allowance",
+  );
+  assert.equal(fragments.join(""), JSON.stringify(original));
+  assert.doesNotMatch(fragments.join(""), /�/);
+  assert.equal(result.length, 2);
+});
+
+test("compaction fails explicitly when its instruction or previous-note envelope cannot fit", async () => {
+  for (const oversizedNote of [false, true]) {
+    let calls = 0;
+    await assert.rejects(
+      compactReviewContext({
+        history: [
+          { role: "user", content: "unresolved hypothesis ".repeat(2000) },
+        ],
+        retained: [],
+        knownEvidenceIds: new Set(),
+        maxInputTokens: oversizedNote ? 2500 : 1024,
+        /** Return a valid bounded note that cannot fit in the next small-window request. */
+        async generate() {
+          calls++;
+          return response("unresolved hypothesis: " + "x".repeat(20_000));
+        },
+      }),
+      /compaction.*envelope.*input.*limit/i,
+    );
+    assert.equal(calls, oversizedNote ? 1 : 0);
+  }
 });
 
 test("compaction rejects unknown, unseen or duplicate evidence references", async () => {

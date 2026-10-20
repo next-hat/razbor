@@ -115,6 +115,12 @@ export const runnerConfigSchema = z
       .object({
         initialDiffMaxBytes: z.number().int().min(0).max(1000000).default(4096),
         reviewBudget: reviewBudgetSchema.prefault({}),
+        contextWindowTokens: z
+          .number()
+          .int()
+          .min(1024)
+          .max(10000000)
+          .optional(),
         compactionThresholdTokens: z
           .number()
           .int()

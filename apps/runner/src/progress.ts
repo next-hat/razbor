@@ -4,7 +4,12 @@ import type { Socket } from "node:net";
 
 import type Docker from "dockerode";
 
-import { reviewProgressSchema, type ReviewProgress } from "@razbor/contracts";
+import {
+  reviewProgressSchema,
+  reviewAttemptMetricsSchema,
+  type ReviewAttemptMetrics,
+  type ReviewProgress,
+} from "@razbor/contracts";
 
 /**
  * Parse a framed progress payload and forward only schema-valid events; ignore malformed
@@ -134,4 +139,77 @@ export async function followProgress(
       discard.destroy();
     },
   };
+}
+
+/** Retain cumulative attempt metrics and bound full progress events before transport. */
+export class AttemptProgress {
+  metrics: ReviewAttemptMetrics | undefined;
+  private count = 0;
+  private lastMetrics = "{}";
+  private context: Pick<
+    ReviewProgress,
+    "source" | "model" | "turn" | "maxTurns"
+  > = {};
+
+  /** Return a full event or changed metric snapshot, omitting repeated post-limit events. */
+  capture(event: ReviewProgress): ReviewProgress | undefined {
+    const metrics = reviewAttemptMetricsSchema.strip().parse(event);
+    // Omitted metrics must not erase values retained from earlier snapshots.
+    for (const key of Object.keys(metrics) as (keyof ReviewAttemptMetrics)[])
+      if (metrics[key] === undefined) delete metrics[key];
+    if (Object.keys(metrics).length) {
+      const incomplete = this.metrics?.tokenUsageComplete === false;
+      const costIncomplete = this.metrics?.costEstimateComplete === false;
+      this.metrics = { ...this.metrics, ...metrics };
+      if (
+        incomplete ||
+        metrics.tokenUsageComplete === false ||
+        (metrics.inputTokens !== undefined &&
+          metrics.cachedInputTokens === undefined)
+      )
+        delete this.metrics.cachedInputTokens;
+      for (const key of ["uncachedInputTokens", "cacheWriteTokens"] as const)
+        if (
+          incomplete ||
+          metrics.tokenUsageComplete === false ||
+          (metrics.inputTokens !== undefined && metrics[key] === undefined)
+        )
+          delete this.metrics[key];
+      if (
+        costIncomplete ||
+        metrics.costEstimateComplete === false ||
+        ((incomplete || metrics.tokenUsageComplete === false) &&
+          this.metrics.estimatedCostUsd !== undefined)
+      )
+        this.metrics.costEstimateComplete = false;
+      if (incomplete) this.metrics.tokenUsageComplete = false;
+    }
+    for (const key of ["source", "model", "turn", "maxTurns"] as const)
+      if (event[key] !== undefined)
+        Object.assign(this.context, { [key]: event[key] });
+    if (metrics.modelTurns !== undefined)
+      this.context.turn = metrics.modelTurns;
+    const cumulative = { ...this.context, ...this.metrics };
+    const snapshot = JSON.stringify(cumulative);
+    let payload: ReviewProgress = {
+      ...event,
+      ...cumulative,
+      // A usage gap invalidates these categories even if a later event reports them.
+      cachedInputTokens: this.metrics?.cachedInputTokens,
+      uncachedInputTokens: this.metrics?.uncachedInputTokens,
+      cacheWriteTokens: this.metrics?.cacheWriteTokens,
+    };
+    if (this.count++ >= 500) {
+      if (snapshot === "{}" || snapshot === this.lastMetrics) return undefined;
+      payload = {
+        time: event.time,
+        level: event.level,
+        stage: event.stage,
+        message: "Review metrics updated",
+        ...cumulative,
+      };
+    }
+    if (snapshot !== "{}") this.lastMetrics = snapshot;
+    return payload;
+  }
 }

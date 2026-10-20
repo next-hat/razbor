@@ -150,3 +150,63 @@ test("attempt log exposes configured monetary estimates and measured cache categ
     /USD|cost estimate|cached input tokens|cache-write tokens/,
   );
 });
+
+test("attempt log uses the latest cumulative usage snapshot even without a turn field", () => {
+  const base = {
+    attemptId: "att_fixture",
+    time: "2026-10-20T10:00:00Z",
+    level: "info" as const,
+    stage: "model" as const,
+    message: "progress",
+  };
+  const html = renderToStaticMarkup(
+    createElement(ReviewLog, {
+      job: {
+        id: "rev_fixture",
+        repositoryId: "repo_fixture",
+        status: "failed",
+        submittedAt: base.time,
+      },
+      connection: "finished",
+      available: true,
+      lines: [
+        {
+          ...base,
+          sequence: 1,
+          turn: 2,
+          maxTurns: 10,
+          inputTokens: 100,
+          outputTokens: 10,
+          cachedInputTokens: 30,
+          uncachedInputTokens: 70,
+          toolCalls: 4,
+          estimatedCostUsd: 0.001,
+          costEstimateComplete: true,
+        },
+        {
+          ...base,
+          sequence: 501,
+          modelTurns: 3,
+          inputTokens: 250,
+          outputTokens: 25,
+          cachedInputTokens: 80,
+          uncachedInputTokens: 170,
+          toolCalls: 7,
+          estimatedCostUsd: 0.0025,
+          costEstimateComplete: false,
+        },
+      ],
+    }),
+  );
+  for (const text of [
+    "250</strong> reported input tokens",
+    "25</strong> reported output tokens",
+    "80</strong> cached input tokens",
+    "170</strong> uncached input tokens",
+    "7</strong> tool calls",
+    "3</strong> / 10 turns",
+    "0.002500 USD",
+  ])
+    assert.ok(html.includes(text), text);
+  assert.match(html, /estimated cost · incomplete usage/);
+});

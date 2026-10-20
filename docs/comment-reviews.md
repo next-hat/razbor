@@ -217,6 +217,34 @@ When no new or outstanding findings remain, razbor posts a short congratulations
 comment. The neutral result does not approve or merge the pull request or replace
 required checks. On Forgejo, it also leaves any earlier change request in place.
 
+### Deletion-only changes
+
+Inline findings currently require a location in one recorded head-side diff hunk
+ending on an added line. The shared publisher applies this limit for GitHub,
+GitLab and Forgejo. Removing a guard or deleting a whole file can therefore leave
+no eligible inline location, even when baseline inspection demonstrates a defect.
+The agent can inspect removed source at the baseline revision, but must never
+invent an added line or move a finding to an unrelated change. Report the concern
+and its baseline evidence explicitly as a head-side contract limitation in the
+summary. If the returned findings still contain an unsupported location after
+correction, validation leaves the attempt incomplete. Summary limitations remain
+in the saved review and console; when no structured or outstanding findings
+remain, the provider recap keeps its existing short congratulations format and
+does not display that summary.
+
+Older saved findings that reach publication without an eligible anchor remain in
+the review recap with a location limitation. They are preserved as findings and
+are not converted into a clean review. The added-line publication limit predates
+the autonomous harness; validating it inside the harness now rejects unsupported
+locations earlier in the attempt.
+
+Deletion-side findings need a separate, bounded follow-up: explicitly represent
+the source revision and diff side, validate baseline paths and ranges against
+immutable Git objects, update GitHub, GitLab and Forgejo anchor translation and
+source links, and cover deleted guards and whole-file deletions in provider
+fixtures. This follow-up requires a review-contract decision; current finding
+fields and publication APIs retain their existing head-side meaning.
+
 ## Discuss a finding or request another review
 
 Use **Reply** under a razbor inline finding to ask a question or dispute it.

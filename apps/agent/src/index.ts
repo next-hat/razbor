@@ -69,6 +69,7 @@ try {
       maxTurns: job.maxTurns,
       reviewBudget: job.reviewBudget,
       compactionThresholdTokens: job.compactionThresholdTokens,
+      contextWindowTokens: job.contextWindowTokens,
       supportsTools: job.supportsTools,
       baselineSha: job.baseline,
       signal: abort.signal,

@@ -137,8 +137,24 @@ export function ReviewLog({
   const maxTurns = attempt.find(
     (line) => line.maxTurns !== undefined,
   )?.maxTurns;
-  const stats = attempt.find((line) => line.turn !== undefined);
-  const cost = attempt.find((line) => line.estimatedCostUsd !== undefined);
+  // Transport may retain cumulative metric events without the older turn field.
+  // Select costs and token categories from the same latest snapshot.
+  const stats =
+    attempt.find((line) =>
+      [
+        line.modelTurns,
+        line.inputTokens,
+        line.outputTokens,
+        line.toolCalls,
+        line.estimatedCostUsd,
+        line.tokenUsageComplete,
+      ].some((value) => value !== undefined),
+    ) ?? attempt.find((line) => line.turn !== undefined);
+  const turn =
+    stats?.modelTurns ??
+    stats?.turn ??
+    attempt.find((line) => line.turn !== undefined)?.turn;
+  const cost = stats;
   const elapsed = elapsedSeconds(job, now);
   return (
     <section
@@ -189,7 +205,7 @@ export function ReviewLog({
           </strong>
         </span>
         <span>
-          <strong>{stats?.turn ?? 0}</strong>
+          <strong>{turn ?? 0}</strong>
           {maxTurns !== undefined && ` / ${maxTurns}`} turns{" "}
           <span className="text-muted-foreground">this attempt</span>
         </span>

@@ -82,13 +82,14 @@ timeout_ms = 3600000
 
 [model]
 max_requests = 512
-max_retries = 0 # legacy accepted setting; automatic provider retries are disabled
+max_retries = 0 # opt in to bounded retries of known nonbillable rate rejections
 max_output_tokens = 4096
 timeout_ms = 3600000
 
 [harness]
 initialDiffMaxBytes = 4096
-compactionThresholdTokens = 80000
+compactionThresholdTokens = 80000 # compaction trigger, not a hard context limit
+# contextWindowTokens = 128000 # optional example: use the selected model's supported window
 
 [harness.reviewBudget]
 maxToolCalls = 2048
@@ -97,26 +98,44 @@ maxOutputTokens = 4096
 # maxCostUsd requires explicit, current prices for the exact assigned model.
 ```
 
-`model.max_requests` bounds all model turns, including compaction and the single
-allowed correction of invalid final JSON. `harness.reviewBudget` additionally
-bounds tool calls, cumulative input plus output tokens, and optional estimated
-USD cost. Both output caps apply; the relay respects the lower cap. There is no
-per-group budget multiplier. A rejected tool batch executes no commands. Budget
-exhaustion fails the attempt; it never publishes a clean result by default.
+`model.max_requests` bounds all model turns, including compaction, final output
+and the single allowed correction of invalid final JSON. `harness.reviewBudget`
+additionally bounds tool calls, cumulative input plus output tokens, and optional
+estimated USD cost. Both output caps apply; the relay respects the lower cap.
+There is no per-group budget multiplier.
 
-To enforce a monetary ceiling, add `maxCostUsd` and
-`[harness.reviewBudget.pricing]` with `model`, `inputUsdPerMillion`,
-`cachedInputUsdPerMillion`, `outputUsdPerMillion`, and
-`cacheWriteUsdPerMillion`. Prices are operator-supplied USD per million tokens;
-use zero for a category only when it is not separately billed. The pricing model
-must exactly match the review's selected model. Without prices no cost is shown;
-a monetary ceiling without prices is rejected. Agent profiles continue to choose
+The agent receives one updated remaining-budget notice and keeps room for a final
+ReviewResult. Before a tool batch executes, the harness checks the whole batch and
+its expected output against the remaining tool/token/cost limits and final-response
+headroom. A refused batch executes no tools; each request receives an explicit
+"not executed" result. If a final response is still affordable, the agent must
+finalize with tools disabled and disclose incomplete inspection, unresolved prior
+findings and unrun checks. If it cannot safely afford that response, the attempt
+fails explicitly. No successful clean review is fabricated from exhaustion.
+
+To enforce a monetary ceiling, configure `maxCostUsd` and verified prices under
+`harness.reviewBudget.pricing`. A price entry includes `provider`, `model`,
+`inputUsdPerMillion`, `cachedInputUsdPerMillion`, `outputUsdPerMillion` and
+`cacheWriteUsdPerMillion`. Use TOML array entries
+`[[harness.reviewBudget.pricing]]` to price multiple provider/model pairs. The
+legacy single table `[harness.reviewBudget.pricing]` remains accepted; an omitted
+provider means `openai`. Duplicate provider/model identities are rejected.
+
+Prices are operator-supplied USD per million tokens; use zero for a category only
+when it is not separately billed. Only an exact provider and model match supplies
+cost estimates. Without a matching entry, an uncapped review continues with token
+and tool limits and no cost estimate. A monetary cap requires a matching entry and
+fails before a model dispatch when none exists. Agent profiles continue to choose
 the model and reasoning effort through the existing configuration.
 
-Every paid call reserves conservative input and a full capped output before
-dispatch. Complete provider measurements settle the reservation; missing or
-failed responses retain conservative charges and mark usage incomplete. Cached,
-uncached, output and separately billed cache-write categories remain distinct.
+Budget admission reserves conservative input and a full capped output before each
+dispatch. Its serialized-byte allowance and overhead are deliberately separate
+from the rough context-compaction estimate; when provider prompt measurements
+exist, new serialized bytes retain a conservative allowance. Complete provider
+measurements settle the reservation. Missing or failed responses retain
+conservative charges and mark usage incomplete. Cached, uncached, output and
+separately billed cache-write categories remain distinct.
+
 The existing execution log shows available per-attempt categories and USD
 estimates, labeling conservative estimates. Attempt metrics use existing JSON
 storage and survive failed reviews; no database migration is required. Use matching
@@ -125,12 +144,31 @@ reject them. Existing saved reviews and legacy metric records remain readable.
 
 ### Requests, isolation and command exploration
 
-The SDK and both relay hops dispatch each model request once. HTTP failures,
-rate limits and timeouts are not silently retried, even if a legacy
-`model.max_retries` value is configured. Provider quota headers may pace a later
-independent request. Request timeouts and quota waits remain bounded by the
-whole-attempt deadline; a new request never gets a fresh attempt deadline.
-A final-JSON correction is an explicit budgeted turn, not a transport retry.
+The SDK does not retry model requests. Relay throttle retries are opt-in through
+`model.max_retries` (default 0; range 0–10). A positive value permits only bounded
+retries of known pre-generation rate rejection envelopes: OpenAI
+`rate_limit_exceeded` / `slow_down`, or Claude `rate_limit_error` with a valid
+provider retry delay (its monthly spend-cap errors share the same type). A 429 status,
+`Retry-After` or `x-should-retry: true` alone is insufficient. Permanent quota,
+billing or subscription errors, unknown compatible-provider/Azure error shapes,
+usage-bearing errors, authentication errors, 5xx, transport failures and timeouts
+are never automatically retried. `x-should-retry: false` always disables retry.
+Classification assumes these documented rate errors rejected generation; it does
+not establish a provider billing guarantee for arbitrary compatible endpoints. See
+the [OpenAI error categories](https://developers.openai.com/api/docs/guides/error-codes),
+[Claude429/spend-cap distinction](https://platform.claude.com/docs/en/api/errors),
+and [Azure429 guidance](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/quota).
+
+Known throttle retries honor `retry-after-ms` / `Retry-After`; without a valid
+hint a recognized OpenAI rate rejection uses bounded exponential backoff. Claude
+rejections without a valid delay remain ambiguous and are not retried. Shared quota
+pacing still applies.
+One fixed `model.timeout_ms` deadline covers quota waits, all retries and the
+response body, bounded further by the whole-attempt deadline. Cancellation or
+revocation interrupts backoff before another dispatch. Retry diagnostics expose
+only safe classifications and counts. The retry limit counts extra rejected
+upstream requests within one model turn; it does not authorize another billed
+generation. A final-JSON correction remains an explicit budgeted model turn.
 
 Exec accepts an argument vector and a repository-confined working directory.
 Installed git, rg, grep, cat, sed, awk, head, tail and find can inspect the checkout;
@@ -155,21 +193,38 @@ source pages are limited to 400 lines and 100,000 bytes. Diff pages remain bound
 by the tool output limit. Exceeding a Git cap fails with
 `GIT_OUTPUT_LIMIT_EXCEEDED` without logging source content.
 
-One automatic compaction mechanism triggers at
-`harness.compactionThresholdTokens` (default 80,000). It uses provider prompt
-measurements plus conservative estimates for new history, or serialized UTF-8
-bytes when measurements are absent. Tool definitions and request overhead also
-consume context. The stable system prompt, review objective, revision identities
-and previous-finding obligations remain intact. Older history becomes one bounded
-continuation note preserving discoveries, observation references, unresolved
-hypotheses, failed/unrun checks, inspection limitations and next steps.
+One automatic compaction mechanism uses `harness.compactionThresholdTokens`
+(default 80,000) as a trigger for reducible investigation history. It is not a hard
+context limit. Large immutable inputs do not fail merely because they exceed the
+trigger; initial source context is not replaced with a lossy note before the
+first model request. The trigger can rise above the immutable context, and
+compaction runs only when it can preserve final-response headroom.
+
+Context estimates use measured provider prompt tokens plus estimated new history,
+or serialized UTF-8 bytes divided by three when measurements are absent. Tool
+definitions and request overhead also count. These are planning heuristics, not
+exact tokenization or the conservative byte allowance used for budget admission.
+Optionally set `harness.contextWindowTokens` to the supported context window of
+the selected model. Every dispatch, including compaction, checks estimated input
+plus the capped output against that separate configured window. Summary fragments
+shrink to fit their entire estimated request, including the previous note, prompt
+and reference list. The provider still enforces its actual token limit.
+
+Compaction preserves the stable system instructions, exact complete changed-file
+manifest, revision identities, previous-finding obligations and environment facts.
+Older investigation history becomes one bounded continuation note preserving
+relevant discoveries, observation references, unresolved hypotheses, failed/unrun
+checks, inspection limitations and next steps. Tools-disabled profiles keep their
+exact inline comparison and do not replace it with compressed evidence they
+cannot reread.
 
 Oversized history is summarized in sequential bounded fragments through the same
 model, budget and cancellation signal. Complete tool outputs are consumed once,
 not replayed after compaction; no duplicate evidence ledger or checkpoint JSON is
-injected. Unknown references, incomplete notes or retained context that cannot
-fit fail the attempt. Notes cannot prove a finding or a passing check. Important
-source evidence must be reread when needed. No new persistent state is introduced.
+injected. Unknown references, incomplete notes or an immutable request envelope
+that cannot fit the configured window fail explicitly. Notes cannot prove a
+finding or a passing check. Important source evidence must be reread when needed.
+No new persistent state is introduced.
 
 The agent decides how to investigate large comparisons and must disclose any
 uninspected scope. Optional diff-delivery counters measure content supplied by

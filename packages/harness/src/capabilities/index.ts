@@ -142,12 +142,10 @@ export class ReviewCapabilities {
         await this.memory.start();
         this.signal.throwIfAborted();
       } catch {
-        try {
-          await this.memory.close();
-        } finally {
-          this.signal.throwIfAborted();
-        }
+        const memory = this.memory;
         this.memory = undefined;
+        await this.closeOptional(() => memory.close());
+        this.signal.throwIfAborted();
         const limitation =
           "Optional Codebase Memory is unavailable; no graph inspection was performed through this capability.";
         this.limitations.push(limitation);
@@ -186,12 +184,9 @@ export class ReviewCapabilities {
         await server.start();
         this.signal.throwIfAborted();
       } catch {
-        try {
-          await server.close();
-        } finally {
-          this.signal.throwIfAborted();
-        }
         this.mcpServers.pop();
+        await this.closeOptional(() => server.close());
+        this.signal.throwIfAborted();
         const limitation = `Optional MCP capability ${index + 1} is unavailable; its tools were not used for inspection.`;
         this.limitations.push(limitation);
         this.log.warn(limitation);
@@ -256,13 +251,31 @@ export class ReviewCapabilities {
     this.skills?.resetContext();
   }
 
-  /** Closes every remote client, including clients whose startup failed. */
+  /** Record one sanitized limitation when optional session shutdown cannot be confirmed. */
+  private async closeOptional(close: () => Promise<void>) {
+    try {
+      await close();
+    } catch {
+      const limitation =
+        "Optional capability cleanup did not complete; remote session shutdown could not be confirmed.";
+      if (!this.limitations.includes(limitation)) {
+        this.limitations.push(limitation);
+        this.log.warn(limitation);
+      }
+    }
+  }
+
+  /** Disable optional tools and close each client once, preserving cancellation as fatal. */
   async close() {
-    const results = await Promise.allSettled([
-      this.memory?.close(),
-      ...this.mcpServers.map((server) => server.close()),
+    const memory = this.memory;
+    this.memory = undefined;
+    this.durableMemory = undefined;
+    const servers = this.mcpServers.splice(0);
+    this.mcpTools.clear();
+    await Promise.all([
+      ...(memory ? [this.closeOptional(() => memory.close())] : []),
+      ...servers.map((server) => this.closeOptional(() => server.close())),
     ]);
-    for (const result of results)
-      if (result.status === "rejected") throw result.reason;
+    this.signal.throwIfAborted();
   }
 }

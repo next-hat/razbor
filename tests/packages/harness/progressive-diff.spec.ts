@@ -551,3 +551,47 @@ test("modified multi-hunk pages retain old/new source line locations under a sma
     await f.close();
   }
 });
+
+test("deletion-only changes retain baseline evidence without inventing new-side added anchors", async () => {
+  const f = await diffFixture();
+  try {
+    await f.write("source.ts", "guard();\nwork();\n");
+    const baseline = await f.commit();
+    await f.write("source.ts", "work();\n");
+    await rm(path.join(f.repository, "related.ts"));
+    const deletedHead = await f.commit();
+    const tools = new RepositoryTools(f.repository);
+    const deleted = await tools.prepareDiff(baseline, deletedHead);
+    assert.equal(
+      deleted.files.find((file) => file.path === "source.ts")?.added,
+      0,
+    );
+    assert.equal(deleted.validFindingRange("source.ts", 1, 1), false);
+    assert.equal(deleted.validFindingRange("related.ts", 1, 1), false);
+    assert.match(
+      JSON.parse(
+        await tools.readFile({ path: "source.ts", revision: "baseline" }),
+      ).source,
+      /guard/,
+    );
+    assert.match(
+      JSON.parse(await tools.readFile({ path: "source.ts" })).source,
+      /work/,
+    );
+    assert.equal(
+      JSON.parse(await tools.readFile({ path: "related.ts" })).state,
+      "absent",
+    );
+    await f.write("source.ts", "work();\ncleanup();\n");
+    const addedHead = await f.commit();
+    const added = await new RepositoryTools(f.repository).prepareDiff(
+      baseline,
+      addedHead,
+    );
+    assert.equal(added.validFindingRange("source.ts", 2, 2), true);
+    assert.equal(added.validFindingRange("source.ts", 1, 1), false);
+    assert.equal(added.validFindingRange("source.ts", 1, 3), false);
+  } finally {
+    await f.close();
+  }
+});

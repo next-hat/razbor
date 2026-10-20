@@ -5,6 +5,7 @@ import { reviewResultSchema, type ReviewFinding } from "@razbor/contracts";
 import { preparePublication } from "@razbor/database";
 import {
   forgeMarkdown,
+  renderReview,
   forgejoSourceUrl,
   renderForgejoInline,
   renderForgejoReview,
@@ -247,4 +248,55 @@ test("saved results remain readable and malformed replacements retain strict val
       }).success,
       false,
     );
+});
+
+test("deletion-only findings retain recap evidence without inline anchors on every provider", () => {
+  const deletion =
+    "diff --git a/src/timer.ts b/src/timer.ts\n--- a/src/timer.ts\n+++ b/src/timer.ts\n@@ -1,2 +1 @@\n-guard();\n work();\n";
+  const deletedFile =
+    "diff --git a/src/timer.ts b/src/timer.ts\ndeleted file mode 100644\n--- a/src/timer.ts\n+++ /dev/null\n@@ -1 +0,0 @@\n-guard();\n";
+  const deletionFinding = {
+    ...finding,
+    lineStart: 1,
+    lineEnd: 1,
+    title: "Removing the guard changes authorization",
+  };
+  for (const patch of [deletion, deletedFile]) {
+    const prepared = preparePublication(
+      {
+        summary: "Removed guard requires attention.",
+        findings: [deletionFinding],
+      },
+      patch,
+      "rev_abcdefghijklmnop",
+    );
+    assert.deepEqual(prepared.comments, []);
+    assert.deepEqual(prepared.findings, [deletionFinding]);
+    assert.equal(prepared.limitations.length, 1);
+    assert.match(prepared.limitations[0], /ending on an added line/);
+    for (const forgeType of ["github", "gitlab", "forgejo"] as const) {
+      const recap = renderReview(
+        {
+          summary: "Removed guard requires attention.",
+          findings: prepared.findings,
+        },
+        head,
+        {
+          forgeType,
+          anchoredFindings: prepared.comments,
+          limitations: prepared.limitations,
+        },
+      );
+      assert.ok(recap.includes(deletionFinding.title), forgeType);
+      assert.ok(recap.includes(deletionFinding.failureScenario), forgeType);
+      assert.doesNotMatch(recap, /Congratulations/);
+    }
+  }
+  const added = preparePublication(
+    { summary: "Review", findings: [finding] },
+    diff,
+    "rev_abcdefghijklmnop",
+  );
+  assert.equal(added.comments.length, 1);
+  assert.equal(added.comments[0].lineEnd, 4);
 });

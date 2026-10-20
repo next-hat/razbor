@@ -18,14 +18,15 @@ changed; integration and smoke checks are separate commands.
 
 These suites need no Docker, database, model credentials, or live forge.
 
-| Command                                     | Coverage                                                                      | Extra requirements                             |
-| ------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------- |
-| `pnpm test` or `pnpm run test:capabilities` | Skills, file/output limits, MCP validation, runner instructions               | Node 24 and Git                                |
-| `pnpm run test:diff`                        | Diff pagination, pinned source reads, cancellation, usage reporting           | Temporary Git repositories and child processes |
-| `pnpm run test:verification`                | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch | Child processes and stdio pipes                |
-| `pnpm run test:persistence:unit`            | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                      | Local sockets                                  |
-| `pnpm run test:presentation`                | Review contracts, forge formatting, server-rendered components                | The script selects its TSX configuration       |
-| `pnpm run test:coverage`                    | The default suite with a coverage report                                      | No additional requirements                     |
+| Command                                     | Coverage                                                                                       | Extra requirements                             |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `pnpm test` or `pnpm run test:capabilities` | Skills, file/output limits, MCP validation, runner instructions                                | Node 24 and Git                                |
+| `pnpm run test:review`                      | Autonomous loop, compaction, budgets, relay retry policy, cumulative progress, offline scoring | Temporary Git repositories and child processes |
+| `pnpm run test:diff`                        | Diff pagination, pinned source reads, cancellation, usage reporting                            | Temporary Git repositories and child processes |
+| `pnpm run test:verification`                | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
+| `pnpm run test:persistence:unit`            | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
+| `pnpm run test:presentation`                | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
+| `pnpm run test:coverage`                    | The default suite with a coverage report                                                       | No additional requirements                     |
 
 Run a spec or select tests by name:
 
@@ -54,9 +55,14 @@ pnpm run test:verification
 ```
 
 These deterministic provider fixtures exercise command-only exploration, immutable
-finding locations, previous findings, automatic compaction, failure/cancellation,
-whole-batch tool limits and conservative token/cost reservations. They measure
-protocol behavior; scripted replies do not measure model finding recall or false
+finding locations, exact manifest and previous-finding retention, compaction-window
+chunking, failure/cancellation, budget notices and final-response headroom. They
+cover refused tool batches without command execution, strict token/cost reservations,
+provider/model price selection and legacy configuration compatibility. Relay cases
+exercise opt-in known nonbillable throttles, Retry-After, one request deadline and
+permanent/ambiguous error rejection. Cumulative progress cases preserve coherent
+usage/cost snapshots after 500 events and keep cache data unknown after usage gaps.
+These fixtures measure protocol behavior; scripted replies do not measure model finding recall or false
 positives. Verification checks use installed Git/rg/grep/cat/sed/awk/head/tail/find
 and deterministic process cleanup barriers; unavailable optional utilities are
 reported as skipped. No real model, database or infrastructure credentials are

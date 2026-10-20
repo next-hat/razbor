@@ -39,14 +39,14 @@ function serializedBytes(value: unknown): number {
 }
 
 /**
- * Uses one token per serialized UTF-8 byte when provider measurements are absent.
- * This intentionally overestimates ordinary text, JSON escaping and non-ASCII
- * output rather than relying on an English-only characters-per-token ratio.
+ * Estimates unmeasured context from serialized UTF-8 with a conservative text ratio.
+ * This is a planning heuristic, never an exact tokenizer or a measured provider count.
+ * Monetary reservations retain their separate byte-based upper allowance.
  */
 export function estimateContextTokens(
   messages: readonly ModelMessage[],
 ): number {
-  return serializedBytes(messages);
+  return Math.ceil(serializedBytes(messages) / 3);
 }
 
 /** Moves a split before a surrogate pair so every fragment preserves its Unicode text. */
@@ -65,8 +65,15 @@ function safeBoundary(text: string, end: number): number {
  * Splits even a single enormous tool result as quoted transcript data. The limit
  * applies after JSON escaping, rather than assuming character count equals bytes.
  */
-function* transcriptChunks(text: string): Generator<string> {
+function* transcriptChunks(
+  text: string,
+  fits?: (fragment: string) => boolean,
+): Generator<string> {
   for (let offset = 0; offset < text.length;) {
+    if (fits && !fits(""))
+      throw new IncompleteReviewError([
+        "Context compaction envelope exceeds the configured input token limit.",
+      ]);
     let low = offset + 1;
     let high = Math.min(text.length, offset + MAX_QUOTED_CHUNK_BYTES);
     let end = offset;
@@ -74,7 +81,9 @@ function* transcriptChunks(text: string): Generator<string> {
       const middle = Math.floor((low + high) / 2);
       const candidate = safeBoundary(text, middle);
       if (
-        serializedBytes(text.slice(offset, candidate)) <= MAX_QUOTED_CHUNK_BYTES
+        serializedBytes(text.slice(offset, candidate)) <=
+          MAX_QUOTED_CHUNK_BYTES &&
+        (!fits || fits(text.slice(offset, candidate)))
       ) {
         end = candidate;
         low = middle + 1;
@@ -97,6 +106,8 @@ function* transcriptChunks(text: string): Generator<string> {
  * stay outside summarization and are returned intact in tool-free retained messages.
  * Large transcripts are consumed once in bounded fragments; each request carries
  * only the previous note, not earlier tool outputs or a duplicated evidence ledger.
+ * An optional input allowance sizes each fragment against the full estimated request,
+ * reserving provider overhead while preserving the separate byte ceiling.
  * Invalid or oversized notes fail the review instead of silently dropping history.
  */
 export async function compactReviewContext(options: {
@@ -104,9 +115,16 @@ export async function compactReviewContext(options: {
   retained: ModelMessage[];
   knownEvidenceIds: ReadonlySet<string>;
   generate(messages: ModelMessage[]): Promise<ModelTurn>;
+  maxInputTokens?: number;
   signal?: AbortSignal;
 }): Promise<ModelMessage[]> {
   options.signal?.throwIfAborted();
+  const maxInputTokens = options.maxInputTokens;
+  if (
+    maxInputTokens !== undefined &&
+    (!Number.isSafeInteger(maxInputTokens) || maxInputTokens < 1)
+  )
+    throw new IncompleteReviewError(["Invalid compaction input token limit."]);
   if (serializedBytes(options.retained) > MAX_RETAINED_CONTEXT_BYTES)
     throw new IncompleteReviewError([
       "Immutable review guidance and obligations exceed the context limit.",
@@ -129,8 +147,8 @@ export async function compactReviewContext(options: {
   const transcript = serializeContext(options.history);
   let summary: ContextSummary | null = null;
   let sequence = 0;
-  for (const chunk of transcriptChunks(transcript)) {
-    options.signal?.throwIfAborted();
+  /** Includes the actual prompt, prior note and visible-reference list in each candidate request. */
+  const requestForFragment = (chunk: string) => {
     const visibleIds = new Set([
       ...(summary?.evidenceIds ?? []),
       ...(summary?.notes.match(/\btool-\d+\b/g) ?? []),
@@ -141,7 +159,7 @@ export async function compactReviewContext(options: {
       {
         role: "user",
         content: serializeContext({
-          sequence: ++sequence,
+          sequence: sequence + 1,
           previousSummary: summary,
           knownEvidenceIds: [...visibleIds].filter((id) =>
             options.knownEvidenceIds.has(id),
@@ -150,6 +168,23 @@ export async function compactReviewContext(options: {
         }),
       },
     ];
+    return { messages, visibleIds };
+  };
+  /** Leaves room for unmeasured request overhead without presenting estimates as exact tokens. */
+  const fitsInput = (fragment: string) => {
+    const { messages } = requestForFragment(fragment);
+    return (
+      serializedBytes(messages) <= MAX_COMPACTION_INPUT_BYTES &&
+      estimateContextTokens(messages) + 1024 <= maxInputTokens!
+    );
+  };
+  for (const chunk of transcriptChunks(
+    transcript,
+    maxInputTokens === undefined ? undefined : fitsInput,
+  )) {
+    options.signal?.throwIfAborted();
+    const { messages, visibleIds } = requestForFragment(chunk);
+    sequence++;
     if (serializedBytes(messages) > MAX_COMPACTION_INPUT_BYTES)
       throw new IncompleteReviewError([
         "Compaction input exceeds the safe request limit.",
