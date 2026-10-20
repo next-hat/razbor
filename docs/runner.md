@@ -133,8 +133,11 @@ dispatch. Its serialized-byte allowance and overhead are deliberately separate
 from the rough context-compaction estimate; when provider prompt measurements
 exist, new serialized bytes retain a conservative allowance. Complete provider
 measurements settle the reservation. Missing or failed responses retain
-conservative charges and mark usage incomplete. Cached, uncached, output and
-separately billed cache-write categories remain distinct.
+conservative charges and mark usage incomplete. Each missing input/output total
+retains its own reservation: measured input above its estimate still includes
+the capped output allowance when output usage is absent. Missing categories are
+not recorded as measured usage. Cached, uncached, output and separately billed
+cache-write categories remain distinct.
 
 The existing execution log shows available per-attempt categories and USD
 estimates, labeling conservative estimates. Attempt metrics use existing JSON
@@ -260,7 +263,9 @@ not replayed after compaction; no duplicate evidence ledger or checkpoint JSON i
 injected. Unknown, unseen or duplicate structured `evidenceIds`, incomplete notes,
 or an immutable request envelope that cannot fit the configured window fail
 explicitly. Free-text notes may quote repository strings such as `tool-99`; those
-strings are not validated observation IDs. Notes cannot prove a finding or a
+strings are not validated observation IDs. Known references remain whole across
+fragment boundaries, and visible IDs use the original transcript boundaries so a
+split cannot invent a shorter reference. Notes cannot prove a finding or a
 passing check. Important source evidence must be reread when needed.
 No new persistent state is introduced.
 
@@ -291,8 +296,10 @@ runner; agents receive only a revocable attempt credential.
 
 Before investigation, Razbor checks executables on the approved PATH and detects
 common root manifests. It does not execute project scripts or install toolchains.
-Logs and model context report missing tools, and reviews must distinguish source
-inspection from checks that ran.
+Concrete missing required tools generate warning progress and are appended to the
+result summary as verification limitations even when the model omits them. Generic
+presence-only and read-only environment notices remain model guidance. Reviews
+must distinguish source inspection from checks that ran.
 
 The standard Node agent image has no Cargo. For build verification, choose a
 trusted agent image with the needed toolchain; installing it on the outer runner

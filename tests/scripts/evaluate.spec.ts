@@ -327,3 +327,126 @@ test("offline pricing rejects duplicate provider/model identities using legacy p
   assert.match(prepared.stderr, /Invalid evaluation input/);
   assert.doesNotMatch(prepared.stderr, /private-pricing-model/);
 });
+
+for (const command of ["record", "score"] as const) {
+  for (const scenario of ["missing", "wrong-object", "wrong-array"] as const) {
+    test(`offline ${command} rejects a monetary cap with ${scenario} pricing`, async (t) => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "razbor-evaluate-cap-"),
+      );
+      t.after(() => rm(root, { recursive: true, force: true }));
+      const raw = await readFile(datasetPath, "utf8");
+      const dataset = JSON.parse(raw);
+      const original = execution(dataset.cases[0]);
+      const price = {
+        model: "private-wrong-model",
+        inputUsdPerMillion: 2,
+        cachedInputUsdPerMillion: 0.2,
+        cacheWriteUsdPerMillion: 2.5,
+        outputUsdPerMillion: 8,
+      };
+      const pricing =
+        scenario === "missing"
+          ? undefined
+          : scenario === "wrong-object"
+            ? price
+            : [
+                price,
+                {
+                  ...price,
+                  provider: "anthropic",
+                  model: "another-private-wrong-model",
+                },
+              ];
+      const item = {
+        ...original,
+        configuration: {
+          ...original.configuration,
+          maxCostUsd: 0.5,
+          ...(pricing === undefined ? {} : { pricing }),
+        },
+      };
+      const input = path.join(root, "input.json");
+      await writeFile(
+        input,
+        JSON.stringify(
+          command === "record"
+            ? item
+            : {
+                version: 1,
+                datasetSha256: hash(raw),
+                caseId: dataset.cases[0].id,
+                assessor: null,
+                resultSha256: hash(JSON.stringify(item.result)),
+                execution: item,
+                judgments: [],
+              },
+        ),
+      );
+      const result =
+        command === "record"
+          ? evaluate(command, datasetPath, dataset.cases[0].id, input)
+          : evaluate(command, datasetPath, input);
+      assert.equal(
+        result.status,
+        1,
+        `${command} accepted a cap with ${scenario} pricing`,
+      );
+      assert.match(result.stderr, /Invalid evaluation input/);
+      assert.doesNotMatch(
+        result.stderr,
+        /private-wrong-model|another-private-wrong-model/,
+      );
+    });
+  }
+}
+
+test("capped offline records preserve matching multi-provider pricing without adding budget defaults", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "razbor-evaluate-cap-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataset = JSON.parse(await readFile(datasetPath, "utf8"));
+  const original = execution(dataset.cases[0]);
+  const price = {
+    provider: "anthropic",
+    model: original.configuration.model,
+    inputUsdPerMillion: 2,
+    cachedInputUsdPerMillion: 0.2,
+    cacheWriteUsdPerMillion: 2.5,
+    outputUsdPerMillion: 8,
+  };
+  for (const pricing of [
+    price,
+    [
+      price,
+      { ...price, provider: "openai" },
+      { ...price, model: "other-model" },
+    ],
+  ]) {
+    const configuration = {
+      ...original.configuration,
+      maxCostUsd: 0.5,
+      pricing,
+    };
+    const input = path.join(root, "input.json");
+    await writeFile(input, JSON.stringify({ ...original, configuration }));
+    const prepared = evaluate(
+      "record",
+      datasetPath,
+      dataset.cases[0].id,
+      input,
+    );
+    assert.equal(prepared.status, 0, prepared.stderr);
+    assert.deepEqual(
+      JSON.parse(prepared.stdout).execution.configuration,
+      configuration,
+    );
+    const run = path.join(root, "run.json");
+    await writeFile(run, prepared.stdout);
+    const scored = evaluate("score", datasetPath, run);
+    assert.equal(scored.status, 0, scored.stderr);
+    assert.deepEqual(
+      JSON.parse(scored.stdout).configurations[0].configuration,
+      configuration,
+    );
+  }
+});

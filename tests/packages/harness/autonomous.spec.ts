@@ -159,6 +159,87 @@ test("agent explores callers and pinned source exclusively through exec before r
   }
 });
 
+test("missing required verification tools are warned and disclosed even when the model omits them", async (t) => {
+  const f = await diffFixture();
+  try {
+    await f.write("go.mod", "module fixture\n");
+    const head = await f.commit();
+    const events: ReviewProgress[] = [];
+    const model = provider(t, [
+      (body) => {
+        assert.match(
+          inputText(body),
+          /go is unavailable on the approved executable PATH/,
+        );
+        assert.match(
+          inputText(body),
+          /Preflight checks executable presence only/,
+        );
+        return {
+          summary: "Source inspection found no actionable issue.",
+          findings: [],
+        };
+      },
+    ]);
+    const result = await reviewRepository(f.repository, f.base, head, {
+      ...options,
+      maxTurns: 1,
+      verification: { exec: { env: { PATH: "" } } },
+      /** Observe concrete missing-prerequisite warnings without relying on the model's summary. */
+      onProgress: (event) => events.push(event),
+    });
+    assert.match(
+      result.summary,
+      /Verification limitations: go is unavailable on the approved executable PATH; checks requiring it have not run/,
+    );
+    assert.doesNotMatch(
+      result.summary,
+      /Preflight checks executable presence only|checkout read-only|Commands needing writes/,
+    );
+    const warnings = events.filter((event) => event.level === "warn");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0].message, /go is unavailable/);
+    assert.equal(model.calls, 1);
+    assert.equal(events.at(-1)!.toolCalls, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("available required verification tools keep generic preflight notices out of the result and warnings", async (t) => {
+  const f = await diffFixture();
+  try {
+    await f.write("package.json", "{}\n");
+    const head = await f.commit();
+    const events: ReviewProgress[] = [];
+    const summary = "Source inspection only; no test result is claimed.";
+    const model = provider(t, [
+      (body) => {
+        assert.match(
+          inputText(body),
+          /Preflight checks executable presence only/,
+        );
+        return { summary, findings: [] };
+      },
+    ]);
+    const result = await reviewRepository(f.repository, f.base, head, {
+      ...options,
+      maxTurns: 1,
+      verification: { exec: { env: { PATH: path.dirname(process.execPath) } } },
+      /** Verify presence-only guidance does not become a fabricated missing-tool limitation. */
+      onProgress: (event) => events.push(event),
+    });
+    assert.equal(result.summary, summary);
+    assert.deepEqual(
+      events.filter((event) => event.level === "warn"),
+      [],
+    );
+    assert.equal(model.calls, 1);
+  } finally {
+    await f.close();
+  }
+});
+
 test("final source locations reject unchanged, out-of-range and unsafe paths even after working-tree mutation", async (t) => {
   const f = await diffFixture();
   try {

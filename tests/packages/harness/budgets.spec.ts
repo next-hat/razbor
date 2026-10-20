@@ -103,6 +103,58 @@ test("missing telemetry cannot release a reservation or fabricate measured usage
   assert.throws(() => budget.beginModelTurn(501), ReviewBudgetExceeded);
 });
 
+for (const partial of [
+  { name: "input", usage: { inputTokens: 250 } },
+  { name: "output", usage: { outputTokens: 250 } },
+  { name: "input categories", usage: { cachedInputTokens: 250 } },
+]) {
+  test(`incomplete ${partial.name} usage retains the independently missing token reservation`, () => {
+    const budget = new ReviewBudget({ maxTokens: 400, maxOutputTokens: 100 });
+    budget.beginModelTurn(100);
+    budget.observeModelTurn({ usage: partial.usage });
+    const metrics = budget.metrics();
+    assert.equal(metrics.budgetTokens, 350);
+    assert.equal(metrics.inputTokens, partial.usage.inputTokens);
+    assert.equal(metrics.outputTokens, partial.usage.outputTokens);
+    assert.equal(metrics.tokenUsageComplete, false);
+    assert.equal(budget.remaining().tokens, 50);
+    assert.equal(budget.canReserveModelTurns(0), false);
+    assert.throws(() => budget.beginModelTurn(0), /tokens/);
+    assert.equal(budget.metrics().modelTurns, 1);
+  });
+}
+
+test("measured zero input or output counts release that category's reservation", () => {
+  for (const measured of [
+    { inputTokens: 250, outputTokens: 0 },
+    { inputTokens: 0, outputTokens: 250 },
+    { inputTokens: 0, outputTokens: 0 },
+  ]) {
+    const budget = new ReviewBudget({ maxTokens: 400, maxOutputTokens: 100 });
+    budget.beginModelTurn(100);
+    budget.observeModelTurn({ usage: measured });
+    assert.equal(
+      budget.metrics().budgetTokens,
+      measured.inputTokens + measured.outputTokens,
+    );
+    assert.equal(budget.metrics().inputTokens, measured.inputTokens);
+    assert.equal(budget.metrics().outputTokens, measured.outputTokens);
+    assert.equal(budget.metrics().tokenUsageComplete, true);
+  }
+});
+
+test("zero output remains measured when input telemetry is incomplete", () => {
+  const budget = new ReviewBudget({ maxTokens: 400, maxOutputTokens: 100 });
+  budget.beginModelTurn(100);
+  budget.observeModelTurn({
+    usage: { cachedInputTokens: 250, outputTokens: 0 },
+  });
+  assert.equal(budget.metrics().budgetTokens, 250);
+  assert.equal(budget.metrics().inputTokens, undefined);
+  assert.equal(budget.metrics().outputTokens, 0);
+  assert.equal(budget.metrics().tokenUsageComplete, false);
+});
+
 test("actual provider overruns halt immediately while preserving final metrics", () => {
   const budget = new ReviewBudget({ maxTokens: 50, maxOutputTokens: 10 });
   budget.beginModelTurn(10);

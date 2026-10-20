@@ -128,7 +128,7 @@ export class ReviewBudget {
     this.turns++;
   }
 
-  /** Settles trustworthy measurements, retaining the reservation when telemetry is incomplete. */
+  /** Settles measurements, independently retaining missing token categories and an incomplete call's reservation floor. */
   observeModelTurn(turn: Pick<ModelTurn, "usage" | "usageComplete">): void {
     const reservation = this.reservation;
     if (!reservation) throw new Error("No active model turn");
@@ -182,9 +182,15 @@ export class ReviewBudget {
         (usage.cacheWriteTokens ?? 0),
     );
     const measuredTokens = measuredInput + (usage.outputTokens ?? 0);
+    const conservativeInput = Math.max(
+      measuredInput,
+      usage.inputTokens === undefined ? reservation.input : 0,
+    );
+    const conservativeTokens =
+      conservativeInput + (usage.outputTokens ?? reservation.output);
     this.tokens += measuredComplete
       ? measuredTokens
-      : Math.max(reservation.tokens, measuredTokens);
+      : Math.max(reservation.tokens, conservativeTokens);
     const pricing = this.pricing;
     if (pricing) {
       const pricedComplete =

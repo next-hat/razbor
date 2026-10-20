@@ -49,16 +49,33 @@ export function estimateContextTokens(
   return Math.ceil(serializedBytes(messages) / 3);
 }
 
-/** Moves a split before a surrogate pair so every fragment preserves its Unicode text. */
-function safeBoundary(text: string, end: number): number {
+/** Keeps Unicode pairs and known transcript observation IDs together across fragment boundaries. */
+function safeBoundary(
+  text: string,
+  end: number,
+  knownEvidenceIds: ReadonlySet<string>,
+): number {
   const preceding = text.charCodeAt(end - 1);
   const following = text.charCodeAt(end);
-  return preceding >= 0xd800 &&
+  const boundary =
+    preceding >= 0xd800 &&
     preceding <= 0xdbff &&
     following >= 0xdc00 &&
     following <= 0xdfff
-    ? end - 1
-    : end;
+      ? end - 1
+      : end;
+  const start = text.lastIndexOf("tool-", boundary - 1);
+  if (start >= 0 && (start === 0 || !/\w/.test(text[start - 1]))) {
+    const reference = /^tool-\d+\b/.exec(text.slice(start));
+    // A fragment-local word boundary must never turn tool-12 into tool-1.
+    if (
+      reference &&
+      knownEvidenceIds.has(reference[0]) &&
+      start + reference[0].length > boundary
+    )
+      return start;
+  }
+  return boundary;
 }
 
 /**
@@ -67,6 +84,7 @@ function safeBoundary(text: string, end: number): number {
  */
 function* transcriptChunks(
   text: string,
+  knownEvidenceIds: ReadonlySet<string>,
   fits?: (fragment: string) => boolean,
 ): Generator<string> {
   for (let offset = 0; offset < text.length;) {
@@ -79,7 +97,7 @@ function* transcriptChunks(
     let end = offset;
     while (low <= high) {
       const middle = Math.floor((low + high) / 2);
-      const candidate = safeBoundary(text, middle);
+      const candidate = safeBoundary(text, middle, knownEvidenceIds);
       if (
         serializedBytes(text.slice(offset, candidate)) <=
           MAX_QUOTED_CHUNK_BYTES &&
@@ -147,12 +165,20 @@ export async function compactReviewContext(options: {
   const transcript = serializeContext(options.history);
   let summary: ContextSummary | null = null;
   let sequence = 0;
+  let transcriptOffset = 0;
   /** Includes the actual prompt, prior note and visible-reference list in each candidate request. */
   const requestForFragment = (chunk: string) => {
-    const visibleIds = new Set([
-      ...(summary?.evidenceIds ?? []),
-      ...(chunk.match(/\btool-\d+\b/g) ?? []),
-    ]);
+    const visibleIds = new Set(summary?.evidenceIds ?? []);
+    for (const match of chunk.matchAll(/\btool-\d+\b/g)) {
+      const start = transcriptOffset + match.index;
+      const end = start + match[0].length;
+      // Match original transcript boundaries, never word boundaries created by splitting prose.
+      if (
+        (start === 0 || !/\w/.test(transcript[start - 1])) &&
+        (end === transcript.length || !/\w/.test(transcript[end]))
+      )
+        visibleIds.add(match[0]);
+    }
     const messages: ModelMessage[] = [
       { role: "system", content: instruction },
       {
@@ -179,6 +205,7 @@ export async function compactReviewContext(options: {
   };
   for (const chunk of transcriptChunks(
     transcript,
+    options.knownEvidenceIds,
     maxInputTokens === undefined ? undefined : fitsInput,
   )) {
     options.signal?.throwIfAborted();
@@ -219,6 +246,7 @@ export async function compactReviewContext(options: {
         "Context compaction returned an invalid summary or evidence reference.",
       ]);
     summary = result.data;
+    transcriptOffset += chunk.length;
   }
   return [
     ...options.retained,

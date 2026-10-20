@@ -504,6 +504,13 @@ export async function reviewRepository(
       config.verification?.exec?.env,
       config.signal,
     );
+    // Preserve concrete missing prerequisites; generic preflight guidance stays in context.
+    const verificationLimitations = environment.limitations.filter(
+      (limitation) =>
+        limitation.includes(" is unavailable on the approved executable PATH;"),
+    );
+    for (const limitation of verificationLimitations)
+      progress("agent", limitation, "warn");
     const environmentMessage: ModelMessage = {
       role: "user",
       content: `Review environment facts (availability is not a passing check): ${JSON.stringify(environment)}`,
@@ -1053,6 +1060,9 @@ export async function reviewRepository(
         if (limitation)
           review.summary += `\n\nHarness coverage limitation: ${limitation} This measures optional diff delivery only; repository exploration through exec is not measured. Do not interpret this as complete inspection coverage.`;
       }
+      if (verificationLimitations.length)
+        review.summary +=
+          "\n\nVerification limitations: " + verificationLimitations.join(" ");
       if (capabilities.limitations.length)
         review.summary +=
           "\n\nCapability limitations: " + capabilities.limitations.join(" ");

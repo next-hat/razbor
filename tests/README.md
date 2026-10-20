@@ -57,13 +57,15 @@ pnpm run test:verification
 
 These deterministic provider fixtures exercise command-only exploration, immutable
 finding locations, exact manifest and previous-finding retention, compaction-window
-chunking, a 64k window with the default 80k trigger, immutable-context floors,
+chunking without truncated tool-reference aliases, a 64k window with the default 80k trigger, immutable-context floors,
 large continuation notes followed by consecutive tools without redundant summaries,
 failure/cancellation, budget notices, final-response headroom, correction instructions
 retained after an invalid final output triggers compaction, and budget-limited
-conversation disclosures. They
-cover refused tool batches without command execution, strict token/cost reservations,
-provider/model price selection and legacy configuration compatibility. Relay cases
+conversation disclosures. Concrete missing required-tool warnings and summary
+limitations are enforced independently of model text without repeating generic
+preflight notices. They cover refused tool batches without command execution, strict token/cost reservations,
+independent missing input/output reservations, provider/model price selection
+and legacy configuration compatibility. Relay cases
 exercise opt-in known nonbillable throttles, capped fallback backoff, explicit
 Retry-After, shared credential pacing after oversized HTTP429 bodies, one request
 deadline and permanent/ambiguous error rejection. Cumulative progress cases preserve coherent
@@ -98,7 +100,9 @@ pnpm evaluate plan tests/evaluation/audited-revisions.json
 
 The evaluation CLI regression specs also check historical-record compatibility,
 failed-attempt telemetry, cache splits, configuration grouping and runner-compatible
-single/multiple provider-model pricing, including duplicate-identity rejection. Scoring exposes
+single/multiple provider-model pricing, including duplicate identities and
+monetary caps without matching model prices. Both record and score reject those
+invalid caps while historical omitted settings remain unknown. Scoring exposes
 turns, tool calls, cached/uncached/cache-write tokens and conservative budget
 charges, preserving unknown fields. These specs never dispatch a model.
 

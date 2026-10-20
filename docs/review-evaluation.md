@@ -84,8 +84,12 @@ Null provenance is permitted for historical imports but limits comparability.
 Record `reasoningEffort` (`low`, `medium`, or `high`) and `maxOutputTokens`
 (an integer from 1 through 32768, matching the runner limit) for new executions.
 Record the tool-call/token limits and compaction threshold too. If monetary
-limits apply, record `maxCostUsd` and the explicit `pricing` object from the review
-configuration, including its exact model and all four token prices. These fields
+limits apply, record `maxCostUsd` and the explicit `pricing` object or array from
+the review configuration, including each provider/model and all four token prices.
+Both `record` and `score` reject a monetary cap without pricing for the recorded
+model. The existing execution format has no selected-provider field, so provider
+matching cannot be verified; a matching model entry from either provider is
+accepted. These fields
 are optional for compatibility with existing records: absent values mean unknown
 and are never replaced with current defaults. Every recorded setting participates
 in configuration grouping, so different known settings remain separate. Keep

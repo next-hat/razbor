@@ -181,6 +181,148 @@ test("compaction fragments fit the configured estimated input allowance without 
   assert.equal(result.length, 2);
 });
 
+test("byte-boundary fragments preserve whole observation IDs without aliasing tool-12 to tool-1", async () => {
+  const marker = "BOUNDARY";
+  const template = JSON.stringify([{ role: "user", content: marker }]);
+  const prefix = template.slice(0, template.indexOf(marker));
+  const padding =
+    300000 - Buffer.byteLength(JSON.stringify(prefix + " tool-1"));
+  const original: ModelMessage[] = [
+    {
+      role: "user",
+      content: "x".repeat(padding) + " tool-12 failed; caller unresolved.",
+    },
+  ];
+  const fragments: string[] = [];
+  const visible: string[][] = [];
+  await compactReviewContext({
+    history: original,
+    retained: [],
+    knownEvidenceIds: new Set(["tool-1", "tool-12"]),
+    /** Record the visible references without accepting a boundary-created alias. */
+    async generate(messages) {
+      const payload = JSON.parse(String(messages[1].content));
+      fragments.push(payload.transcriptFragment);
+      visible.push(payload.knownEvidenceIds);
+      assert.ok(!payload.knownEvidenceIds.includes("tool-1"));
+      return response(
+        "The observed failure remains unresolved.",
+        payload.knownEvidenceIds,
+      );
+    },
+  });
+  assert.equal(fragments.join(""), JSON.stringify(original));
+  assert.equal(fragments.length, 2);
+  assert.deepEqual(visible, [[], ["tool-12"]]);
+  assert.ok(fragments[1].startsWith("tool-12"));
+});
+
+test("a fragment boundary inside repository tool-12suffix text cannot expose a shorter known ID", async () => {
+  const marker = "BOUNDARY";
+  const template = JSON.stringify([{ role: "user", content: marker }]);
+  const prefix = template.slice(0, template.indexOf(marker));
+  const padding =
+    300000 - Buffer.byteLength(JSON.stringify(prefix + " tool-1"));
+  const original: ModelMessage[] = [
+    {
+      role: "user",
+      content: "x".repeat(padding) + " tool-12suffix remains unresolved.",
+    },
+  ];
+  const fragments: string[] = [];
+  await compactReviewContext({
+    history: original,
+    retained: [],
+    knownEvidenceIds: new Set(["tool-1", "tool-12"]),
+    /** Repository words must not become references at an artificial fragment boundary. */
+    async generate(messages) {
+      const payload = JSON.parse(String(messages[1].content));
+      fragments.push(payload.transcriptFragment);
+      assert.deepEqual(payload.knownEvidenceIds, []);
+      return response();
+    },
+  });
+  assert.equal(fragments.join(""), JSON.stringify(original));
+  assert.equal(fragments.length, 2);
+});
+
+test("adaptive-window fragments never split whole observation IDs", async () => {
+  const original: ModelMessage[] = [
+    {
+      role: "user",
+      content: " tool-12 failed; caller unresolved. ".repeat(2000),
+    },
+  ];
+  const fragments: string[] = [];
+  const maxInputTokens = 2500;
+  await compactReviewContext({
+    history: original,
+    retained: [],
+    knownEvidenceIds: new Set(["tool-1", "tool-12"]),
+    maxInputTokens,
+    /** Verify window limits and prohibit prefix aliases while the note changes fragment sizing. */
+    async generate(messages) {
+      assert.ok(estimateContextTokens(messages) + 1024 <= maxInputTokens);
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(messages)) <=
+          MAX_COMPACTION_INPUT_BYTES,
+      );
+      const payload = JSON.parse(String(messages[1].content));
+      fragments.push(payload.transcriptFragment);
+      assert.ok(!payload.knownEvidenceIds.includes("tool-1"));
+      return response(
+        "The observed failure remains unresolved.",
+        payload.knownEvidenceIds,
+      );
+    },
+  });
+  const transcript = JSON.stringify(original);
+  assert.equal(fragments.join(""), transcript);
+  assert.ok(fragments.length > 2);
+  const boundaries = new Set<number>();
+  let offset = 0;
+  for (const fragment of fragments) {
+    offset += fragment.length;
+    boundaries.add(offset);
+  }
+  for (const match of transcript.matchAll(/\btool-\d+\b/g))
+    for (
+      let index = match.index + 1;
+      index < match.index + match[0].length;
+      index++
+    )
+      assert.ok(
+        !boundaries.has(index),
+        "an observation ID must remain in one fragment",
+      );
+});
+
+test("an enormous unknown repository tool-number literal remains ordinary bounded transcript text", async () => {
+  const id = "tool-" + "1".repeat(300000);
+  const original: ModelMessage[] = [
+    { role: "user", content: " " + id + " remains unresolved." },
+  ];
+  const fragments: string[] = [];
+  await compactReviewContext({
+    history: original,
+    retained: [],
+    knownEvidenceIds: new Set(["tool-1"]),
+    /** The unknown repository literal must neither block chunking nor alias a known short ID. */
+    async generate(messages) {
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(messages)) <=
+          MAX_COMPACTION_INPUT_BYTES,
+      );
+      const payload = JSON.parse(String(messages[1].content));
+      fragments.push(payload.transcriptFragment);
+      assert.deepEqual(payload.knownEvidenceIds, []);
+      return response();
+    },
+  });
+  assert.equal(fragments.join(""), JSON.stringify(original));
+  assert.equal(fragments.length, 2);
+});
+
 test("compaction fails explicitly when its instruction or previous-note envelope cannot fit", async () => {
   for (const oversizedNote of [false, true]) {
     let calls = 0;

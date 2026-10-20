@@ -77,14 +77,38 @@ const configurationSchema = z
     maxTokens: z.number().int().min(1).max(100000000).optional(),
     maxCostUsd: z.number().finite().positive().optional(),
     compactionThresholdTokens: count.positive().optional(),
-    // Validate with the runner policy, including duplicate provider/model identities,
-    // then retain only supplied pricing instead of adding budget defaults to history.
-    pricing: z
-      .preprocess((pricing) => ({ pricing }), reviewBudgetSchema)
-      .transform(({ pricing }) => pricing)
-      .optional(),
+    pricing: reviewBudgetSchema.shape.pricing,
   })
-  .strict();
+  .strict()
+  .superRefine((configuration, context) => {
+    // Validate cap and prices together without copying runtime defaults into history.
+    const budget = reviewBudgetSchema.safeParse({
+      maxCostUsd: configuration.maxCostUsd,
+      pricing: configuration.pricing,
+    });
+    if (!budget.success) {
+      for (const issue of budget.error.issues)
+        context.addIssue({
+          code: "custom",
+          message: issue.message,
+          path: issue.path,
+        });
+      return;
+    }
+    if (configuration.maxCostUsd === undefined) return;
+    const entries = Array.isArray(budget.data.pricing)
+      ? budget.data.pricing
+      : budget.data.pricing
+        ? [budget.data.pricing]
+        : [];
+    // Historical configuration has no selected provider; verify the recorded model only.
+    if (!entries.some((entry) => entry.model === configuration.model))
+      context.addIssue({
+        code: "custom",
+        message: "A monetary budget requires pricing for the recorded model",
+        path: ["pricing"],
+      });
+  });
 
 const telemetrySchema = z
   .object({
