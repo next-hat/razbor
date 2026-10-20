@@ -28,7 +28,7 @@ Cargoes:
     Hostname: razbor-runner
     Containers:
       - Name: runner
-        Image: ghcr.io/next-hat/razbor-runner:0.1.11
+        Image: ghcr.io/next-hat/razbor-runner:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-runner.enrollment]
         Cmd: [--url, "https://razbor.next-hat.com"]

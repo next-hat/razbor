@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Build one service at a time so release work does not saturate the workstation.
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-tag=${RAZBOR_IMAGE_TAG:-0.1.11}
+tag=${RAZBOR_IMAGE_TAG:-0.1.0}
 output=--load
 services=()
 

@@ -39,8 +39,8 @@ For private packages, the publishing account needs package write permission and
 the deployment account needs read permission for every image. See
 [GitHub's Container registry instructions](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 
-The committed deployment examples pin web to `0.1.12` and the other services to
-`0.1.11`. These are template defaults, not a statement about the latest release.
+The committed deployment examples pin all six services to the initial Razbor
+release, `0.1.0`. These are template defaults, not a statement about the latest release.
 Choose and publish the tags you intend to deploy, then update all image references.
 Upgrade the control plane before runners when a release changes their protocol or
 review limits.
@@ -127,8 +127,8 @@ Create a private environment file outside the checkout, for example
 `~/razbor-deploy/compose.env`:
 
 ```dotenv
-RAZBOR_IMAGE_TAG=0.1.11
-RAZBOR_WEB_IMAGE_TAG=0.1.12
+RAZBOR_IMAGE_TAG=0.1.0
+RAZBOR_WEB_IMAGE_TAG=0.1.0
 RAZBOR_PUBLIC_URL=https://razbor.example.com
 RAZBOR_ADMIN_USERNAME=admin
 RAZBOR_ADMIN_PASSWORD=REPLACE_WITH_A_PRIVATE_PASSWORD
