@@ -170,6 +170,21 @@ only safe classifications and counts. The retry limit counts extra rejected
 upstream requests within one model turn; it does not authorize another billed
 generation. A final-JSON correction remains an explicit budgeted model turn.
 
+Finalization and JSON correction retain the same tool definitions as ordinary
+conversation turns, including when historical calls and results are present.
+They explicitly select `tool_choice: none`, and the harness rejects any new tool
+call instead of executing it. Independent compaction requests contain quoted
+transcript text rather than live tool-use blocks and omit tool definitions.
+Anthropic documents [`none` as prohibiting tool calls](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools)
+and distinguishes [definition changes from tool-choice cache invalidation](https://platform.claude.com/docs/en/build-with-claude/prompt-caching):
+changing definitions invalidates the tool, system and message prefix, while
+changing tool choice affects message caching. Keeping definitions stable avoids
+that additional prefix change; it does not guarantee a cache hit or live-provider
+acceptance. Native request regressions cover both Messages and Responses through
+the adapter and relay. The documentation checked does not establish a universal
+HTTP400 rule for ordinary client-tool history without definitions; the documented
+missing-tool error for an unresolved server tool is a separate case.
+
 Exec accepts an argument vector and a repository-confined working directory.
 Installed git, rg, grep, cat, sed, awk, head, tail and find can inspect the checkout;
 existing test/build tools can verify behavior. Optional read_file/read_diff tools
@@ -198,7 +213,14 @@ One automatic compaction mechanism uses `harness.compactionThresholdTokens`
 context limit. Large immutable inputs do not fail merely because they exceed the
 trigger; initial source context is not replaced with a lossy note before the
 first model request. The trigger can rise above the immutable context, and
-compaction runs only when it can preserve final-response headroom.
+compaction runs only when it can preserve final-response headroom. With a configured
+model window, the effective trigger leaves room for the capped output, tool
+definitions, request overhead and a safety margin. The margin is normally 5% of
+the window (at least 1,024 estimated tokens), bounded by half the space remaining
+after immutable context. This keeps the trigger above the immutable floor while
+allowing a 64k window to compact before the default 80k trigger. Immutable guidance
+that cannot fit with those required request fields fails explicitly before
+dispatch; repeatedly summarizing it cannot make it fit.
 
 Context estimates use measured provider prompt tokens plus estimated new history,
 or serialized UTF-8 bytes divided by three when measurements are absent. Tool

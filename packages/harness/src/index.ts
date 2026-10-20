@@ -293,7 +293,7 @@ async function validateFindingLocations(
 }
 
 /**
- * Disables tools during JSON correction and omits tool selection entirely for models
+ * Prohibits new tool calls during JSON correction and omits tool selection for models
  * configured without tool support.
  */
 function reviewToolChoice(
@@ -510,7 +510,12 @@ export async function reviewRepository(
     };
     input.push(environmentMessage);
     retained.push(environmentMessage);
-    const modelTools = [...tools, ...capabilities.tools];
+    const modelTools =
+      config.supportsTools === false ? [] : [...tools, ...capabilities.tools];
+    const toolContextTokens = Math.ceil(
+      Buffer.byteLength(JSON.stringify(modelTools)) / 3,
+    );
+    const requestOverheadTokens = 1024;
     if (capabilities.limitations.length) {
       const limitationMessage: ModelMessage = {
         role: "user",
@@ -541,8 +546,7 @@ export async function reviewRepository(
     /** Uses provider prompt measurements and byte-based estimates only for changed history. */
     const contextTokens = () => {
       const bytes = contextBytes(input);
-      const toolsEstimate =
-        Math.ceil(Buffer.byteLength(JSON.stringify(modelTools)) / 3) + 1024;
+      const toolsEstimate = toolContextTokens + requestOverheadTokens;
       return measuredContext
         ? measuredContext.tokens +
             Math.ceil(Math.max(0, bytes - measuredContext.bytes) / 3)
@@ -607,7 +611,7 @@ export async function reviewRepository(
     /** Charges one request, including compaction, without transport or SDK retries. */
     const requestTurn = async (
       messages: ModelMessage[] = input,
-      withoutTools = false,
+      disableToolCalls = false,
     ) => {
       config.signal?.throwIfAborted();
       const estimatedRequestTokens =
@@ -636,12 +640,12 @@ export async function reviewRepository(
       try {
         response = await client.generate(
           messages,
-          messages === input && !withoutTools && !outputRetries
-            ? modelTools
-            : [],
+          // Keep the ordinary conversation's schema prefix stable even when
+          // finalizing historical tool calls. Independent summaries have no tool history.
+          messages === input ? modelTools : [],
           config.supportsTools === false
             ? undefined
-            : withoutTools
+            : disableToolCalls
               ? "none"
               : reviewToolChoice(outputRetries, config.supportsTools),
         );
@@ -794,9 +798,37 @@ export async function reviewRepository(
         (message) => !preserved.has(message) && message !== budgetNotice,
       );
       const immutableEstimate = estimateContextTokens(retained);
-      const trigger = Math.max(
-        compactionThreshold,
-        immutableEstimate + Math.min(compactionThreshold, 8192),
+      const immutableRequestTokens =
+        immutableEstimate + toolContextTokens + requestOverheadTokens;
+      const windowInputTokens =
+        config.contextWindowTokens === undefined
+          ? undefined
+          : config.contextWindowTokens - budget.options.maxOutputTokens;
+      if (
+        windowInputTokens !== undefined &&
+        immutableRequestTokens > windowInputTokens
+      )
+        throw new IncompleteReviewError([
+          "Immutable review context plus tool definitions, request overhead and capped output cannot fit the configured model context window; compaction cannot reduce these obligations.",
+        ]);
+      // Leave a margin before the next ordinary request, including its budget note.
+      // If immutable guidance dominates, reserve at most half the remaining space:
+      // a preferred margin must never make the immutable prefix compact repeatedly.
+      const windowSafetyMargin =
+        windowInputTokens === undefined
+          ? 0
+          : Math.min(
+              Math.max(1024, Math.ceil(config.contextWindowTokens! * 0.05)),
+              Math.floor((windowInputTokens - immutableRequestTokens) / 2),
+            );
+      const trigger = Math.min(
+        Math.max(
+          compactionThreshold,
+          immutableRequestTokens + Math.min(compactionThreshold, 8192),
+        ),
+        windowInputTokens === undefined
+          ? Infinity
+          : windowInputTokens - windowSafetyMargin,
       );
       // Initial evidence has not become conversation history. Tool-free profiles must
       // retain their exact inline diff because they cannot reread a compressed patch.
@@ -830,7 +862,9 @@ export async function reviewRepository(
             maxInputTokens:
               config.contextWindowTokens === undefined
                 ? undefined
-                : config.contextWindowTokens - budget.options.maxOutputTokens,
+                : config.contextWindowTokens -
+                  budget.options.maxOutputTokens -
+                  windowSafetyMargin,
             async generate(messages) {
               // The note is JSON embedded in a message: allow its complete escaped
               // representation, tool definitions, request overhead and one budget note.

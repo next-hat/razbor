@@ -56,12 +56,18 @@ pnpm run test:verification
 
 These deterministic provider fixtures exercise command-only exploration, immutable
 finding locations, exact manifest and previous-finding retention, compaction-window
-chunking, failure/cancellation, budget notices and final-response headroom. They
+chunking, a 64k window with the default 80k trigger, immutable-context floors,
+failure/cancellation, budget notices and final-response headroom. They
 cover refused tool batches without command execution, strict token/cost reservations,
 provider/model price selection and legacy configuration compatibility. Relay cases
 exercise opt-in known nonbillable throttles, Retry-After, one request deadline and
 permanent/ambiguous error rejection. Cumulative progress cases preserve coherent
 usage/cost snapshots after 500 events and keep cache data unknown after usage gaps.
+`tests/apps/runner/finalization.spec.ts` sends native OpenAI Responses and Anthropic
+Messages payloads through the real model adapter and runner relay, intercepting
+only external provider I/O. It checks stable tool definitions with historical
+calls/results, explicit `none` during finalization and truncated-output correction,
+no execution of unexpected finalization calls, and tool-free independent compaction.
 These fixtures measure protocol behavior; scripted replies do not measure model finding recall or false
 positives. Verification checks use installed Git/rg/grep/cat/sed/awk/head/tail/find
 and deterministic process cleanup barriers; unavailable optional utilities are

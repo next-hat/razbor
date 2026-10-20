@@ -279,7 +279,8 @@ test("an oversized tool batch is rejected before its first command side effect",
         command("two", ["cat", "source.ts"]),
       ],
       (body) => {
-        assert.equal(body.tools, undefined);
+        assert.ok(Array.isArray(body.tools));
+        assert.equal(body.tool_choice, "none");
         assert.match(JSON.stringify(body.input), /Not executed/);
         return {
           summary:
@@ -670,7 +671,8 @@ test("a token-truncated final answer receives exactly one budgeted tool-free cor
           },
         ]),
       (body) => {
-        assert.equal(body.tools, undefined);
+        assert.ok(Array.isArray(body.tools));
+        assert.equal(body.tool_choice, "none");
         assert.match(inputText(body), /correction|failed validation/);
         return {
           summary: "Limited fixture inspection, no actionable findings.",
@@ -720,7 +722,8 @@ test("the last available turn requests explicit limited finalization rather than
     const model = provider(t, [
       () => [command("inspect", ["cat", "source.ts"])],
       (body) => {
-        assert.equal(body.tools, undefined);
+        assert.ok(Array.isArray(body.tools));
+        assert.equal(body.tool_choice, "none");
         assert.match(inputText(body), /finaliz.*now|final response now/i);
         assert.match(inputText(body), /remaining|budget/i);
         return {
@@ -798,7 +801,8 @@ test("compaction admission can fall back to a safe final response without losing
         command("inspect", ["cat", "source.ts"]),
       ],
       (body) => {
-        assert.equal(body.tools, undefined);
+        assert.ok(Array.isArray(body.tools));
+        assert.equal(body.tool_choice, "none");
         assert.doesNotMatch(inputText(body), /transcriptFragment/);
         assert.match(inputText(body), /Finalize now/);
         assert.match(JSON.stringify(body.input), /new implementation/);
@@ -853,7 +857,8 @@ for (const boundary of ["tokens", "cost"] as const) {
         () =>
           measuredResponse([command("second", ["cat", "related.ts"])], 20000),
         (body) => {
-          assert.equal(body.tools, undefined);
+          assert.ok(Array.isArray(body.tools));
+          assert.equal(body.tool_choice, "none");
           assert.match(inputText(body), /Finalize now/);
           assert.match(inputText(body), /remaining review budget/i);
           assert.match(JSON.stringify(body.input), /Not executed/);
@@ -1038,7 +1043,8 @@ test("partial multi-fragment compaction preserves original finalization headroom
             { headers: { "content-type": "application/json" } },
           );
         }
-        assert.equal(body.tools, undefined);
+        assert.ok(Array.isArray(body.tools));
+        assert.equal(body.tool_choice, "none");
         assert.match(inputText(body), /Finalize now/);
         assert.match(JSON.stringify(body.input), /original-observation-marker/);
         return {
@@ -1066,6 +1072,256 @@ test("partial multi-fragment compaction preserves original finalization headroom
       result.summary,
       /original investigation history remains available/,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a 64k model window compacts accumulated tool results before the default 80k trigger and continues inspection", async (t) => {
+  const f = await diffFixture();
+  try {
+    let summaries = 0;
+    let resumed = false;
+    const events: ReviewProgress[] = [];
+    /** Counts the actual native input and tool schemas plus request/output headroom. */
+    const withinWindow = (body: Record<string, unknown>) => {
+      const inputBytes = Buffer.byteLength(JSON.stringify(body.input));
+      const toolBytes = Buffer.byteLength(JSON.stringify(body.tools ?? []));
+      const estimatedRequest = Math.ceil((inputBytes + toolBytes) / 3) + 1024;
+      assert.ok(
+        estimatedRequest + Number(body.max_output_tokens) <= 64000,
+        "native request, tools, overhead and output must fit the configured window",
+      );
+    };
+    const model = provider(t, [
+      (body) => {
+        withinWindow(body);
+        return [
+          command(
+            "first-observation",
+            [
+              process.execPath,
+              "-e",
+              "process.stdout.write('first-large-observation-'+ 'a'.repeat(89900))",
+            ],
+            90000,
+          ),
+          command(
+            "second-observation",
+            [
+              process.execPath,
+              "-e",
+              "process.stdout.write('second-large-observation-'+ 'b'.repeat(89900))",
+            ],
+            90000,
+          ),
+        ];
+      },
+      ...Array.from({ length: 8 }, () => (body: Record<string, unknown>) => {
+        withinWindow(body);
+        const text = inputText(body);
+        if (text.includes('"transcriptFragment"')) {
+          summaries++;
+          return {
+            notes:
+              "Earlier commands returned repetitive observations; caller and source inspection remain unresolved and no tests ran.",
+            evidenceIds: [],
+          };
+        }
+        assert.ok(
+          summaries > 0,
+          "history must compact before ordinary model continuation",
+        );
+        assert.doesNotMatch(
+          JSON.stringify(body.input),
+          /first-large-observation|second-large-observation/,
+        );
+        if (!resumed) {
+          resumed = true;
+          return [
+            command("inspect-source-and-caller", [
+              "cat",
+              "source.ts",
+              "related.ts",
+            ]),
+          ];
+        }
+        assert.match(
+          JSON.stringify(body.input),
+          /new implementation|related unchanged/,
+        );
+        return {
+          summary:
+            "Inspected source and caller after window-driven compaction; no test success claimed.",
+          findings: [finding],
+        };
+      }),
+    ]);
+    const result = await reviewRepository(f.repository, f.base, f.head, {
+      ...options,
+      contextWindowTokens: 64000,
+      maxTurns: 10,
+      reviewBudget: { maxTokens: 3000000 },
+      verification: { exec: { maxOutputBytes: 90000 } },
+      /** Verifies source inspection continues after one bounded compaction sequence. */
+      onProgress: (event) => events.push(event),
+    });
+    assert.ok(summaries > 0);
+    assert.equal(model.calls, summaries + 3);
+    assert.equal(result.findings.length, 1);
+    assert.equal(events.at(-1)!.toolCalls, 3);
+    assert.ok(events.at(-1)!.budgetTokens! <= 3000000);
+  } finally {
+    await f.close();
+  }
+});
+
+test("a 64k model window fails before dispatch when immutable obligations alone cannot fit", async (t) => {
+  const f = await diffFixture();
+  try {
+    const model = provider(t, []);
+    const events: ReviewProgress[] = [];
+    await assert.rejects(
+      reviewRepository(f.repository, f.base, f.head, {
+        ...options,
+        contextWindowTokens: 64000,
+        previousFindings: [
+          {
+            id: "prior",
+            reviewId: "rev_1234567890abcdef",
+            finding,
+            discussion: [
+              {
+                id: "immutable",
+                author: "author",
+                body: "immutable prior obligation ".repeat(10000),
+              },
+            ],
+          },
+        ],
+        /** Immutable guidance is never silently summarized or omitted to fit the window. */
+        onProgress: (event) => events.push(event),
+      }),
+      /configured model context window/,
+    );
+    assert.equal(model.calls, 0);
+    assert.equal(events.at(-1)!.modelTurns, 0);
+    assert.ok(!events.some((event) => event.message.startsWith("Compacting")));
+  } finally {
+    await f.close();
+  }
+});
+
+test("retained context near a 64k window does not trigger repeated compaction of tiny observations", async (t) => {
+  const f = await diffFixture();
+  try {
+    const discussion = "retained-prior-obligation " + "r".repeat(145000);
+    let ordinaryTurns = 0;
+    let summaries = 0;
+    /** Returns native usage matching the intercepted input estimate so retained context remains visible. */
+    const measuredReply = (body: Record<string, unknown>, value: unknown) => {
+      const inputTokens =
+        Math.ceil(
+          (Buffer.byteLength(JSON.stringify(body.input)) +
+            Buffer.byteLength(JSON.stringify(body.tools ?? []))) /
+            3,
+        ) + 1024;
+      assert.ok(inputTokens + Number(body.max_output_tokens) <= 64000);
+      return new Response(
+        JSON.stringify({
+          id: "near-window",
+          object: "response",
+          created_at: 0,
+          status: "completed",
+          model: "fixture",
+          output: Array.isArray(value)
+            ? value
+            : [
+                {
+                  id: "message",
+                  type: "message",
+                  status: "completed",
+                  role: "assistant",
+                  content: [
+                    {
+                      type: "output_text",
+                      text: JSON.stringify(value),
+                      annotations: [],
+                    },
+                  ],
+                },
+              ],
+          usage: {
+            input_tokens: inputTokens,
+            output_tokens: 10,
+            total_tokens: inputTokens + 10,
+            input_tokens_details: { cached_tokens: 0 },
+            output_tokens_details: { reasoning_tokens: 0 },
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    };
+    const model = provider(
+      t,
+      Array.from({ length: 8 }, () => (body: Record<string, unknown>) => {
+        const text = inputText(body);
+        if (text.includes('"transcriptFragment"')) {
+          summaries++;
+          assert.ok(
+            summaries <= 1,
+            "immutable context must not repeatedly compact tiny continuation history",
+          );
+          return measuredReply(body, {
+            notes:
+              "A source observation returned. Prior obligations remain unresolved and are retained separately; caller inspection still needs completion.",
+            evidenceIds: [],
+          });
+        }
+        ordinaryTurns++;
+        assert.ok(text.includes(discussion));
+        if (ordinaryTurns === 1)
+          return measuredReply(body, [
+            command("near-window-source", ["cat", "source.ts"]),
+          ]);
+        if (ordinaryTurns === 2)
+          return measuredReply(body, [
+            command("near-window-caller", ["cat", "related.ts"]),
+          ]);
+        assert.equal(ordinaryTurns, 3);
+        return measuredReply(body, {
+          summary:
+            "Source and caller inspected; the prior failure scenario remains unresolved and no test success is claimed.",
+          findings: [],
+          findingChecks: [
+            {
+              id: "prior",
+              status: "uncertain",
+              evidence:
+                "The recorded source and caller observations do not establish the original failure scenario's resolution.",
+            },
+          ],
+        });
+      }),
+    );
+    const result = await reviewRepository(f.repository, f.base, f.head, {
+      ...options,
+      contextWindowTokens: 64000,
+      maxTurns: 8,
+      reviewBudget: { maxTokens: 3000000 },
+      previousFindings: [
+        {
+          id: "prior",
+          reviewId: "rev_1234567890abcdef",
+          finding,
+          discussion: [{ id: "retained", author: "author", body: discussion }],
+        },
+      ],
+    });
+    assert.equal(ordinaryTurns, 3);
+    assert.ok(summaries <= 1);
+    assert.equal(model.calls, ordinaryTurns + summaries);
+    assert.equal(result.findingChecks?.[0].status, "uncertain");
   } finally {
     await f.close();
   }
