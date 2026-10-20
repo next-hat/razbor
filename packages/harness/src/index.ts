@@ -530,6 +530,7 @@ export async function reviewRepository(
     }
     const evidenceIds = new Set<string>();
     let measuredContext: { tokens: number; bytes: number } | undefined;
+    let lastCompactedHistoryBytes: number | undefined;
     /** Reports optional diff delivery without treating it as semantic inspection coverage. */
     const reportContext = () => {
       const coverage = prepared.coverage();
@@ -793,9 +794,16 @@ export async function reviewRepository(
     };
     while (true) {
       config.signal?.throwIfAborted();
+      // Size the current request with one replaceable budget notice, never history.
+      updateBudgetNotice(false);
       const preserved = new Set(retained);
       const history = input.filter(
         (message) => !preserved.has(message) && message !== budgetNotice,
+      );
+      const historyBytes = contextBytes(history);
+      const freshHistoryBytes = Math.max(
+        0,
+        historyBytes - (lastCompactedHistoryBytes ?? 0),
       );
       const immutableEstimate = estimateContextTokens(retained);
       const immutableRequestTokens =
@@ -837,6 +845,13 @@ export async function reviewRepository(
         calls > 0 &&
         history.length &&
         contextTokens() >= trigger &&
+        // A fitting continuation note may exceed the preferred trigger. Summarize
+        // it again only after meaningful new history or genuine hard-window pressure.
+        (lastCompactedHistoryBytes === undefined ||
+          freshHistoryBytes >= 3 * Math.min(compactionThreshold, 8192) ||
+          (freshHistoryBytes > 0 &&
+            windowInputTokens !== undefined &&
+            contextTokens() > windowInputTokens)) &&
         budget.remaining().modelTurns > 1 &&
         budget.canReserveModelTurns(reservedInputTokens(), 2)
       ) {
@@ -845,7 +860,6 @@ export async function reviewRepository(
           "agent",
           "Compacting reducible history while preserving the exact manifest, revisions and prior obligations",
         );
-        const before = contextBytes(input);
         // A later fragment may be refused after earlier requests have been charged.
         // Preserve the original transcript's final-response allowance until all fragments succeed.
         const originalFinalInput = reservedInputTokens() + 2048;
@@ -897,10 +911,22 @@ export async function reviewRepository(
           capabilities.resetContext();
           measuredContext = undefined;
           budgetNotice = undefined;
-          if (contextBytes(input) >= before)
+          const compactedHistoryBytes = contextBytes(
+            compacted.slice(retained.length),
+          );
+          if (compactedHistoryBytes >= historyBytes)
             throw new IncompleteReviewError([
               "Context compaction did not reduce conversation history.",
             ]);
+          updateBudgetNotice(false);
+          if (
+            windowInputTokens !== undefined &&
+            contextTokens() > windowInputTokens
+          )
+            throw new IncompleteReviewError([
+              "Compacted review context plus tool definitions, request overhead and capped output cannot fit the configured model context window; no further compaction was requested.",
+            ]);
+          lastCompactedHistoryBytes = compactedHistoryBytes;
         }
       }
 

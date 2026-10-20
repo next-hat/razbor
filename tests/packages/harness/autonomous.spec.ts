@@ -1212,117 +1212,177 @@ test("a 64k model window fails before dispatch when immutable obligations alone 
   }
 });
 
-test("retained context near a 64k window does not trigger repeated compaction of tiny observations", async (t) => {
-  const f = await diffFixture();
-  try {
-    const discussion = "retained-prior-obligation " + "r".repeat(145000);
-    let ordinaryTurns = 0;
-    let summaries = 0;
-    /** Returns native usage matching the intercepted input estimate so retained context remains visible. */
-    const measuredReply = (body: Record<string, unknown>, value: unknown) => {
-      const inputTokens =
-        Math.ceil(
-          (Buffer.byteLength(JSON.stringify(body.input)) +
-            Buffer.byteLength(JSON.stringify(body.tools ?? []))) /
-            3,
-        ) + 1024;
-      assert.ok(inputTokens + Number(body.max_output_tokens) <= 64000);
-      return new Response(
-        JSON.stringify({
-          id: "near-window",
-          object: "response",
-          created_at: 0,
-          status: "completed",
-          model: "fixture",
-          output: Array.isArray(value)
-            ? value
-            : [
-                {
-                  id: "message",
-                  type: "message",
-                  status: "completed",
-                  role: "assistant",
-                  content: [
+for (const mode of ["fit", "oversized", "pressure"] as const) {
+  const oversizedNote = mode === "oversized";
+  const expectedSummaries = mode === "pressure" ? 2 : 1;
+  test(
+    oversizedNote
+      ? "an oversized bounded continuation note fails once before another ordinary model request"
+      : mode === "pressure"
+        ? "new hard-window pressure compacts small history despite the preferred-growth watermark"
+        : "a large continuation note above the preferred trigger does not recompact after tiny observations",
+    async (t) => {
+      const f = await diffFixture();
+      try {
+        const discussion = "retained-prior-obligation " + "r".repeat(140000);
+        let ordinaryTurns = 0;
+        let summaries = 0;
+        const events: ReviewProgress[] = [];
+        /** Returns native usage matching the intercepted input estimate so retained context remains visible. */
+        const measuredReply = (
+          body: Record<string, unknown>,
+          value: unknown,
+        ) => {
+          const inputTokens =
+            Math.ceil(
+              (Buffer.byteLength(JSON.stringify(body.input)) +
+                Buffer.byteLength(JSON.stringify(body.tools ?? []))) /
+                3,
+            ) + 1024;
+          assert.ok(inputTokens + Number(body.max_output_tokens) <= 64000);
+          return new Response(
+            JSON.stringify({
+              id: "near-window",
+              object: "response",
+              created_at: 0,
+              status: "completed",
+              model: "fixture",
+              output: Array.isArray(value)
+                ? value
+                : [
                     {
-                      type: "output_text",
-                      text: JSON.stringify(value),
-                      annotations: [],
+                      id: "message",
+                      type: "message",
+                      status: "completed",
+                      role: "assistant",
+                      content: [
+                        {
+                          type: "output_text",
+                          text: JSON.stringify(value),
+                          annotations: [],
+                        },
+                      ],
                     },
                   ],
+              usage: {
+                input_tokens: inputTokens,
+                output_tokens: 10,
+                total_tokens: inputTokens + 10,
+                input_tokens_details: { cached_tokens: 0 },
+                output_tokens_details: { reasoning_tokens: 0 },
+              },
+            }),
+            { headers: { "content-type": "application/json" } },
+          );
+        };
+        const model = provider(
+          t,
+          Array.from({ length: 8 }, () => (body: Record<string, unknown>) => {
+            const text = inputText(body);
+            if (text.includes('"transcriptFragment"')) {
+              summaries++;
+              assert.ok(
+                summaries <= expectedSummaries,
+                "immutable context must not repeatedly compact tiny continuation history",
+              );
+              return measuredReply(body, {
+                notes:
+                  "Earlier exploration returned unverified observations. Prior obligations remain unresolved and retained separately. " +
+                  "n".repeat(oversizedNote ? 14000 : 6000),
+                evidenceIds: [],
+              });
+            }
+            ordinaryTurns++;
+            assert.ok(text.includes(discussion));
+            assert.match(text, /Exact changed-file manifest/);
+            assert.match(text, new RegExp(f.head));
+            if (ordinaryTurns === 1)
+              return measuredReply(body, [
+                command(
+                  "near-window-large",
+                  [
+                    process.execPath,
+                    "-e",
+                    "process.stdout.write('initial-large-observation-'+'x'.repeat(20000))",
+                  ],
+                  25000,
+                ),
+              ]);
+            if (ordinaryTurns === 2)
+              return measuredReply(body, [
+                mode === "pressure"
+                  ? command(
+                      "near-window-pressure",
+                      [
+                        process.execPath,
+                        "-e",
+                        "process.stdout.write(require('node:fs').readFileSync('source.ts','utf8')+'new-window-pressure-marker-'+ 'p'.repeat(10000))",
+                      ],
+                      12000,
+                    )
+                  : command("near-window-source", ["cat", "source.ts"]),
+              ]);
+            if (mode === "pressure" && ordinaryTurns === 3) {
+              assert.equal(summaries, 2);
+              assert.doesNotMatch(
+                JSON.stringify(body.input),
+                /new-window-pressure-marker/,
+              );
+            }
+            if (ordinaryTurns === 3)
+              return measuredReply(body, [
+                command("near-window-caller", ["cat", "related.ts"]),
+              ]);
+            assert.equal(ordinaryTurns, 4);
+            return measuredReply(body, {
+              summary:
+                "Source and caller inspected; the prior failure scenario remains unresolved and no test success is claimed.",
+              findings: [],
+              findingChecks: [
+                {
+                  id: "prior",
+                  status: "uncertain",
+                  evidence:
+                    "The recorded source and caller observations do not establish the original failure scenario's resolution.",
                 },
               ],
-          usage: {
-            input_tokens: inputTokens,
-            output_tokens: 10,
-            total_tokens: inputTokens + 10,
-            input_tokens_details: { cached_tokens: 0 },
-            output_tokens_details: { reasoning_tokens: 0 },
-          },
-        }),
-        { headers: { "content-type": "application/json" } },
-      );
-    };
-    const model = provider(
-      t,
-      Array.from({ length: 8 }, () => (body: Record<string, unknown>) => {
-        const text = inputText(body);
-        if (text.includes('"transcriptFragment"')) {
-          summaries++;
-          assert.ok(
-            summaries <= 1,
-            "immutable context must not repeatedly compact tiny continuation history",
-          );
-          return measuredReply(body, {
-            notes:
-              "A source observation returned. Prior obligations remain unresolved and are retained separately; caller inspection still needs completion.",
-            evidenceIds: [],
-          });
-        }
-        ordinaryTurns++;
-        assert.ok(text.includes(discussion));
-        if (ordinaryTurns === 1)
-          return measuredReply(body, [
-            command("near-window-source", ["cat", "source.ts"]),
-          ]);
-        if (ordinaryTurns === 2)
-          return measuredReply(body, [
-            command("near-window-caller", ["cat", "related.ts"]),
-          ]);
-        assert.equal(ordinaryTurns, 3);
-        return measuredReply(body, {
-          summary:
-            "Source and caller inspected; the prior failure scenario remains unresolved and no test success is claimed.",
-          findings: [],
-          findingChecks: [
+            });
+          }),
+        );
+        const review = reviewRepository(f.repository, f.base, f.head, {
+          ...options,
+          contextWindowTokens: 64000,
+          maxTurns: 8,
+          reviewBudget: { maxTokens: 3000000 },
+          /** Retains cumulative accounting without retaining command contents in progress logs. */
+          onProgress: (event) => events.push(event),
+          previousFindings: [
             {
               id: "prior",
-              status: "uncertain",
-              evidence:
-                "The recorded source and caller observations do not establish the original failure scenario's resolution.",
+              reviewId: "rev_1234567890abcdef",
+              finding,
+              discussion: [
+                { id: "retained", author: "author", body: discussion },
+              ],
             },
           ],
         });
-      }),
-    );
-    const result = await reviewRepository(f.repository, f.base, f.head, {
-      ...options,
-      contextWindowTokens: 64000,
-      maxTurns: 8,
-      reviewBudget: { maxTokens: 3000000 },
-      previousFindings: [
-        {
-          id: "prior",
-          reviewId: "rev_1234567890abcdef",
-          finding,
-          discussion: [{ id: "retained", author: "author", body: discussion }],
-        },
-      ],
-    });
-    assert.equal(ordinaryTurns, 3);
-    assert.ok(summaries <= 1);
-    assert.equal(model.calls, ordinaryTurns + summaries);
-    assert.equal(result.findingChecks?.[0].status, "uncertain");
-  } finally {
-    await f.close();
-  }
-});
+        if (oversizedNote) {
+          await assert.rejects(review, /configured model context window/);
+          assert.equal(ordinaryTurns, 1);
+          assert.equal(model.calls, 2);
+        } else {
+          const result = await review;
+          assert.equal(ordinaryTurns, 4);
+          assert.equal(model.calls, ordinaryTurns + expectedSummaries);
+          assert.equal(result.findingChecks?.[0].status, "uncertain");
+        }
+        assert.equal(summaries, expectedSummaries);
+        assert.equal(events.at(-1)!.modelTurns, model.calls);
+        assert.ok(events.at(-1)!.budgetTokens! <= 3000000);
+      } finally {
+        await f.close();
+      }
+    },
+  );
+}

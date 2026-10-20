@@ -57,6 +57,7 @@ pnpm run test:verification
 These deterministic provider fixtures exercise command-only exploration, immutable
 finding locations, exact manifest and previous-finding retention, compaction-window
 chunking, a 64k window with the default 80k trigger, immutable-context floors,
+large continuation notes followed by consecutive tools without redundant summaries,
 failure/cancellation, budget notices and final-response headroom. They
 cover refused tool batches without command execution, strict token/cost reservations,
 provider/model price selection and legacy configuration compatibility. Relay cases

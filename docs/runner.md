@@ -221,6 +221,12 @@ after immutable context. This keeps the trigger above the immutable floor while
 allowing a 64k window to compact before the default 80k trigger. Immutable guidance
 that cannot fit with those required request fields fails explicitly before
 dispatch; repeatedly summarizing it cannot make it fit.
+A reduced continuation note that fits the configured window may remain above the
+preferred trigger. Another preferred compaction waits for substantial new history;
+replaceable budget notices do not count as growth. New history that exhausts the
+actual window can compact sooner. If the complete post-compaction request cannot
+fit with its capped output, the attempt fails explicitly without another summary
+request.
 
 Context estimates use measured provider prompt tokens plus estimated new history,
 or serialized UTF-8 bytes divided by three when measurements are absent. Tool
