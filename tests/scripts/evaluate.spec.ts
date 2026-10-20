@@ -241,3 +241,89 @@ test("new review limits remain distinct configuration provenance", async (t) => 
   assert.equal(scored.status, 0, scored.stderr);
   assert.equal(JSON.parse(scored.stdout).configurations.length, 2);
 });
+
+test("offline record and score accept runner pricing objects and multiple provider/model entries", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "razbor-evaluate-pricing-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataset = JSON.parse(await readFile(datasetPath, "utf8"));
+  const price = {
+    model: "shared-model",
+    inputUsdPerMillion: 2,
+    cachedInputUsdPerMillion: 0.2,
+    cacheWriteUsdPerMillion: 2.5,
+    outputUsdPerMillion: 8,
+  };
+  const entries = [
+    { ...price, provider: "openai" },
+    { ...price, provider: "anthropic", inputUsdPerMillion: 3 },
+    { ...price, provider: "openai", model: "other-model" },
+  ];
+  for (const pricing of [price, entries]) {
+    const original = execution(dataset.cases[0]);
+    const input = path.join(root, "execution.json");
+    await writeFile(
+      input,
+      JSON.stringify({
+        ...original,
+        configuration: { ...original.configuration, pricing },
+      }),
+    );
+    const prepared = evaluate(
+      "record",
+      datasetPath,
+      dataset.cases[0].id,
+      input,
+    );
+    assert.equal(prepared.status, 0, prepared.stderr);
+    const expected = Array.isArray(pricing)
+      ? entries
+      : { ...price, provider: "openai" };
+    assert.deepEqual(
+      JSON.parse(prepared.stdout).execution.configuration.pricing,
+      expected,
+    );
+    const run = path.join(root, "run.json");
+    await writeFile(run, prepared.stdout);
+    const scored = evaluate("score", datasetPath, run);
+    assert.equal(scored.status, 0, scored.stderr);
+    const group = JSON.parse(scored.stdout).configurations[0];
+    assert.deepEqual(group.configuration.pricing, expected);
+    assert.equal(group.costUsd.total, 0.01);
+  }
+});
+
+test("offline pricing rejects duplicate provider/model identities using legacy provider defaults", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "razbor-evaluate-pricing-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataset = JSON.parse(await readFile(datasetPath, "utf8"));
+  const original = execution(dataset.cases[0]);
+  const price = {
+    model: "private-pricing-model",
+    inputUsdPerMillion: 2,
+    cachedInputUsdPerMillion: 0.2,
+    cacheWriteUsdPerMillion: 2.5,
+    outputUsdPerMillion: 8,
+  };
+  const input = path.join(root, "execution.json");
+  await writeFile(
+    input,
+    JSON.stringify({
+      ...original,
+      configuration: {
+        ...original.configuration,
+        pricing: [
+          price,
+          { ...price, provider: "openai", inputUsdPerMillion: 3 },
+        ],
+      },
+    }),
+  );
+  const prepared = evaluate("record", datasetPath, dataset.cases[0].id, input);
+  assert.equal(prepared.status, 1);
+  assert.match(prepared.stderr, /Invalid evaluation input/);
+  assert.doesNotMatch(prepared.stderr, /private-pricing-model/);
+});

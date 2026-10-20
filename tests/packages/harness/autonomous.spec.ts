@@ -691,6 +691,139 @@ test("a token-truncated final answer receives exactly one budgeted tool-free cor
   }
 });
 
+test("an invalid final output crossing the compaction trigger retains its single correction instruction", async (t) => {
+  const f = await diffFixture();
+  try {
+    const events: ReviewProgress[] = [];
+    const invalidMarker = "invalid-final-output-marker";
+    const model = provider(t, [
+      () => [command("inspect", ["cat", "source.ts"])],
+      (body) => {
+        assert.doesNotMatch(inputText(body), /transcriptFragment/);
+        return invalidMarker + "x".repeat(70000);
+      },
+      (body) => {
+        assert.equal(body.tools, undefined);
+        assert.match(inputText(body), /transcriptFragment/);
+        assert.match(inputText(body), new RegExp(invalidMarker));
+        return {
+          notes:
+            "The previous final output was invalid. Source inspection remains limited and the prior finding is unresolved; no tests ran.",
+          evidenceIds: ["tool-1"],
+        };
+      },
+      (body) => {
+        assert.equal(body.tool_choice, "none");
+        assert.ok(Array.isArray(body.tools));
+        const text = inputText(body);
+        assert.match(text, /Untrusted continuation note/);
+        assert.doesNotMatch(text, new RegExp(invalidMarker));
+        assert.match(text, /Your final response failed validation/);
+        assert.equal(
+          (text.match(/This is the only correction attempt/g) ?? []).length,
+          1,
+        );
+        assert.match(text, /Exact changed-file manifest/);
+        assert.match(text, new RegExp(f.head));
+        assert.match(text, /prior/);
+        return {
+          summary:
+            "Limited source inspection; the prior failure remains unresolved and no tests ran.",
+          findings: [],
+          findingChecks: [
+            {
+              id: "prior",
+              status: "uncertain",
+              evidence:
+                "The inspected source alone does not establish that the prior failure is resolved.",
+            },
+          ],
+        };
+      },
+    ]);
+    const result = await reviewRepository(f.repository, f.base, f.head, {
+      ...options,
+      maxTurns: 5,
+      contextWindowTokens: 128000,
+      compactionThresholdTokens: 16000,
+      reviewBudget: { maxTokens: 3000000, maxOutputTokens: 32768 },
+      previousFindings: [
+        {
+          id: "prior",
+          reviewId: "rev_1234567890abcdef",
+          originalHead: f.base,
+          finding,
+        },
+      ],
+      /** Counts the paid compaction and the one allowed correction in the same attempt. */
+      onProgress: (event) => events.push(event),
+    });
+    assert.equal(model.calls, 4);
+    assert.equal(events.at(-1)!.modelTurns, 4);
+    assert.equal(events.at(-1)!.toolCalls, 1);
+    assert.equal(result.findingChecks?.[0].status, "uncertain");
+  } finally {
+    await f.close();
+  }
+});
+
+for (const boundary of ["turns", "tools"] as const) {
+  test(`premature conversation finalization discloses the ${boundary} budget limitation`, async (t) => {
+    const f = await diffFixture();
+    try {
+      const model = provider(t, [
+        () => [command("inspect", ["cat", "source.ts"])],
+        (body) => {
+          assert.equal(body.tool_choice, "none");
+          return {
+            mode: "conversation",
+            summary: "The source shows the new implementation.",
+            findings: [],
+          };
+        },
+      ]);
+      const result = await reviewRepository(f.repository, f.base, f.head, {
+        ...options,
+        ...(boundary === "turns"
+          ? { maxTurns: 2 }
+          : { reviewBudget: { maxToolCalls: 1 } }),
+        conversation: {
+          reviewId: "rev_1234567890abcdef",
+          originalBase: f.base,
+          originalHead: f.head,
+          originalReview: {
+            summary: "Original fixture finding",
+            findings: [finding],
+          },
+          title: "Discuss the changed source",
+          target: {
+            commentId: "comment",
+            reviewId: "review",
+            path: "source.ts",
+            lineStart: 1,
+            lineEnd: 1,
+          },
+          history: [],
+          reply: {
+            id: "reply",
+            author: "author",
+            body: "Does the caller still require the previous behavior?",
+          },
+        },
+      });
+      assert.equal(result.mode, "conversation");
+      assert.match(
+        result.summary,
+        /^Inspection limitation: remaining review budget requires a final response before further investigation/,
+      );
+      assert.match(result.summary, /The source shows the new implementation/);
+      assert.equal(model.calls, 2);
+    } finally {
+      await f.close();
+    }
+  });
+}
+
 test("incomplete tool turns never execute their partial calls", async (t) => {
   const f = await diffFixture();
   try {

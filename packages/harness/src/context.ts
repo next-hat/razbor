@@ -151,7 +151,6 @@ export async function compactReviewContext(options: {
   const requestForFragment = (chunk: string) => {
     const visibleIds = new Set([
       ...(summary?.evidenceIds ?? []),
-      ...(summary?.notes.match(/\btool-\d+\b/g) ?? []),
       ...(chunk.match(/\btool-\d+\b/g) ?? []),
     ]);
     const messages: ModelMessage[] = [
@@ -212,9 +211,6 @@ export async function compactReviewContext(options: {
     if (
       !result.success ||
       result.data.evidenceIds.some(
-        (id) => !visibleIds.has(id) || !options.knownEvidenceIds.has(id),
-      ) ||
-      (result.data.notes.match(/\btool-\d+\b/g) ?? []).some(
         (id) => !visibleIds.has(id) || !options.knownEvidenceIds.has(id),
       ) ||
       new Set(result.data.evidenceIds).size !== result.data.evidenceIds.length

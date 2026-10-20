@@ -125,7 +125,9 @@ test("oversized Unicode history is consumed once in bounded sequential fragments
           "tool-1 failed; inspect the unresolved caller next.",
         );
       assert.deepEqual(payload.knownEvidenceIds, ["tool-1"]);
-      return response("tool-1 failed; inspect the unresolved caller next.");
+      return response("tool-1 failed; inspect the unresolved caller next.", [
+        "tool-1",
+      ]);
     },
   });
   assert.ok(fragments.length > 2);
@@ -202,11 +204,50 @@ test("compaction fails explicitly when its instruction or previous-note envelope
   }
 });
 
+test("compaction preserves repository strings resembling evidence IDs in free-text notes", async () => {
+  const notes =
+    "The dependency build-tool-3 prints tool-99; this repository text does not prove a successful check.";
+  const result = await compactReviewContext({
+    history: [
+      {
+        role: "user",
+        content: "Source dependency build-tool-3 prints tool-99.",
+      },
+    ],
+    retained: [],
+    knownEvidenceIds: new Set(),
+    generate: async () => response(notes),
+  });
+  assert.ok(String(result[0].content).includes(notes));
+});
+
+test("free-text notes do not authorize evidence references in later fragments", async () => {
+  let calls = 0;
+  await assert.rejects(
+    compactReviewContext({
+      history: [
+        { role: "user", content: "tool-1 failed; " + "x".repeat(400000) },
+      ],
+      retained: [],
+      knownEvidenceIds: new Set(["tool-1"]),
+      /** Omit the structured reference first, then reject its attempted reuse after its fragment. */
+      async generate() {
+        calls++;
+        return response(
+          "tool-1 remains unresolved.",
+          calls === 1 ? [] : ["tool-1"],
+        );
+      },
+    }),
+    /invalid summary or evidence reference/,
+  );
+  assert.equal(calls, 2);
+});
+
 test("compaction rejects unknown, unseen or duplicate evidence references", async () => {
   for (const turn of [
     response("tool-99 succeeded", ["tool-99"]),
     response("tool-2 succeeded", ["tool-2"]),
-    response("tool-99 succeeded", []),
     response("tool-1 failed", ["tool-1", "tool-1"]),
   ]) {
     await assert.rejects(

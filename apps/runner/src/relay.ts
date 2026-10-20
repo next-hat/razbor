@@ -21,6 +21,16 @@ const modelDispatcher = new Dispatcher1Wrapper(
   new Agent({ headersTimeout: 0, bodyTimeout: 0 }),
 );
 
+// Limit inferred backoff before it enters shared credential pacing; explicit provider delays remain authoritative.
+const MAX_FALLBACK_RETRY_MS = 30000;
+
+class BodyLimitError extends Error {
+  /** Identifies bounded-body overflow without retaining any untrusted response bytes. */
+  constructor() {
+    super("body too large");
+  }
+}
+
 /**
  * Collect a stream into memory, rejecting it as soon as the configured byte limit is
  * exceeded.
@@ -30,7 +40,7 @@ async function boundedBody(stream: AsyncIterable<Uint8Array>, limit: number) {
   let size = 0;
   for await (const chunk of stream) {
     size += chunk.length;
-    if (size > limit) throw new Error("body too large");
+    if (size > limit) throw new BodyLimitError();
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
@@ -1134,24 +1144,35 @@ export class ModelRelay {
           } as RequestInit & Pick<UndiciRequestInit, "dispatcher">);
           operation.signal.throwIfAborted();
           // Parse only a bounded rejection envelope; raw errors never leave the relay.
-          const rejected =
-            upstream.status === 429 && upstream.body
-              ? await boundedBody(
-                  upstream.body,
-                  access.model.max_response_bytes,
-                )
-              : undefined;
+          let rejected: Buffer | undefined;
+          if (upstream.status === 429 && upstream.body) {
+            try {
+              rejected = await boundedBody(
+                upstream.body,
+                access.model.max_response_bytes,
+              );
+            } catch (error) {
+              // An oversized envelope cannot establish an unbilled throttle, but
+              // response headers still govern later requests sharing this credential.
+              if (!(error instanceof BodyLimitError)) throw error;
+            }
+          }
           operation.signal.throwIfAborted();
           const transient =
             rejected !== undefined &&
             retryableThrottle(upstream, rejected, access.model.provider);
           const now = Date.now();
+          const providerDelay =
+            upstream.status === 429
+              ? retryDelay(upstream.headers, now)
+              : undefined;
           const retryMs = transient
             ? Math.max(
                 1,
-                retryDelay(upstream.headers, now) ?? 1000 * 2 ** retries,
+                providerDelay ??
+                  Math.min(MAX_FALLBACK_RETRY_MS, 1000 * 2 ** retries),
               )
-            : undefined;
+            : providerDelay;
           this.observeLimits(
             quota,
             access.model.provider === "anthropic"

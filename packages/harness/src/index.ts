@@ -1026,19 +1026,23 @@ export async function reviewRepository(
           "Invalid review output; requesting one budgeted JSON correction",
           "warn",
         );
-        input.push({
+        const correction: ModelMessage = {
           role: "user",
           content: await renderPrompt("correction", {
             conversational: !!config.conversation,
           }),
-        });
+        };
+        // The one allowed correction is pending work, not reducible investigation.
+        // Retain its exact instructions even when the invalid output needs compaction.
+        retained.push(correction);
+        input.push(correction);
         continue;
       }
       await capabilities.close();
       if (boundedOutput)
         review.summary +=
           "\n\nInspection limitation: some tool observations were truncated to preserve bounded output and final-response headroom; omitted content is not verified coverage.";
-      if (finalizationReason && !config.conversation)
+      if (finalizationReason)
         review.summary =
           "Inspection limitation: " +
           finalizationReason +

@@ -4,7 +4,7 @@ import { open } from "node:fs/promises";
 
 import { z } from "zod";
 
-import { reviewPricingSchema, reviewResultSchema } from "@razbor/contracts";
+import { reviewBudgetSchema, reviewResultSchema } from "@razbor/contracts";
 
 const MAX_FILE_BYTES = 2_000_000;
 
@@ -77,7 +77,12 @@ const configurationSchema = z
     maxTokens: z.number().int().min(1).max(100000000).optional(),
     maxCostUsd: z.number().finite().positive().optional(),
     compactionThresholdTokens: count.positive().optional(),
-    pricing: reviewPricingSchema.optional(),
+    // Validate with the runner policy, including duplicate provider/model identities,
+    // then retain only supplied pricing instead of adding budget defaults to history.
+    pricing: z
+      .preprocess((pricing) => ({ pricing }), reviewBudgetSchema)
+      .transform(({ pricing }) => pricing)
+      .optional(),
   })
   .strict();
 

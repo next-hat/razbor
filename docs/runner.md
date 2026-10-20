@@ -160,9 +160,12 @@ the [OpenAI error categories](https://developers.openai.com/api/docs/guides/erro
 and [Azure429 guidance](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/quota).
 
 Known throttle retries honor `retry-after-ms` / `Retry-After`; without a valid
-hint a recognized OpenAI rate rejection uses bounded exponential backoff. Claude
-rejections without a valid delay remain ambiguous and are not retried. Shared quota
-pacing still applies.
+hint a recognized OpenAI rate rejection uses exponential backoff capped at 30
+seconds per fallback delay. Explicit provider retry delays remain uncapped.
+Claude rejections without a valid delay remain ambiguous and are not retried.
+Oversized HTTP429 bodies are also non-retryable: the relay still observes quota
+headers and explicit retry delays while discarding the bounded parsing failure.
+Shared quota pacing still applies.
 One fixed `model.timeout_ms` deadline covers quota waits, all retries and the
 response body, bounded further by the whole-attempt deadline. Cancellation or
 revocation interrupts backoff before another dispatch. Retry diagnostics expose
@@ -203,7 +206,10 @@ the configured agent image; missing utilities are failed checks, never passes.
 ### Context and large comparisons
 
 Full patch ingestion is capped at 32 MiB. Ordinary Git output and the changed-file
-manifest are capped at 1,000,000 bytes. Pinned source blobs may be up to 32 MiB;
+manifest are capped at 1,000,000 bytes. Finding validation reads a complete
+immutable source blob and remains limited to 32 MiB, even for a small diff in a
+larger file; a finding requiring such a blob fails validation rather than
+bypassing the cap. Pinned source blobs may be up to 32 MiB;
 source pages are limited to 400 lines and 100,000 bytes. Diff pages remain bounded
 by the tool output limit. Exceeding a Git cap fails with
 `GIT_OUTPUT_LIMIT_EXCEEDED` without logging source content.
@@ -240,6 +246,8 @@ and reference list. The provider still enforces its actual token limit.
 
 Compaction preserves the stable system instructions, exact complete changed-file
 manifest, revision identities, previous-finding obligations and environment facts.
+A pending one-shot JSON correction keeps its exact instruction across compaction;
+summarizing an invalid final output does not consume or replace that correction.
 Older investigation history becomes one bounded continuation note preserving
 relevant discoveries, observation references, unresolved hypotheses, failed/unrun
 checks, inspection limitations and next steps. Tools-disabled profiles keep their
@@ -249,14 +257,17 @@ cannot reread.
 Oversized history is summarized in sequential bounded fragments through the same
 model, budget and cancellation signal. Complete tool outputs are consumed once,
 not replayed after compaction; no duplicate evidence ledger or checkpoint JSON is
-injected. Unknown references, incomplete notes or an immutable request envelope
-that cannot fit the configured window fail explicitly. Notes cannot prove a
-finding or a passing check. Important source evidence must be reread when needed.
+injected. Unknown, unseen or duplicate structured `evidenceIds`, incomplete notes,
+or an immutable request envelope that cannot fit the configured window fail
+explicitly. Free-text notes may quote repository strings such as `tool-99`; those
+strings are not validated observation IDs. Notes cannot prove a finding or a
+passing check. Important source evidence must be reread when needed.
 No new persistent state is introduced.
 
 The agent decides how to investigate large comparisons and must disclose any
-uninspected scope. Optional diff-delivery counters measure content supplied by
-read_diff; they do not measure inspection through commands or semantic coverage.
+uninspected scope. Budget-forced finalization adds an inspection limitation to
+both ordinary review summaries and conversation replies. Optional diff-delivery
+counters measure content supplied by read_diff; they do not measure inspection through commands or semantic coverage.
 Tools-disabled models can review a complete inline comparison, but a lazy diff
 requires tools. No minimum four-turn workflow remains.
 

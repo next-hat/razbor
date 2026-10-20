@@ -25,14 +25,14 @@ function fixture(
   const controller = new AbortController();
   const access = relay.issue(controller.signal, undefined, diagnostic);
   /** Sends directly through the authorized relay handler without a network server. */
-  const request = (extra: Record<string, unknown> = {}) =>
+  const request = (extra: Record<string, unknown> = {}, token = access.token) =>
     relay.handleRequest(
       new Request(
         `http://relay.invalid/v1/${provider === "anthropic" ? "messages" : "responses"}`,
         {
           method: "POST",
           headers: {
-            authorization: `Bearer ${access.token}`,
+            authorization: `Bearer ${token}`,
             "content-type": "application/json",
           },
           body: JSON.stringify({
@@ -175,7 +175,9 @@ test("relay retries explicit nonbillable throttles with Retry-After and one fixe
         signals.push(init!.signal!);
         bodies.push(String(init!.body));
         dispatched.push(Date.now());
-        return signals.length === 1 ? throttle(provider) : new Response("{}");
+        return signals.length === 1
+          ? throttle(provider, { "retry-after": "120" })
+          : new Response("{}");
       },
     );
     try {
@@ -184,7 +186,7 @@ test("relay retries explicit nonbillable throttles with Retry-After and one fixe
       assert.equal(fetch.mock.callCount(), 2);
       assert.equal(signals[0], signals[1]);
       assert.equal(bodies[0], bodies[1]);
-      assert.ok(dispatched[1] - dispatched[0] >= 2000);
+      assert.ok(dispatched[1] - dispatched[0] >= 120000);
       assert.equal(response.headers.get("x-razbor-usage-incomplete"), null);
     } finally {
       fetch.mock.restore();
@@ -192,7 +194,7 @@ test("relay retries explicit nonbillable throttles with Retry-After and one fixe
       await f.relay.close();
     }
   }
-  assert.deepEqual(clock.waits, [2000, 2000]);
+  assert.deepEqual(clock.waits, [120000, 120000]);
 });
 
 test("recognized OpenAI rate rejections without delay headers use bounded exponential backoff", async (t) => {
@@ -401,31 +403,56 @@ test("the fixed request deadline cancels throttle backoff without another dispat
   }
 });
 
-test("oversized throttle bodies fail closed within the response limit without retry", async (t) => {
-  const f = fixture("openai", { max_response_bytes: 1024 });
-  const fetch = t.mock.method(
-    globalThis,
-    "fetch",
-    async () =>
-      new Response(
-        JSON.stringify({
-          error: {
-            code: "rate_limit_exceeded",
-            type: "requests",
-            message: "private-provider-key".repeat(100),
-          },
-        }),
-        { status: 429 },
-      ),
-  );
-  try {
-    await assert.rejects(f.request(), /body too large/);
-    assert.equal(fetch.mock.callCount(), 1);
-  } finally {
-    fetch.mock.restore();
-    f.access.revoke();
-    await f.relay.close();
+test("oversized429 bodies retain provider pacing and quota headers for shared credentials without retry", async (t) => {
+  const clock = retryClock(t);
+  for (const retryAfter of [45, 120]) {
+    const f = fixture("openai", { max_response_bytes: 1024 });
+    let other: ReturnType<ModelRelay["issue"]> | undefined;
+    let calls = 0;
+    const fetch = t.mock.method(globalThis, "fetch", async () =>
+      ++calls === 1
+        ? new Response(
+            JSON.stringify({
+              error: {
+                code: "rate_limit_exceeded",
+                type: "requests",
+                message: "private-provider-key".repeat(100),
+              },
+            }),
+            {
+              status: 429,
+              headers: {
+                "retry-after": String(retryAfter),
+                "x-ratelimit-limit-requests": "100",
+                "x-ratelimit-remaining-requests": "0",
+                "x-ratelimit-reset-requests": "75",
+              },
+            },
+          )
+        : new Response("{}"),
+    );
+    try {
+      const response = await f.request();
+      assert.equal(response.status, 429);
+      assert.equal(response.headers.get("x-should-retry"), "false");
+      assert.doesNotMatch(
+        await response.text(),
+        /private-provider-key|rate_limit_exceeded/,
+      );
+      assert.equal(fetch.mock.callCount(), 1);
+      const rejectedAt = Date.now();
+      other = f.relay.issue(new AbortController().signal);
+      assert.equal((await f.request({}, other.token)).status, 200);
+      assert.equal(Date.now() - rejectedAt, Math.max(75000, retryAfter * 1000));
+      assert.equal(fetch.mock.callCount(), 2);
+    } finally {
+      fetch.mock.restore();
+      other?.revoke();
+      f.access.revoke();
+      await f.relay.close();
+    }
   }
+  assert.deepEqual(clock.waits, [75000, 120000]);
 });
 
 test("attempt cancellation aborts an in-flight provider call without retry", async (t) => {
@@ -584,5 +611,40 @@ test("native Claude response preserves uncached, cache-read and cache-write bill
     assert.equal(fetch.mock.callCount(), 1);
   } finally {
     fetch.mock.restore();
+  }
+});
+
+test("fallback throttle backoff caps at30 seconds including pacing a later shared-credential request", async (t) => {
+  const clock = retryClock(t);
+  const f = fixture("openai", { max_retries: 10 });
+  let other: ReturnType<ModelRelay["issue"]> | undefined;
+  let calls = 0;
+  const fetch = t.mock.method(globalThis, "fetch", async () =>
+    ++calls <= 11
+      ? new Response(
+          JSON.stringify({
+            error: { code: "rate_limit_exceeded", type: "requests" },
+          }),
+          { status: 429 },
+        )
+      : new Response("{}"),
+  );
+  try {
+    assert.equal((await f.request()).status, 429);
+    assert.equal(fetch.mock.callCount(), 11);
+    const rejectedAt = Date.now();
+    other = f.relay.issue(new AbortController().signal);
+    assert.equal((await f.request({}, other.token)).status, 200);
+    assert.equal(Date.now() - rejectedAt, 30000);
+    assert.deepEqual(
+      clock.waits,
+      [1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000, 30000, 30000, 30000],
+    );
+    assert.equal(fetch.mock.callCount(), 12);
+  } finally {
+    fetch.mock.restore();
+    other?.revoke();
+    f.access.revoke();
+    await f.relay.close();
   }
 });

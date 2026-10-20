@@ -26,6 +26,7 @@ These suites need no Docker, database, model credentials, or live forge.
 | `pnpm run test:verification`                | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
 | `pnpm run test:persistence:unit`            | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
 | `pnpm run test:presentation`                | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
+| `pnpm run test:release`                     | Explicit image publication tags and local-load defaults                                        | Bash; temporary fake Docker/Git, no daemon     |
 | `pnpm run test:coverage`                    | The default suite with a coverage report                                                       | No additional requirements                     |
 
 Run a spec or select tests by name:
@@ -58,11 +59,14 @@ These deterministic provider fixtures exercise command-only exploration, immutab
 finding locations, exact manifest and previous-finding retention, compaction-window
 chunking, a 64k window with the default 80k trigger, immutable-context floors,
 large continuation notes followed by consecutive tools without redundant summaries,
-failure/cancellation, budget notices and final-response headroom. They
+failure/cancellation, budget notices, final-response headroom, correction instructions
+retained after an invalid final output triggers compaction, and budget-limited
+conversation disclosures. They
 cover refused tool batches without command execution, strict token/cost reservations,
 provider/model price selection and legacy configuration compatibility. Relay cases
-exercise opt-in known nonbillable throttles, Retry-After, one request deadline and
-permanent/ambiguous error rejection. Cumulative progress cases preserve coherent
+exercise opt-in known nonbillable throttles, capped fallback backoff, explicit
+Retry-After, shared credential pacing after oversized HTTP429 bodies, one request
+deadline and permanent/ambiguous error rejection. Cumulative progress cases preserve coherent
 usage/cost snapshots after 500 events and keep cache data unknown after usage gaps.
 `tests/apps/runner/finalization.spec.ts` sends native OpenAI Responses and Anthropic
 Messages payloads through the real model adapter and runner relay, intercepting
@@ -74,6 +78,12 @@ positives. Verification checks use installed Git/rg/grep/cat/sed/awk/head/tail/f
 and deterministic process cleanup barriers; unavailable optional utilities are
 reported as skipped. No real model, database or infrastructure credentials are
 needed. All temporary repositories and evaluation files are removed by fixtures.
+
+The release-script regressions run the real shell script with temporary Docker
+and Git recorders. They verify rejection of implicit publication tags before any
+Docker invocation, explicit CLI/environment tag selection and unchanged local
+load defaults. They neither build nor publish images. Run `pnpm run test:release`
+separately from provider and database integration suites.
 
 ## Audited revision evaluation
 
@@ -87,7 +97,8 @@ pnpm evaluate plan tests/evaluation/audited-revisions.json
 ```
 
 The evaluation CLI regression specs also check historical-record compatibility,
-failed-attempt telemetry, cache splits and configuration grouping. Scoring exposes
+failed-attempt telemetry, cache splits, configuration grouping and runner-compatible
+single/multiple provider-model pricing, including duplicate-identity rejection. Scoring exposes
 turns, tool calls, cached/uncached/cache-write tokens and conservative budget
 charges, preserving unknown fields. These specs never dispatch a model.
 

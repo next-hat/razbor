@@ -29,6 +29,11 @@ docker login ghcr.io --username YOUR_GITHUB_USERNAME
 bash scripts/publish-images.sh --tag "$RAZBOR_IMAGE_TAG" --push
 ```
 
+Publishing requires an explicit `--tag` or a nonempty `RAZBOR_IMAGE_TAG`; an
+implicit or empty tag fails before Docker runs. Local loads retain the `0.1.0`
+default. An explicitly selected existing tag can still be overwritten, so select
+a new release tag deliberately.
+
 The script publishes `ghcr.io/next-hat/razbor-{web,indexer,runner,embeddings,postgres,migrate}`
 and labels them with the source repository, version, and Git revision. For a fork,
 change the image namespace and source labels in the script and Dockerfiles, then
@@ -40,8 +45,17 @@ the deployment account needs read permission for every image. See
 [GitHub's Container registry instructions](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 
 The committed deployment examples pin all six services to the initial Razbor
-release, `0.1.0`. These are template defaults, not a statement about the latest release.
-Choose and publish the tags you intend to deploy, then update all image references.
+release, `0.1.0`: Compose defaults to that tag for every service, with a separate
+web override; Nanocl pins it directly. Commit `2fc6a06` changed these selections
+and the local-build default together, independently of the harness code. They
+remain template defaults, not a statement about the latest release.
+
+Source inspection cannot verify the registry contents, migration compatibility,
+or ordering of these artifacts relative to the earlier `0.1.11`/`0.1.12`
+deployment selections. The `0.1.0` tag alone does not establish that an image
+contains the autonomous harness. Verify the intended image revisions and matching
+control-plane/runner versions before applying these examples to an existing
+installation. Choose and publish your intended tags, then update all references.
 Upgrade the control plane before runners when a release changes their protocol or
 review limits.
 
