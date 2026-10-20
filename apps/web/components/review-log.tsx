@@ -130,16 +130,15 @@ export function ReviewLog({
       viewport.current.scrollTop = viewport.current.scrollHeight;
   }, [lines, follow, showDetails]);
   const latest = lines.at(-1);
-  const model = lines.findLast(
-    (line) => line.attemptId === latest?.attemptId && line.model,
-  )?.model;
-  const maxTurns = lines.findLast(
-    (line) =>
-      line.attemptId === latest?.attemptId && line.maxTurns !== undefined,
+  const attempt = [...lines]
+    .reverse()
+    .filter((line) => line.attemptId === latest?.attemptId);
+  const model = attempt.find((line) => line.model)?.model;
+  const maxTurns = attempt.find(
+    (line) => line.maxTurns !== undefined,
   )?.maxTurns;
-  const stats = lines.findLast(
-    (line) => line.attemptId === latest?.attemptId && line.turn !== undefined,
-  );
+  const stats = attempt.find((line) => line.turn !== undefined);
+  const cost = attempt.find((line) => line.estimatedCostUsd !== undefined);
   const elapsed = elapsedSeconds(job, now);
   return (
     <section
@@ -203,6 +202,36 @@ export function ReviewLog({
         <span>
           <strong>{stats?.outputTokens ?? "—"}</strong> reported output tokens
         </span>
+        {stats?.uncachedInputTokens !== undefined && (
+          <span>
+            <strong>{stats.uncachedInputTokens}</strong> uncached input tokens
+          </span>
+        )}
+        {stats?.cachedInputTokens !== undefined && (
+          <span>
+            <strong>{stats.cachedInputTokens}</strong> cached input tokens
+          </span>
+        )}
+        {stats?.cacheWriteTokens !== undefined &&
+          stats.cacheWriteTokens > 0 && (
+            <span>
+              <strong>{stats.cacheWriteTokens}</strong> cache-write tokens
+            </span>
+          )}
+        {cost?.estimatedCostUsd !== undefined && (
+          <span
+            title={
+              cost.costEstimateComplete !== true
+                ? "Usage is incomplete; this estimate may differ from provider charges."
+                : "Estimated from recorded token categories and configured model prices."
+            }
+          >
+            <strong>{cost.estimatedCostUsd.toFixed(6)} USD</strong>{" "}
+            {cost.costEstimateComplete !== true
+              ? "estimated cost · incomplete usage"
+              : "estimated cost"}
+          </span>
+        )}
       </div>
       {!available && (
         <output className="block border-b px-4 py-3 text-sm text-destructive">

@@ -38,6 +38,19 @@ dependencies_volume = "razbor-runtime"
 
 [harness]
 initialDiffMaxBytes = 4096 # UTF-8 bytes; 0 forces lazy context for nonempty changes
+compactionThresholdTokens = 80000
+
+[harness.reviewBudget]
+maxToolCalls = 2048
+maxTokens = 1000000
+maxOutputTokens = 4096
+# maxCostUsd = 1.0 # requires explicit prices for the exact selected model
+# [harness.reviewBudget.pricing]
+# model = "exact-model-id"
+# inputUsdPerMillion = 0 # set current operator-verified rates
+# cachedInputUsdPerMillion = 0
+# outputUsdPerMillion = 0
+# cacheWriteUsdPerMillion = 0 # zero only when not separately billed
 
 [model]
 # Assign an AI reviewer to each repository in the UI. Its endpoint, model and
@@ -49,8 +62,8 @@ initialDiffMaxBytes = 4096 # UTF-8 bytes; 0 forces lazy context for nonempty cha
 # model = "gpt-oss-20b" # configure all three legacy fields together
 reasoning_effort = "high" # fallback; saved AI reviewer profiles pin their own effort
 supports_tools = true # false fails clearly when the diff requires lazy loading
-max_requests = 512 # aggregate ceiling; small reviews use at most 24, large reviews budget groups plus final verification and compaction
-max_retries = 3 # transient HTTP/timeout retries per turn (0-10); these do not consume turns
+max_requests = 512 # aggregate ceiling including compaction, final output and one JSON correction
+max_retries = 0 # legacy accepted setting; provider requests are never automatically retried
 max_request_bytes = 2000000
 max_response_bytes = 1000000
 max_output_tokens = 4096

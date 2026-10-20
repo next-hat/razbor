@@ -68,7 +68,12 @@ abrupt restart, the previous session can take up to 90 seconds to expire.
 
 ## Change capacity and review limits
 
-The example config sets:
+One autonomous agent chooses commands, source reads and optional capabilities.
+There are no mandatory investigation phases, checkpoint JSON or model-generated
+risk inventories. The final ReviewResult, prior-finding reassessment and existing
+publication flow are unchanged. Finding locations are checked against regular
+files and added-line hunks at the immutable recorded head, independently of the
+source discovery tool. This validates locations, not semantic correctness.
 
 ```toml
 [runner]
@@ -77,97 +82,100 @@ timeout_ms = 3600000
 
 [model]
 max_requests = 512
-max_retries = 3
+max_retries = 0 # legacy accepted setting; automatic provider retries are disabled
 max_output_tokens = 4096
 timeout_ms = 3600000
 
 [harness]
 initialDiffMaxBytes = 4096
+compactionThresholdTokens = 80000
+
+[harness.reviewBudget]
+maxToolCalls = 2048
+maxTokens = 1000000
+maxOutputTokens = 4096
+# maxCostUsd requires explicit, current prices for the exact assigned model.
 ```
 
-| Setting                       | Meaning                                                                                                                  |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `runner.concurrency`          | Reviews running at once.                                                                                                 |
-| `runner.timeout_ms`           | Whole-attempt deadline; one hour by default.                                                                             |
-| `model.max_requests`          | Total model-call ceiling, including compaction and final output. Range 1–512; default 512. Small reviews use at most 24. |
-| `model.max_retries`           | Retries for transient HTTP errors and upstream timeouts. Range 0–10; default 3.                                          |
-| `model.max_output_tokens`     | Maximum output requested per model turn.                                                                                 |
-| `model.timeout_ms`            | Limit for each upstream request, including its response body. Default and maximum: one hour.                             |
-| `harness.initialDiffMaxBytes` | Inline patch threshold for a single-group review. Grouped reviews inline bounded groups and page oversized patches.      |
+`model.max_requests` bounds all model turns, including compaction and the single
+allowed correction of invalid final JSON. `harness.reviewBudget` additionally
+bounds tool calls, cumulative input plus output tokens, and optional estimated
+USD cost. Both output caps apply; the relay respects the lower cap. There is no
+per-group budget multiplier. A rejected tool batch executes no commands. Budget
+exhaustion fails the attempt; it never publishes a clean result by default.
 
-Every request and retry is bounded by the time remaining in the attempt. A late
-request does not get another hour. Incoming request uploads have a separate
-60-second cap. Custom configs retain their explicit values; set
-`model.timeout_ms = 3600000` if you want the current default. External proxies
-must allow equivalent response timeouts; the Nanocl template allows one hour.
+To enforce a monetary ceiling, add `maxCostUsd` and
+`[harness.reviewBudget.pricing]` with `model`, `inputUsdPerMillion`,
+`cachedInputUsdPerMillion`, `outputUsdPerMillion`, and
+`cacheWriteUsdPerMillion`. Prices are operator-supplied USD per million tokens;
+use zero for a category only when it is not separately billed. The pricing model
+must exactly match the review's selected model. Without prices no cost is shown;
+a monetary ceiling without prices is rejected. Agent profiles continue to choose
+the model and reasoning effort through the existing configuration.
 
-### Retries and usage
+Every paid call reserves conservative input and a full capped output before
+dispatch. Complete provider measurements settle the reservation; missing or
+failed responses retain conservative charges and mark usage incomplete. Cached,
+uncached, output and separately billed cache-write categories remain distinct.
+The existing execution log shows available per-attempt categories and USD
+estimates, labeling conservative estimates. Attempt metrics use existing JSON
+storage and survive failed reviews; no database migration is required. Use matching
+web and runner versions for the new telemetry fields; older strict APIs may
+reject them. Existing saved reviews and legacy metric records remain readable.
 
-The provider relay honors `x-should-retry: false` and `true`. Without that header,
-408, 409, 429, and 5xx responses are retryable. `retry-after-ms` takes precedence
-over `Retry-After`; otherwise retries use bounded exponential backoff.
-Cancellation and the attempt deadline apply during both requests and waits.
-Policy rejections and oversized payloads are not retried.
+### Requests, isolation and command exploration
 
-For UI-configured reviewers, the control plane owns retries. The runner's
-forwarding hop waits within the same deadline without retrying, and Mastra SDK
-retries are disabled. Failed responses after exhausted retries carry
-`x-should-retry: false`. Recovery after a timeout or non-rate-limit error marks
-usage incomplete, since failed calls may have consumed unreported tokens.
-Upgrade web and runner together to enable this behavior on both hops.
+The SDK and both relay hops dispatch each model request once. HTTP failures,
+rate limits and timeouts are not silently retried, even if a legacy
+`model.max_retries` value is configured. Provider quota headers may pace a later
+independent request. Request timeouts and quota waits remain bounded by the
+whole-attempt deadline; a new request never gets a fresh attempt deadline.
+A final-JSON correction is an explicit budgeted turn, not a transport retry.
 
-Rate-limit retries stay within one model turn. Waiting for a quota reset still
-uses attempt time. Raising request or retry limits does not extend the deadline;
-an attempt without a validated final result fails when its budget runs out.
+Exec accepts an argument vector and a repository-confined working directory.
+Installed git, rg, grep, cat, sed, awk, head, tail and find can inspect the checkout;
+existing test/build tools can verify behavior. Optional read_file/read_diff tools
+provide pinned pages. Normal command exploration needs no graph or skill call.
+Unavailable optional CBM/MCP/memory services produce explicit limitations.
+Approved instruction or skill loading failures remain fatal.
 
-### Large reviews and evidence
+Commands keep the existing Kata/container boundary, resource limits, sanitized
+environment, bounded output, cancellation, deadline and process-group cleanup.
+Exec is not a host shell or a new filesystem/network sandbox: the existing
+non-root job container and internal job network enforce those boundaries.
+Source objects are imported into a fresh checkout without forge credentials or
+host infrastructure sockets. Availability of command-line programs depends on
+the configured agent image; missing utilities are failed checks, never passes.
+
+### Context and large comparisons
 
 Full patch ingestion is capped at 32 MiB. Ordinary Git output and the changed-file
 manifest are capped at 1,000,000 bytes. Pinned source blobs may be up to 32 MiB;
 source pages are limited to 400 lines and 100,000 bytes. Diff pages remain bounded
 by the tool output limit. Exceeding a Git cap fails with
-`GIT_OUTPUT_LIMIT_EXCEEDED` without logging patch content.
+`GIT_OUTPUT_LIMIT_EXCEEDED` without logging source content.
 
-Patches above 512 KiB or 96 files use deterministic file groups. Each group has
-its own conversation, investigation, verification, and challenge checkpoints.
-Oversized files stay paged. Groups share pinned commits and repository-wide
-source access. A final pass checks cross-file contracts, reassesses candidates,
-and rereads finding ranges before publication. Binary and unsupported changes
-remain explicit limitations; unread content is never counted as reviewed.
+One automatic compaction mechanism triggers at
+`harness.compactionThresholdTokens` (default 80,000). It uses provider prompt
+measurements plus conservative estimates for new history, or serialized UTF-8
+bytes when measurements are absent. Tool definitions and request overhead also
+consume context. The stable system prompt, review objective, revision identities
+and previous-finding obligations remain intact. Older history becomes one bounded
+continuation note preserving discoveries, observation references, unresolved
+hypotheses, failed/unrun checks, inspection limitations and next steps.
 
-The harness budgets up to 24 calls per group and reserves calls for final
-verification, all within `model.max_requests`. Lower configured limits remain
-in force and can produce an incomplete result. Large reviews can cost
-substantially more; their time limit stays the same.
+Oversized history is summarized in sequential bounded fragments through the same
+model, budget and cancellation signal. Complete tool outputs are consumed once,
+not replayed after compaction; no duplicate evidence ledger or checkpoint JSON is
+injected. Unknown references, incomplete notes or retained context that cannot
+fit fail the attempt. Notes cannot prove a finding or a passing check. Important
+source evidence must be reread when needed. No new persistent state is introduced.
 
-Upgrade the control plane before runners using these limits. Older control planes
-reject more than 100 requests or a model timeout above five minutes. Lower runner
-limits remain compatible but can be too small for grouped reviews or models using
-high reasoning effort.
-
-Before context exceeds the relay budget, synchronous Mastra compaction summarizes
-older history in bounded chunks. Compaction shares the request budget, token
-metrics, deadline, and cancellation. Instructions, current scope, and checkpoints
-are retained; the source evidence ledger remains authoritative. Summaries help
-navigation but do not count as proof. Invalid summaries or immutable context that
-cannot fit make the review incomplete. Compaction adds no persistent memory,
-hidden streaming calls, or separate retry budget.
-
-The workflow shares one budget across investigation, verification, a challenge
-pass even for zero-finding drafts, and completion. Workflow state belongs to the
-attempt; the queue and attempt lease provide durable execution. The review guide
-prioritizes changed production code, including maintained vendor code, before
-test-only files. Checkpoints preserve each risk's contract and trigger, baseline
-and head behavior, and downstream effects. Verification must address those same
-contracts. The evidence gate checks source delivery and continuity; semantic
-correctness and test expectations still need independent validation. A rejected
-checkpoint gets one bounded revisit; unresolved gaps make the review incomplete.
-
-Keep `model.supports_tools = true` for code reviews. Executable changes need pinned
-source reads, and paged diffs need tools; a tools-disabled profile is rejected
-before model requests in either case. Small inline documentation reviews can run
-without tools. Staged reviews need at least four model turns; conversational
-replies need at least one.
+The agent decides how to investigate large comparisons and must disclose any
+uninspected scope. Optional diff-delivery counters measure content supplied by
+read_diff; they do not measure inspection through commands or semantic coverage.
+Tools-disabled models can review a complete inline comparison, but a lazy diff
+requires tools. No minimum four-turn workflow remains.
 
 ### Model configuration
 

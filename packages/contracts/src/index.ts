@@ -8,6 +8,7 @@ import {
   preparedMcpServerSchema,
 } from "@contracts/src/mcp.js";
 import { reviewMetricCountSchema } from "@contracts/src/telemetry.js";
+import { reviewBudgetSchema } from "@contracts/src/review-budget.js";
 import {
   MAX_SKILL_FILE_BYTES,
   reviewGuidanceSnapshotSchema,
@@ -16,6 +17,8 @@ import {
 } from "@contracts/src/skills.js";
 
 export * from "@contracts/src/skills.js";
+
+export * from "@contracts/src/review-budget.js";
 
 export * from "@contracts/src/github-app.js";
 
@@ -305,6 +308,12 @@ export const reviewProgressSchema = z.object({
   toolCalls: z.number().int().nonnegative().optional(),
   inputTokens: reviewMetricCountSchema.optional(),
   cachedInputTokens: reviewMetricCountSchema.optional(),
+  uncachedInputTokens: reviewMetricCountSchema.optional(),
+  cacheWriteTokens: reviewMetricCountSchema.optional(),
+  modelTurns: reviewMetricCountSchema.optional(),
+  budgetTokens: reviewMetricCountSchema.optional(),
+  estimatedCostUsd: z.number().finite().nonnegative().optional(),
+  costEstimateComplete: z.boolean().optional(),
   outputTokens: reviewMetricCountSchema.optional(),
   addedLines: reviewMetricCountSchema.optional(),
   deletedLines: reviewMetricCountSchema.optional(),
@@ -446,6 +455,13 @@ export const agentJobSchema = z.object({
   initialDiffMaxBytes: z.number().int().min(0).max(1000000).default(4096),
   supportsTools: z.boolean().default(true),
   maxTurns: reviewMaxTurnsSchema,
+  reviewBudget: reviewBudgetSchema.optional(),
+  compactionThresholdTokens: z
+    .number()
+    .int()
+    .min(1024)
+    .max(1000000)
+    .default(80000),
   capabilities: preparedCapabilitiesSchema.optional(),
   previousFindings: previousFindingsSchema.optional(),
   conversation: reviewConversationSchema.optional(),

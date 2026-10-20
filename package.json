@@ -31,7 +31,8 @@
     "test:persistence:unit": "node --import=tsx --test tests/packages/database/identifiers.spec.ts tests/packages/forge-adapters/providers.spec.ts",
     "test:persistence": "node --import=tsx --test tests/packages/database/integration.spec.ts",
     "test:comments": "node --import=tsx --test tests/packages/database/comment-flow.spec.ts",
-    "test:presentation": "TSX_TSCONFIG_PATH=tests/apps/web/tsconfig.json node --import=tsx --test tests/packages/contracts/presentation.spec.ts tests/packages/forge-adapters/presentation.spec.ts tests/apps/web/presentation.spec.ts"
+    "test:presentation": "TSX_TSCONFIG_PATH=tests/apps/web/tsconfig.json node --import=tsx --test tests/packages/contracts/presentation.spec.ts tests/packages/forge-adapters/presentation.spec.ts tests/apps/web/presentation.spec.ts",
+    "test:review": "node --import=tsx --test --test-isolation=none tests/packages/harness/autonomous.spec.ts tests/packages/harness/budgets.spec.ts tests/packages/harness/context.spec.ts tests/apps/runner/model-budget.spec.ts tests/scripts/evaluate.spec.ts"
   },
   "dependencies": {
     "ajv": "8.20.0",

@@ -13,6 +13,7 @@ import { SkillCatalog } from "@harness/src/capabilities/skills.js";
 export class ReviewCapabilities {
   readonly tools: OpenAI.Chat.Completions.ChatCompletionTool[] = [];
   readonly instructions: string[] = [];
+  readonly limitations: string[] = [];
   private memory?: RemoteMemory;
   private durableMemory?: DurableMemory;
   private skills?: SkillCatalog;
@@ -30,12 +31,14 @@ export class ReviewCapabilities {
   ) {}
 
   /**
-   * Starts approved capabilities, closing every partially opened remote connection
-   * before propagating a startup failure.
+   * Loads trusted guidance and optional tools, closing partially opened connections
+   * before propagating cancellation or an authoritative guidance failure.
    */
   async start() {
     try {
+      this.signal.throwIfAborted();
       await this.load();
+      this.signal.throwIfAborted();
     } catch (error) {
       await this.close().catch(() => {});
       throw error;
@@ -45,6 +48,8 @@ export class ReviewCapabilities {
   /**
    * Loads approved instructions and skills, connects revision-bound code navigation,
    * repository MCP servers and durable memory, then exposes their tool definitions.
+   * Unavailable optional services become sanitized limitations; trusted guidance
+   * failures remain fatal and cancellation never becomes an availability warning.
    */
   private async load() {
     if (!this.config) return;
@@ -126,31 +131,49 @@ export class ReviewCapabilities {
       );
     }
     if (this.config.codebaseMemory) {
+      this.signal.throwIfAborted();
       this.memory = new RemoteMemory(
         this.config.codebaseMemory,
         this.log,
         this.signal,
         this.config.limits.toolOutputBytes,
       );
-      await this.memory.start();
-      this.instructions.push(
-        await renderPrompt("index-context", {
-          branch: this.config.codebaseMemory.indexBranch,
-          indexHead: this.config.codebaseMemory.indexHeadSha,
-        }),
-      );
-      this.tools.push(
-        ...this.memory.tools.map((tool) => ({
-          type: "function" as const,
-          function: {
-            name: `cbm_${tool.name}`,
-            description: tool.description,
-            parameters: tool.inputSchema,
-          },
-        })),
-      );
+      try {
+        await this.memory.start();
+        this.signal.throwIfAborted();
+      } catch {
+        try {
+          await this.memory.close();
+        } finally {
+          this.signal.throwIfAborted();
+        }
+        this.memory = undefined;
+        const limitation =
+          "Optional Codebase Memory is unavailable; no graph inspection was performed through this capability.";
+        this.limitations.push(limitation);
+        this.log.warn(limitation);
+      }
+      if (this.memory) {
+        this.instructions.push(
+          await renderPrompt("index-context", {
+            branch: this.config.codebaseMemory.indexBranch,
+            indexHead: this.config.codebaseMemory.indexHeadSha,
+          }),
+        );
+        this.tools.push(
+          ...this.memory.tools.map((tool) => ({
+            type: "function" as const,
+            function: {
+              name: `cbm_${tool.name}`,
+              description: tool.description,
+              parameters: tool.inputSchema,
+            },
+          })),
+        );
+      }
     }
     for (const [index, config] of (this.config.mcpServers ?? []).entries()) {
+      this.signal.throwIfAborted();
       const server = new RemoteMcp(
         config,
         index,
@@ -159,7 +182,21 @@ export class ReviewCapabilities {
         this.config.limits.toolOutputBytes,
       );
       this.mcpServers.push(server);
-      await server.start();
+      try {
+        await server.start();
+        this.signal.throwIfAborted();
+      } catch {
+        try {
+          await server.close();
+        } finally {
+          this.signal.throwIfAborted();
+        }
+        this.mcpServers.pop();
+        const limitation = `Optional MCP capability ${index + 1} is unavailable; its tools were not used for inspection.`;
+        this.limitations.push(limitation);
+        this.log.warn(limitation);
+        continue;
+      }
       for (const tool of server.tools) {
         this.mcpTools.set(tool.name, server);
         this.tools.push({
@@ -173,15 +210,27 @@ export class ReviewCapabilities {
       }
     }
     if (this.config.memory) {
+      this.signal.throwIfAborted();
       this.durableMemory = new DurableMemory(
         this.config.memory,
         this.log,
         this.signal,
         this.config.limits.toolOutputBytes,
       );
-      this.durableMemory.start();
-      this.instructions.push(await renderPrompt("memory-guidance"));
-      this.tools.push(...this.durableMemory.tools);
+      try {
+        this.durableMemory.start();
+      } catch {
+        this.signal.throwIfAborted();
+        this.durableMemory = undefined;
+        const limitation =
+          "Optional durable memory is unavailable; no memory documents were inspected through this capability.";
+        this.limitations.push(limitation);
+        this.log.warn(limitation);
+      }
+      if (this.durableMemory) {
+        this.instructions.push(await renderPrompt("memory-guidance"));
+        this.tools.push(...this.durableMemory.tools);
+      }
     }
   }
 

@@ -43,6 +43,25 @@ Presentation checks cover text, Markdown safety, source links, and rendered HTML
 Check layout, clipboard actions, disclosures, keyboard navigation, and both themes
 in a browser.
 
+## Autonomous review harness
+
+Run the focused agent-loop, budget, context, relay and evaluation regressions:
+
+```sh
+pnpm run test:review
+pnpm run test:diff
+pnpm run test:verification
+```
+
+These deterministic provider fixtures exercise command-only exploration, immutable
+finding locations, previous findings, automatic compaction, failure/cancellation,
+whole-batch tool limits and conservative token/cost reservations. They measure
+protocol behavior; scripted replies do not measure model finding recall or false
+positives. Verification checks use installed Git/rg/grep/cat/sed/awk/head/tail/find
+and deterministic process cleanup barriers; unavailable optional utilities are
+reported as skipped. No real model, database or infrastructure credentials are
+needed. All temporary repositories and evaluation files are removed by fixtures.
+
 ## Audited revision evaluation
 
 `tests/evaluation/audited-revisions.json` contains exact revision comparisons,
@@ -53,6 +72,11 @@ spec.
 pnpm evaluate validate tests/evaluation/audited-revisions.json
 pnpm evaluate plan tests/evaluation/audited-revisions.json
 ```
+
+The evaluation CLI regression specs also check historical-record compatibility,
+failed-attempt telemetry, cache splits and configuration grouping. Scoring exposes
+turns, tool calls, cached/uncached/cache-write tokens and conservative budget
+charges, preserving unknown fields. These specs never dispatch a model.
 
 The offline `record` and `score` commands process independently assessed execution
 records. They do not call a model or publish reviews. See the
@@ -211,9 +235,10 @@ Use disposable data and report these checks separately from automated results:
 | Pull requests                                       | Discover unreviewed PRs, retain IDs, confirm closure, preserve snapshots on refresh failure, repository grants, search, history, stale revisions, themes |
 | [Comment reviews](../docs/comment-reviews.md)       | Webhooks, publication, repeat assessments, recap edits, replies, resolution                                                                              |
 
-Model-loop fixtures return one tool call per response. They do not cover concurrent
-tool batches, multi-call result order, or cancellation during a batch. Integration
-success also does not measure retrieval relevance, autonomous tool selection, or
+Model-loop fixtures include serial command batches and budget rejection before
+any batch side effect. Live concurrent cancellation and retrieval relevance still
+need isolated runtime acceptance. Integration success does not measure model
+autonomous tool selection or
 [review quality](../docs/review-evaluation.md).
 
 `pnpm run submit <repository-key> <checkout> <base> <head>` submits committed

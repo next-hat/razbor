@@ -4,6 +4,7 @@ import path from "node:path";
 
 import { z } from "zod";
 
+import { safeGitOptions } from "@harness/src/git.js";
 import { textPrefix } from "@harness/src/tools/text.js";
 
 const argument = z
@@ -69,6 +70,28 @@ export async function executeCommand(
     args.maxOutputBytes ?? policy.maxOutputBytes,
     policy.maxOutputBytes,
   );
+  // Explicit Git exploration uses the same no-hooks/no-protocol policy as source reads.
+  // Arbitrary test/build programs remain confined by the job container, not argv filtering.
+  const isGit = path.basename(args.argv[0]) === "git";
+  const argv = isGit
+    ? [args.argv[0], ...safeGitOptions, ...args.argv.slice(1)]
+    : args.argv;
+  const env = { ...policy.env };
+  // Relative PATH entries would let the reviewed checkout shadow installed utilities.
+  if (env.PATH !== undefined)
+    env.PATH =
+      env.PATH.split(path.delimiter)
+        .filter((entry) => path.isAbsolute(entry))
+        .join(path.delimiter) || "/usr/bin:/bin";
+  if (isGit)
+    Object.assign(env, {
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+      GIT_TERMINAL_PROMPT: "0",
+      GIT_NO_REPLACE_OBJECTS: "1",
+      GIT_LFS_SKIP_SMUDGE: "1",
+      GIT_OPTIONAL_LOCKS: "0",
+    });
   const started = performance.now();
   return new Promise<{
     ok: boolean;
@@ -84,9 +107,9 @@ export async function executeCommand(
     timeoutMs: number;
     maxOutputBytes: number;
   }>((resolve, reject) => {
-    const child = spawn(args.argv[0], args.argv.slice(1), {
+    const child = spawn(argv[0], argv.slice(1), {
       cwd,
-      env: { ...policy.env },
+      env,
       shell: false,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
@@ -150,6 +173,9 @@ export async function executeCommand(
         new Error(`Command could not start (${error.code ?? "spawn failed"})`),
       );
     });
+    // A background child may retain output pipes after the command leader exits.
+    // Kill its process group now so completion does not wait for the full deadline.
+    child.once("exit", kill);
     child.once("close", (exitCode, exitSignal) => {
       cleanup();
       // Also remove background children that inherited neither output pipe.

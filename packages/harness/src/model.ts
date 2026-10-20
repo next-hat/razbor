@@ -40,6 +40,8 @@ export type ModelTurn = {
   usage: {
     inputTokens?: number;
     cachedInputTokens?: number;
+    uncachedInputTokens?: number;
+    cacheWriteTokens?: number;
     outputTokens?: number;
   };
 };
@@ -64,31 +66,67 @@ function modelStatus(error: unknown): number | undefined {
  * Preserve absent cache measurements instead of the SDK's inferred zero. Mastra
  * retains the native usage under the normalized V4 usage's raw field.
  */
-function measuredUsage(
+export function measuredUsage(
   provider: ModelProvider,
   usage: ModelTurn["usage"] & { raw?: unknown },
+  body?: unknown,
 ): ModelTurn["usage"] {
-  const native = (
-    usage.raw as
-      | {
-          raw?: {
-            input_tokens_details?: { cached_tokens?: unknown } | null;
-            cache_read_input_tokens?: unknown;
-          };
-        }
-      | undefined
-  )?.raw;
+  const wrapped = usage.raw as { raw?: unknown } | undefined;
+  const native = (wrapped?.raw ??
+    usage.raw ??
+    (body as { usage?: unknown } | undefined)?.usage) as
+    | {
+        input_tokens?: unknown;
+        input_tokens_details?: { cached_tokens?: unknown } | null;
+        cache_read_input_tokens?: unknown;
+        cache_creation_input_tokens?: unknown;
+      }
+    | undefined;
   const cached =
     provider === "openai"
       ? native?.input_tokens_details?.cached_tokens
       : native?.cache_read_input_tokens;
+  const writes =
+    provider === "openai" ? 0 : native?.cache_creation_input_tokens;
+  /** Preserves absent or invalid native counts rather than manufacturing a zero. */
+  const measured = (value: unknown): number | undefined =>
+    typeof value === "number" && Number.isSafeInteger(value) && value >= 0
+      ? value
+      : undefined;
+  const inputTokens = measured(usage.inputTokens);
+  let cachedInputTokens = measured(cached);
+  let cacheWriteTokens = measured(writes);
+  let uncachedInputTokens =
+    provider === "anthropic"
+      ? measured(native?.input_tokens)
+      : inputTokens !== undefined &&
+          cachedInputTokens !== undefined &&
+          cachedInputTokens <= inputTokens
+        ? inputTokens - cachedInputTokens
+        : undefined;
+  if (
+    inputTokens !== undefined &&
+    ((cachedInputTokens !== undefined && cachedInputTokens > inputTokens) ||
+      (cacheWriteTokens !== undefined && cacheWriteTokens > inputTokens) ||
+      (cachedInputTokens !== undefined &&
+        cacheWriteTokens !== undefined &&
+        cachedInputTokens + cacheWriteTokens > inputTokens) ||
+      (uncachedInputTokens !== undefined &&
+        cachedInputTokens !== undefined &&
+        cacheWriteTokens !== undefined &&
+        uncachedInputTokens + cachedInputTokens + cacheWriteTokens !==
+          inputTokens))
+  ) {
+    cachedInputTokens = undefined;
+    cacheWriteTokens = undefined;
+    uncachedInputTokens = undefined;
+  }
   return {
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    cachedInputTokens:
-      typeof cached === "number" && Number.isSafeInteger(cached) && cached >= 0
-        ? cached
-        : undefined,
+    inputTokens,
+    outputTokens: measured(usage.outputTokens),
+    cachedInputTokens,
+    uncachedInputTokens,
+    cacheWriteTokens,
   };
 }
 
@@ -137,6 +175,7 @@ export function createReviewModel(config: {
   model: string;
   provider?: ModelProvider;
   reasoningEffort: ReasoningEffort;
+  maxOutputTokens?: number;
   signal?: AbortSignal;
 }) {
   const provider = config.provider ?? "openai";
@@ -158,7 +197,7 @@ export function createReviewModel(config: {
   // The existing progress stream is the only log sink. Do not emit SDK payloads.
   agent.__setLogger(noopLogger);
   return {
-    /** Executes exactly one nonstreaming model step; all retries belong to the relay. */
+    /** Executes one capped model step with no SDK retries. */
     async generate(
       messages: ModelMessage[],
       definitions: OpenAI.Chat.Completions.ChatCompletionTool[],
@@ -181,7 +220,10 @@ export function createReviewModel(config: {
         const result = await agent.generate(messages, {
           maxSteps: 1,
           maxProcessorRetries: 0,
-          modelSettings: { maxRetries: 0 },
+          modelSettings: {
+            maxRetries: 0,
+            maxOutputTokens: config.maxOutputTokens ?? 4096,
+          },
           abortSignal: config.signal,
           toolCallConcurrency: 4,
           ...(toolChoice === undefined ? {} : { clientTools, toolChoice }),
@@ -225,7 +267,7 @@ export function createReviewModel(config: {
             result.response.headers?.["x-razbor-usage-incomplete"] === "true"
               ? false
               : undefined,
-          usage: measuredUsage(provider, result.usage),
+          usage: measuredUsage(provider, result.usage, result.response.body),
         };
       } catch (error) {
         config.signal?.throwIfAborted();

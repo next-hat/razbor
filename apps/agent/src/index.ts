@@ -67,6 +67,8 @@ try {
       ),
       initialDiffMaxBytes: job.initialDiffMaxBytes,
       maxTurns: job.maxTurns,
+      reviewBudget: job.reviewBudget,
+      compactionThresholdTokens: job.compactionThresholdTokens,
       supportsTools: job.supportsTools,
       baselineSha: job.baseline,
       signal: abort.signal,

@@ -53,7 +53,10 @@ Copy repository and revision values from `plan`; the example below uses case `c0
     "capabilitiesVersion": null,
     "maxTurns": 24,
     "reasoningEffort": "high",
-    "maxOutputTokens": 4096
+    "maxOutputTokens": 4096,
+    "maxToolCalls": 2048,
+    "maxTokens": 1000000,
+    "compactionThresholdTokens": 80000
   },
   "status": "completed",
   "result": { "summary": "Original result text", "findings": [] },
@@ -61,10 +64,16 @@ Copy repository and revision values from `plan`; the example below uses case `c0
     "durationMs": null,
     "inputTokens": null,
     "cachedInputTokens": null,
+    "uncachedInputTokens": null,
+    "cacheWriteTokens": null,
+    "modelTurns": null,
+    "toolCalls": null,
+    "budgetTokens": null,
     "outputTokens": null,
     "tokenUsageComplete": null,
     "costUsd": null,
-    "costBasis": null
+    "costBasis": null,
+    "costEstimateComplete": null
   },
   "failureCategory": null
 }
@@ -74,17 +83,34 @@ Record actual immutable prompt/capability versions or digests when available.
 Null provenance is permitted for historical imports but limits comparability.
 Record `reasoningEffort` (`low`, `medium`, or `high`) and `maxOutputTokens`
 (an integer from 1 through 32768, matching the runner limit) for new executions.
-These fields are optional only for compatibility with existing records: absent
-values mean unknown and are never replaced with current defaults. Both fields
-participate in configuration grouping, so different known settings remain
-separate. Keep externally recovered settings in their provenance unless the
-original execution metadata supports adding them.
+Record the tool-call/token limits and compaction threshold too. If monetary
+limits apply, record `maxCostUsd` and the explicit `pricing` object from the review
+configuration, including its exact model and all four token prices. These fields
+are optional for compatibility with existing records: absent values mean unknown
+and are never replaced with current defaults. Every recorded setting participates
+in configuration grouping, so different known settings remain separate. Keep
+externally recovered settings in their provenance unless the original execution
+metadata supports adding them.
 Allowed statuses are `completed`, `failed`, `incomplete`, and `cancelled`.
 Completed requires a result and no failure category; a timeout or malformed result
 must remain unsuccessful. A failure category is a short safe identifier such as
 `model_output_invalid`, not the provider payload. Token counts are final cumulative
 attempt totals, including any retries. Cost must include its basis (`provider` or
 `estimate`); no price or token-to-money conversion is assumed.
+
+For new autonomous-agent runs, copy measured `modelTurns`, `toolCalls`,
+`uncachedInputTokens`, and `cacheWriteTokens` from the final attempt metrics,
+including unsuccessful attempts. Model turns include compaction calls. Input
+counts are normalized totals: cached reads, uncached input and separately billed
+cache writes are disjoint parts of `inputTokens`; never add them to that total
+again. Unknown cache categories remain absent or null, rather than inferred zero.
+`budgetTokens` is a conservative budget charge and may exceed measured usage
+when a request failed or omitted telemetry. Preserve that distinction.
+
+Map `estimatedCostUsd` to `costUsd` with `costBasis: "estimate"`, and preserve
+`costEstimateComplete`. An incomplete estimate can contain conservative reserved
+cost for an unmeasured request; it is not an observed provider charge. Do not use
+incomplete token or cost records to claim savings.
 
 Prepare a record using the actual execution metadata:
 
@@ -152,9 +178,13 @@ Read the scores with their denominators:
   Non-completion rate includes failed, incomplete and cancelled / all attempts.
   Expected issues in unsuccessful runs are reported as failed opportunities, not
   model misses. Missing cases are listed separately.
-- Observed token/cost totals include unsuccessful attempts and report measurement
-  coverage. Cached input is already part of input. Incomplete token usage is a
-  lower bound. Cost basis counts distinguish estimates from provider charges.
+- Token counts, model turns, tool calls and cost totals include unsuccessful
+  attempts and report measured/missing run counts. Historical records without the
+  new fields remain unknown. Cached and cache-write input are already included in
+  total input. Incomplete observed token usage is a lower bound; conservative
+  budget charges are reported separately. Cost basis counts distinguish estimates
+  from provider charges, and complete-estimate coverage remains visible. Each case
+  also retains its original attempt telemetry.
 - Median and p95 duration use measured attempts, including unsuccessful ones;
   missing durations stay unknown. Repeated runs are separate observations, and
   case details show them so an unbalanced repetition count cannot be hidden.
@@ -162,3 +192,12 @@ Read the scores with their denominators:
 Compare configurations on the same cases with the same repetition counts. Read
 individual findings and unsafe suggestions alongside the totals. Use separate
 held-out revisions before making broader claims about review quality.
+
+A deterministic tool-dispatch fixture checks control flow and contract validation;
+it does not measure finding recall or false positives for a real model. To compare
+the staged baseline and autonomous implementation, run both immutable harness
+versions on the same defective and corrected/refuted cases, using the same model,
+reasoning effort, resource limits, pricing and repetition counts. Record every
+attempt, adjudicate against pinned source, and score both configurations. If the
+required runner image, Kata runtime, model access or revision sources are missing,
+report those checks as unavailable and leave savings and quality changes unclaimed.

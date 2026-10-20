@@ -6,7 +6,7 @@ import path from "node:path";
 import os from "node:os";
 import { createServer } from "node:http";
 
-import { publicIdSchema } from "@razbor/contracts";
+import { publicIdSchema, type ReviewAttemptMetrics } from "@razbor/contracts";
 import {
   connectDatabase,
   listRepositories,
@@ -16,6 +16,7 @@ import {
   listReviews,
   beginAttempt,
   finishAttempt,
+  recordAttemptMetrics,
   ensureDevelopmentWorkspaces,
   ownedWorkspaces,
   issueToken,
@@ -223,6 +224,59 @@ test(
         (await beginAttempt(db, accepted.id, "other", 10000)).kind,
         "busy",
       );
+      assert.equal(
+        await recordAttemptMetrics(db, accepted.id, first.attemptId, "runner", {
+          inputTokens: 100,
+          outputTokens: 20,
+          uncachedInputTokens: 50,
+          cachedInputTokens: 40,
+          cacheWriteTokens: 10,
+          modelTurns: 1,
+          toolCalls: 3,
+          budgetTokens: 120,
+          estimatedCostUsd: 0.0003,
+          costEstimateComplete: true,
+          tokenUsageComplete: true,
+        }),
+        true,
+      );
+      assert.equal(
+        await recordAttemptMetrics(db, accepted.id, first.attemptId, "runner", {
+          inputTokens: 100,
+          outputTokens: 20,
+          modelTurns: 2,
+          toolCalls: 3,
+          budgetTokens: 500,
+          estimatedCostUsd: 0.0006,
+          costEstimateComplete: false,
+          tokenUsageComplete: false,
+        }),
+        true,
+      );
+      // A transport gap never regains precise cache accounting through replayed progress.
+      await recordAttemptMetrics(db, accepted.id, first.attemptId, "runner", {
+        inputTokens: 100,
+        outputTokens: 20,
+        cachedInputTokens: 40,
+        uncachedInputTokens: 50,
+        cacheWriteTokens: 10,
+        estimatedCostUsd: 0.0006,
+        costEstimateComplete: true,
+        tokenUsageComplete: true,
+      });
+      const storedUsage = await fixture.administrator.query<{
+        metrics: ReviewAttemptMetrics;
+      }>("select metrics from review_attempts where public_id=$1", [
+        first.attemptId,
+      ]);
+      assert.equal(storedUsage.rows[0].metrics.modelTurns, 2);
+      assert.equal(storedUsage.rows[0].metrics.budgetTokens, 500);
+      assert.equal(storedUsage.rows[0].metrics.estimatedCostUsd, 0.0006);
+      assert.equal(storedUsage.rows[0].metrics.tokenUsageComplete, false);
+      assert.equal(storedUsage.rows[0].metrics.costEstimateComplete, false);
+      assert.equal(storedUsage.rows[0].metrics.cachedInputTokens, undefined);
+      assert.equal(storedUsage.rows[0].metrics.uncachedInputTokens, undefined);
+      assert.equal(storedUsage.rows[0].metrics.cacheWriteTokens, undefined);
       await fixture.administrator.query(
         "update review_attempts set lease_until = now() - interval '1 second' where public_id=$1",
         [first.attemptId],
@@ -234,7 +288,34 @@ test(
       await assert.rejects(
         finishAttempt(db, accepted.id, first.attemptId, "runner", result),
       );
+      await recordAttemptMetrics(
+        db,
+        accepted.id,
+        next.attemptId,
+        "runner",
+        {
+          inputTokens: 50,
+          outputTokens: 10,
+          cachedInputTokens: 0,
+          uncachedInputTokens: 50,
+          cacheWriteTokens: 0,
+          modelTurns: 1,
+          toolCalls: 0,
+          budgetTokens: 60,
+          estimatedCostUsd: 0.0001,
+          costEstimateComplete: true,
+          tokenUsageComplete: true,
+        },
+        true,
+      );
       await finishAttempt(db, accepted.id, next.attemptId, "runner", result);
+      const successfulUsage = await fixture.administrator.query<{
+        metrics: ReviewAttemptMetrics;
+      }>("select metrics from review_attempts where public_id=$1", [
+        next.attemptId,
+      ]);
+      assert.equal(successfulUsage.rows[0].metrics.finalized, true);
+      assert.equal(successfulUsage.rows[0].metrics.estimatedCostUsd, 0.0001);
       await assert.rejects(
         finishAttempt(
           db,

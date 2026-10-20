@@ -139,50 +139,7 @@ test(
           ["cbm_search_graph", { name_pattern: "^add$" }],
           ["read_file", { path: "math.ts" }],
         ] as const;
-        const stage = [
-          ...texts.matchAll(
-            /harness is now running the (investigate|verify|challenge) checkpoint/g,
-          ),
-        ].at(-1)?.[1];
-        const final = texts.includes(
-          "All three investigation checkpoints passed",
-        );
-        const sourceReads = input.input.filter(
-          (message: { type?: string; name?: string }) =>
-            message.type === "function_call" && message.name === "read_file",
-        ).length;
-        const step =
-          sequence[calls] ??
-          (stage === "challenge" && sourceReads === 1 && !final
-            ? sequence[3]
-            : undefined);
-        const evidenceIds = ["tool-4", ...(sourceReads > 1 ? ["tool-5"] : [])];
-        const checkpoint = {
-          summary: "The inspected add implementation subtracts its arguments.",
-          risks: [
-            {
-              id: "addition-result",
-              path: "math.ts",
-              contract: "add returns the arithmetic sum of its arguments.",
-              trigger: "Call add(1, 2).",
-              before: "The baseline returns 3 using a + b.",
-              after: "The head returns -1 using a - b.",
-              evidenceIds,
-            },
-          ],
-          candidates: [
-            {
-              path: "math.ts",
-              lineStart: 1,
-              lineEnd: 1,
-              scenario: "add(1, 2) produces -1.",
-              status: "supported",
-              evidenceIds,
-            },
-          ],
-          unresolved: [],
-          limitations: [],
-        };
+        const step = sequence[calls];
         const output = step
           ? {
               id: `fixture-function-${calls}`,
@@ -200,25 +157,21 @@ test(
               content: [
                 {
                   type: "output_text",
-                  text: JSON.stringify(
-                    final
-                      ? {
-                          summary: "Fixture tools verified",
-                          findings: [
-                            {
-                              severity: "high",
-                              path: "math.ts",
-                              lineStart: 1,
-                              lineEnd: 1,
-                              title: "Addition now subtracts",
-                              body: "The inspected function subtracts its arguments.",
-                              failureScenario: "add(1, 2) produces -1.",
-                              suggestion: "Return a + b.",
-                            },
-                          ],
-                        }
-                      : checkpoint,
-                  ),
+                  text: JSON.stringify({
+                    summary: "Fixture tools verified",
+                    findings: [
+                      {
+                        severity: "high",
+                        path: "math.ts",
+                        lineStart: 1,
+                        lineEnd: 1,
+                        title: "Addition now subtracts",
+                        body: "The inspected function subtracts its arguments.",
+                        failureScenario: "add(1, 2) produces -1.",
+                        suggestion: "Return a + b.",
+                      },
+                    ],
+                  }),
                   annotations: [],
                 },
               ],
@@ -1005,7 +958,7 @@ test(
         );
       }
       if (modelFailure) throw modelFailure;
-      assert.equal(calls, 9);
+      assert.equal(calls, 5);
       assert.equal(review.findings[0]?.path, "math.ts");
       assert.deepEqual(
         await readdir(path.join(root, "index-data/reviews")),

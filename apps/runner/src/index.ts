@@ -503,6 +503,7 @@ async function main() {
           if (metrics[key] === undefined) delete metrics[key];
         if (Object.keys(metrics).length) {
           const incomplete = latestMetrics?.tokenUsageComplete === false;
+          const costIncomplete = latestMetrics?.costEstimateComplete === false;
           latestMetrics = { ...latestMetrics, ...metrics };
           if (
             incomplete ||
@@ -511,6 +512,23 @@ async function main() {
               metrics.cachedInputTokens === undefined)
           )
             delete latestMetrics.cachedInputTokens;
+          for (const key of [
+            "uncachedInputTokens",
+            "cacheWriteTokens",
+          ] as const)
+            if (
+              incomplete ||
+              metrics.tokenUsageComplete === false ||
+              (metrics.inputTokens !== undefined && metrics[key] === undefined)
+            )
+              delete latestMetrics[key];
+          if (
+            costIncomplete ||
+            metrics.costEstimateComplete === false ||
+            ((incomplete || metrics.tokenUsageComplete === false) &&
+              latestMetrics.estimatedCostUsd !== undefined)
+          )
+            latestMetrics.costEstimateComplete = false;
           if (incomplete) latestMetrics.tokenUsageComplete = false;
         }
         const snapshot = JSON.stringify(metrics);

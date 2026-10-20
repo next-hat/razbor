@@ -12,7 +12,10 @@
     "./mcp": "./src/capabilities/mcp.ts",
     "./skills": "./src/capabilities/skills.ts",
     "./capabilities": "./src/capabilities/index.ts",
-    "./git-policy": "./src/git-policy.ts"
+    "./git-policy": "./src/git-policy.ts",
+    "./budget": "./src/budgets.ts",
+    "./context": "./src/context.ts",
+    "./model": "./src/model.ts"
   },
   "dependencies": {
     "@ai-sdk/anthropic": "4.0.80",
