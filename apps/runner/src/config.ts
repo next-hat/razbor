@@ -10,6 +10,7 @@ import {
   reasoningEffortSchema,
   runnerCreateSchema,
   reviewMaxTurnsSchema,
+  reviewBudgetSchema,
 } from "@razbor/contracts";
 
 import { PermanentError } from "@runner/src/errors.js";
@@ -113,6 +114,19 @@ export const runnerConfigSchema = z
     harness: z
       .object({
         initialDiffMaxBytes: z.number().int().min(0).max(1000000).default(4096),
+        reviewBudget: reviewBudgetSchema.prefault({}),
+        contextWindowTokens: z
+          .number()
+          .int()
+          .min(1024)
+          .max(10000000)
+          .optional(),
+        compactionThresholdTokens: z
+          .number()
+          .int()
+          .min(1024)
+          .max(1000000)
+          .default(80000),
       })
       .strict()
       .prefault({}),
@@ -125,7 +139,7 @@ export const runnerConfigSchema = z
         supports_tools: z.boolean().default(true),
         reasoning_effort: reasoningEffortSchema.default("high"),
         max_requests: reviewMaxTurnsSchema,
-        max_retries: z.number().int().min(0).max(10).default(3),
+        max_retries: z.number().int().min(0).max(10).default(0),
         max_request_bytes: z
           .number()
           .int()

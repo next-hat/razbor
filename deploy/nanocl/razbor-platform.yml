@@ -50,7 +50,7 @@ Cargoes:
     Hostname: razbor-postgres
     Containers:
       - Name: postgres
-        Image: ghcr.io/next-hat/razbor-postgres:0.1.11
+        Image: ghcr.io/next-hat/razbor-postgres:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.postgres]
         StopTimeout: 45
@@ -75,7 +75,7 @@ Cargoes:
     Hostname: razbor-embeddings
     Containers:
       - Name: embeddings
-        Image: ghcr.io/next-hat/razbor-embeddings:0.1.11
+        Image: ghcr.io/next-hat/razbor-embeddings:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.embeddings]
         Env: [EMBEDDINGS_CPU_THREADS=4]
@@ -108,7 +108,7 @@ Cargoes:
     Hostname: razbor-web
     InitContainers:
       - Name: migrate
-        Image: ghcr.io/next-hat/razbor-migrate:0.1.11
+        Image: ghcr.io/next-hat/razbor-migrate:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.migrations]
         HostConfig:
@@ -119,7 +119,7 @@ Cargoes:
           PidsLimit: 128
     Containers:
       - Name: web
-        Image: ghcr.io/next-hat/razbor-web:0.1.12
+        Image: ghcr.io/next-hat/razbor-web:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.web]
         Env:
@@ -157,7 +157,7 @@ Cargoes:
     Hostname: razbor-indexer
     InitContainers:
       - Name: configure
-        Image: ghcr.io/next-hat/razbor-migrate:0.1.11
+        Image: ghcr.io/next-hat/razbor-migrate:0.1.0
         ImagePullSecret: registry.ghcr.io
         User: "0:0"
         Entrypoint: [node, --input-type=module, -e]
@@ -203,7 +203,7 @@ Cargoes:
           NanoCpus: 1000000000
           PidsLimit: 64
       - Name: wait-schema
-        Image: ghcr.io/next-hat/razbor-migrate:0.1.11
+        Image: ghcr.io/next-hat/razbor-migrate:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.migrations]
         Cmd: [--wait-schema]
@@ -215,7 +215,7 @@ Cargoes:
           PidsLimit: 128
     Containers:
       - Name: indexer
-        Image: ghcr.io/next-hat/razbor-indexer:0.1.11
+        Image: ghcr.io/next-hat/razbor-indexer:0.1.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.indexer]
         Cmd: [--config, /index-config/indexer.toml]

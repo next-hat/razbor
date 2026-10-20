@@ -337,7 +337,7 @@ test("comparison uses merge base once, not the recorded base tip or a later bran
   }
 });
 
-test("static model turns keep lazy patches out of initial messages, sequence tools and persist limitations/usage", async (t) => {
+test("autonomous turns use optional pinned reads and preserve limitations and usage", async (t) => {
   const globals = globalThis as typeof globalThis & { razborLogger?: Logger };
   const previousLogger = globals.razborLogger;
   globals.razborLogger = pino({ enabled: false });
@@ -360,87 +360,31 @@ test("static model turns keep lazy patches out of initial messages, sequence too
         if (toolsDisabled) assert.equal(body.tools, undefined);
         const input = body.input as {
           type?: string;
-          role?: string;
-          content?: string | { text?: string }[];
-          call_id?: string;
           name?: string;
+          content?: unknown;
           output?: string;
         }[];
-        const texts = input
-          .map((message) =>
-            typeof message.content === "string"
-              ? message.content
-              : (message.content ?? []).map((part) => part.text ?? "").join(""),
-          )
-          .join("\n");
-        if (calls === 1) {
-          if (scenario === "inline") assert.match(texts, /new implementation/);
-          else
-            assert.doesNotMatch(texts, /new implementation|old implementation/);
-          assert.match(texts, /"status":"modified"/);
-        }
-        const outputOffset = [...input]
-          .reverse()
-          .findIndex((message) => message.type === "function_call_output");
-        if (outputOffset >= 0) {
-          const outputIndex = input.length - outputOffset - 1;
-          assert.equal(input[outputIndex - 1]?.type, "function_call");
-          assert.equal(
-            input[outputIndex - 1]?.call_id,
-            input[outputIndex]?.call_id,
-          );
-          assert.match(input[outputIndex]!.output!, /new implementation/);
-        }
-        const stage = [
-          ...texts.matchAll(
-            /harness is now running the (investigate|verify|challenge) checkpoint/g,
-          ),
-        ].at(-1)?.[1];
-        const final = texts.includes(
-          "All three investigation checkpoints passed",
+        const serialized = JSON.stringify(input);
+        assert.doesNotMatch(
+          serialized,
+          /harness is now running the .* checkpoint|Recorded evidence IDs/,
         );
+        if (calls === 1) {
+          if (scenario === "inline")
+            assert.match(serialized, /new implementation/);
+          else
+            assert.doesNotMatch(
+              serialized,
+              /new implementation|old implementation/,
+            );
+        }
         const issued = input.filter(
           (message) => message.type === "function_call",
         );
-        const sourceReads = issued.filter(
-          (message) => message.name === "read_file",
-        ).length;
         const tool =
-          !toolsDisabled && !final
-            ? scenario === "read" &&
-              !issued.some((message) => message.name === "read_diff")
-              ? "read_diff"
-              : (stage === "investigate" && sourceReads === 0) ||
-                  (stage === "challenge" && sourceReads === 1)
-                ? "read_file"
-                : undefined
+          scenario === "read" && issued.length < 2
+            ? ["read_diff", "read_file"][issued.length]
             : undefined;
-        const firstSource = scenario === "read" ? 2 : 1;
-        const checkpoint = {
-          summary: "Inspected the changed implementation and its source.",
-          risks: [
-            {
-              id: "source-content",
-              path: "source.ts",
-              contract:
-                "The changed source retains the implementation and stable context.",
-              trigger:
-                "Read the changed implementation and its surrounding context.",
-              before:
-                "The diff shows the old implementation followed by stable context.",
-              after: "The recorded source contains the new implementation.",
-              evidenceIds: sourceReads
-                ? [
-                    `tool-${firstSource}`,
-                    ...(sourceReads > 1 ? [`tool-${firstSource + 1}`] : []),
-                  ]
-                : [],
-            },
-          ],
-          candidates: [],
-          unresolved: [],
-          limitations: [],
-        };
         return new Response(
           JSON.stringify({
             id: "fixture",
@@ -454,7 +398,7 @@ test("static model turns keep lazy patches out of initial messages, sequence too
                     id: "diff-function",
                     type: "function_call",
                     status: "completed",
-                    call_id: `source-call-${issued.length}`,
+                    call_id: `source-call-${calls}`,
                     name: tool,
                     arguments: JSON.stringify(
                       tool === "read_diff"
@@ -470,15 +414,11 @@ test("static model turns keep lazy patches out of initial messages, sequence too
                     content: [
                       {
                         type: "output_text",
-                        text: JSON.stringify(
-                          final
-                            ? {
-                                summary:
-                                  "No actionable findings in supplied changes.",
-                                findings: [],
-                              }
-                            : checkpoint,
-                        ),
+                        text: JSON.stringify({
+                          summary:
+                            "No actionable findings in inspected changes.",
+                          findings: [],
+                        }),
                         annotations: [],
                       },
                     ],
@@ -501,30 +441,20 @@ test("static model turns keep lazy patches out of initial messages, sequence too
       scenario = mode;
       calls = 0;
       events.length = 0;
-      const review = reviewRepository(f.repository, f.base, f.head, {
+      const review = await reviewRepository(f.repository, f.base, f.head, {
         baseUrl: "http://fixture.invalid/v1",
         apiKey: "fixture",
         model: "fixture",
         reasoningEffort: "low",
         reviewId: "fixture",
         initialDiffMaxBytes: mode === "inline" ? 4096 : 0,
-        /** Collect progress events for usage totals and source-content redaction assertions. */
+        /** Collect safe progress and cumulative usage for the completed attempt. */
         onProgress: (event) => events.push(event),
       });
-      if (mode === "unread") {
-        await assert.rejects(
-          review,
-          /Review incomplete:.*diff pages remain unread/,
-        );
-        assert.equal(calls, 3);
-        assert.ok(
-          !events.some((event) => event.message.startsWith("Review ready")),
-        );
-      } else {
-        const result = await review;
-        assert.doesNotMatch(result.summary, /Review limitation/);
-        assert.equal(calls, mode === "read" ? 7 : 6);
-      }
+      if (mode === "unread")
+        assert.match(review.summary, /coverage limitation/);
+      else assert.doesNotMatch(review.summary, /coverage limitation/);
+      assert.equal(calls, mode === "read" ? 3 : 1);
       assert.equal(
         events.at(-1)!.cachedInputTokens,
         mode === "read" ? undefined : calls * 50,
@@ -539,22 +469,15 @@ test("static model turns keep lazy patches out of initial messages, sequence too
     toolsDisabled = true;
     scenario = "inline";
     calls = 0;
-    events.length = 0;
-    await assert.rejects(
-      reviewRepository(f.repository, f.base, f.head, {
-        baseUrl: "http://fixture.invalid/v1",
-        apiKey: "fixture",
-        model: "fixture",
-        reasoningEffort: "low",
-        reviewId: "fixture",
-        supportsTools: false,
-        /** Collect progress events for usage totals and source-content redaction assertions. */
-        onProgress: (event) => events.push(event),
-      }),
-      /Review incomplete:.*tool/i,
-    );
-    assert.equal(calls, 0);
-    assert.equal(events.at(-1)!.cachedInputTokens, undefined);
+    await reviewRepository(f.repository, f.base, f.head, {
+      baseUrl: "http://fixture.invalid/v1",
+      apiKey: "fixture",
+      model: "fixture",
+      reasoningEffort: "low",
+      reviewId: "fixture",
+      supportsTools: false,
+    });
+    assert.equal(calls, 1);
     calls = 0;
     await assert.rejects(
       reviewRepository(f.repository, f.base, f.head, {
@@ -563,8 +486,8 @@ test("static model turns keep lazy patches out of initial messages, sequence too
         model: "fixture",
         reasoningEffort: "low",
         reviewId: "fixture",
-        initialDiffMaxBytes: 0,
         supportsTools: false,
+        initialDiffMaxBytes: 0,
       }),
       /tool capability required/,
     );
@@ -624,6 +547,50 @@ test("modified multi-hunk pages retain old/new source line locations under a sma
     assert.equal(reconstructed, prepared.patch);
     assert.ok(checkedOld && checkedNew);
     assert.equal(prepared.coverage().remainingBytes, 0);
+  } finally {
+    await f.close();
+  }
+});
+
+test("deletion-only changes retain baseline evidence without inventing new-side added anchors", async () => {
+  const f = await diffFixture();
+  try {
+    await f.write("source.ts", "guard();\nwork();\n");
+    const baseline = await f.commit();
+    await f.write("source.ts", "work();\n");
+    await rm(path.join(f.repository, "related.ts"));
+    const deletedHead = await f.commit();
+    const tools = new RepositoryTools(f.repository);
+    const deleted = await tools.prepareDiff(baseline, deletedHead);
+    assert.equal(
+      deleted.files.find((file) => file.path === "source.ts")?.added,
+      0,
+    );
+    assert.equal(deleted.validFindingRange("source.ts", 1, 1), false);
+    assert.equal(deleted.validFindingRange("related.ts", 1, 1), false);
+    assert.match(
+      JSON.parse(
+        await tools.readFile({ path: "source.ts", revision: "baseline" }),
+      ).source,
+      /guard/,
+    );
+    assert.match(
+      JSON.parse(await tools.readFile({ path: "source.ts" })).source,
+      /work/,
+    );
+    assert.equal(
+      JSON.parse(await tools.readFile({ path: "related.ts" })).state,
+      "absent",
+    );
+    await f.write("source.ts", "work();\ncleanup();\n");
+    const addedHead = await f.commit();
+    const added = await new RepositoryTools(f.repository).prepareDiff(
+      baseline,
+      addedHead,
+    );
+    assert.equal(added.validFindingRange("source.ts", 2, 2), true);
+    assert.equal(added.validFindingRange("source.ts", 1, 1), false);
+    assert.equal(added.validFindingRange("source.ts", 1, 3), false);
   } finally {
     await f.close();
   }

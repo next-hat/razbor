@@ -4,7 +4,7 @@ import { open } from "node:fs/promises";
 
 import { z } from "zod";
 
-import { reviewResultSchema } from "@razbor/contracts";
+import { reviewBudgetSchema, reviewResultSchema } from "@razbor/contracts";
 
 const MAX_FILE_BYTES = 2_000_000;
 
@@ -73,18 +73,58 @@ const configurationSchema = z
     // Absence preserves unknown historical settings; never infer defaults.
     reasoningEffort: z.enum(["low", "medium", "high"]).optional(),
     maxOutputTokens: z.number().int().min(1).max(32768).optional(),
+    maxToolCalls: z.number().int().min(1).max(100000).optional(),
+    maxTokens: z.number().int().min(1).max(100000000).optional(),
+    maxCostUsd: z.number().finite().positive().optional(),
+    compactionThresholdTokens: count.positive().optional(),
+    pricing: reviewBudgetSchema.shape.pricing,
   })
-  .strict();
+  .strict()
+  .superRefine((configuration, context) => {
+    // Validate cap and prices together without copying runtime defaults into history.
+    const budget = reviewBudgetSchema.safeParse({
+      maxCostUsd: configuration.maxCostUsd,
+      pricing: configuration.pricing,
+    });
+    if (!budget.success) {
+      for (const issue of budget.error.issues)
+        context.addIssue({
+          code: "custom",
+          message: issue.message,
+          path: issue.path,
+        });
+      return;
+    }
+    if (configuration.maxCostUsd === undefined) return;
+    const entries = Array.isArray(budget.data.pricing)
+      ? budget.data.pricing
+      : budget.data.pricing
+        ? [budget.data.pricing]
+        : [];
+    // Historical configuration has no selected provider; verify the recorded model only.
+    if (!entries.some((entry) => entry.model === configuration.model))
+      context.addIssue({
+        code: "custom",
+        message: "A monetary budget requires pricing for the recorded model",
+        path: ["pricing"],
+      });
+  });
 
 const telemetrySchema = z
   .object({
     durationMs: count.nullable(),
     inputTokens: count.nullable(),
     cachedInputTokens: count.nullable(),
+    uncachedInputTokens: count.nullable().optional(),
+    cacheWriteTokens: count.nullable().optional(),
+    modelTurns: count.nullable().optional(),
+    toolCalls: count.nullable().optional(),
+    budgetTokens: count.nullable().optional(),
     outputTokens: count.nullable(),
     tokenUsageComplete: z.boolean().nullable(),
     costUsd: z.number().finite().nonnegative().nullable(),
     costBasis: z.enum(["provider", "estimate"]).nullable(),
+    costEstimateComplete: z.boolean().nullable().optional(),
   })
   .strict()
   .superRefine((value, ctx) => {
@@ -93,14 +133,25 @@ const telemetrySchema = z
         code: "custom",
         message: "Cost needs both amount and basis",
       });
+    const inputParts = [
+      value.uncachedInputTokens,
+      value.cachedInputTokens,
+      value.cacheWriteTokens,
+    ];
+    const measuredParts = inputParts.filter(
+      (part): part is number => typeof part === "number",
+    );
     if (
-      value.cachedInputTokens !== null &&
       value.inputTokens !== null &&
-      value.cachedInputTokens > value.inputTokens
+      (measuredParts.reduce((total, part) => total + part, 0) >
+        value.inputTokens ||
+        (measuredParts.length === inputParts.length &&
+          measuredParts.reduce((total, part) => total + part, 0) !==
+            value.inputTokens))
     )
       ctx.addIssue({
         code: "custom",
-        message: "Cached input exceeds total input",
+        message: "Input token categories do not match total input",
       });
     if (
       value.tokenUsageComplete === true &&
@@ -343,6 +394,7 @@ function scoreRun(sample: EvaluationCase, run: Run) {
     caseId: sample.id,
     runId: run.execution.runId,
     status: run.execution.status,
+    telemetry: run.execution.telemetry,
     expectedIssues: completed ? sample.expectedIssues.length : 0,
     detectedIssues: matched.size,
     missedIssueIds: unresolved ? [] : unmatched,
@@ -387,11 +439,20 @@ function scoreGroup(dataset: Dataset, runs: Run[], datasetHash: string) {
   const telemetry = runs.map((run) => run.execution.telemetry);
   /** Keep measurement coverage alongside each observed sum. */
   const measurement = (
-    key: "inputTokens" | "cachedInputTokens" | "outputTokens" | "costUsd",
+    key:
+      | "inputTokens"
+      | "cachedInputTokens"
+      | "uncachedInputTokens"
+      | "cacheWriteTokens"
+      | "outputTokens"
+      | "modelTurns"
+      | "toolCalls"
+      | "budgetTokens"
+      | "costUsd",
   ) => {
     const values = telemetry
       .map((entry) => entry[key])
-      .filter((value) => value !== null);
+      .filter((value): value is number => typeof value === "number");
     return {
       total: values.length
         ? values.reduce((total, value) => total + value, 0)
@@ -454,11 +515,19 @@ function scoreGroup(dataset: Dataset, runs: Run[], datasetHash: string) {
     },
     inputTokens: measurement("inputTokens"),
     cachedInputTokens: measurement("cachedInputTokens"),
+    uncachedInputTokens: measurement("uncachedInputTokens"),
+    cacheWriteTokens: measurement("cacheWriteTokens"),
+    modelTurns: measurement("modelTurns"),
+    toolCalls: measurement("toolCalls"),
+    budgetTokens: measurement("budgetTokens"),
     outputTokens: measurement("outputTokens"),
     usageCompleteRuns: telemetry.filter(
       (entry) => entry.tokenUsageComplete === true,
     ).length,
     costUsd: measurement("costUsd"),
+    costEstimateCompleteRuns: telemetry.filter(
+      (entry) => entry.costEstimateComplete === true,
+    ).length,
     costBasisCounts: {
       provider: telemetry.filter((entry) => entry.costBasis === "provider")
         .length,

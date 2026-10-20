@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import {
+  chmod,
   mkdtemp,
   mkdir,
   readFile,
@@ -178,6 +179,91 @@ test("exec confines cwd after resolving symlinks and accepts repository subdirec
       await realpath(cwd ? path.resolve(repo, cwd) : repo),
     );
   }
+});
+
+test("exec explores source and recorded revisions with installed command-line utilities", async (t) => {
+  const f = await diffFixture();
+  t.after(() => f.close());
+  const commands: [string[], RegExp][] = [
+    [["git", "show", `${f.head}:source.ts`], /new implementation/],
+    [["rg", "-n", "implementation", "."], /source.ts:1:new implementation/],
+    [["grep", "-n", "implementation", "source.ts"], /1:new implementation/],
+    [["cat", "source.ts"], /new implementation/],
+    [["sed", "-n", "1p", "source.ts"], /new implementation/],
+    [["awk", "NR == 1 { print }", "source.ts"], /new implementation/],
+    [["head", "-n", "1", "source.ts"], /new implementation/],
+    [["tail", "-n", "1", "source.ts"], /stable context/],
+    [["find", ".", "-name", "related.ts"], /related.ts/],
+  ];
+  for (const [argv, expected] of commands)
+    await t.test(argv[0], async (subtest) => {
+      let result;
+      try {
+        result = await executeCommand(f.repository, { argv });
+      } catch (error) {
+        if (String(error).includes("ENOENT") && argv[0] !== "git") {
+          subtest.skip(`optional installed utility unavailable: ${argv[0]}`);
+          return;
+        }
+        throw error;
+      }
+      assert.equal(result.ok, true);
+      assert.match(result.stdout, expected);
+    });
+});
+
+test("exec ignores relative PATH entries and suppresses Git global config and transports", async (t) => {
+  const f = await diffFixture();
+  t.after(() => f.close());
+  const shadow = path.join(f.repository, "cat");
+  await writeFile(shadow, "#!/bin/sh\nprintf shadowed-command");
+  await chmod(shadow, 0o755);
+  for (const searchPath of [
+    `.${path.delimiter}/usr/bin${path.delimiter}/bin`,
+    ".",
+  ]) {
+    const result = await executeCommand(
+      f.repository,
+      { argv: ["cat", "source.ts"] },
+      { env: { PATH: searchPath } },
+    );
+    assert.equal(result.ok, true);
+    assert.match(result.stdout, /new implementation/);
+    assert.doesNotMatch(result.stdout, /shadowed-command/);
+  }
+  await writeFile(
+    path.join(f.repository, ".gitconfig"),
+    "[alias]\n  private = !printf credential-from-user-config\n",
+  );
+  const global = await executeCommand(
+    f.repository,
+    { argv: ["git", "config", "--global", "--get", "alias.private"] },
+    { env: { HOME: f.repository } },
+  );
+  assert.equal(global.exitCode, 1);
+  assert.equal(global.stdout, "");
+  const remote = await executeCommand(f.repository, {
+    argv: ["git", "ls-remote", `file://${f.repository}`],
+  });
+  assert.equal(remote.ok, false);
+  assert.match(remote.stderr, /transport 'file' not allowed/);
+});
+
+test("exec terminates background descendants when their command leader exits", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "razbor-exit-group-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const descendant =
+    'process.stdout.write(String(process.pid)); process.send("ready"); setInterval(()=>{},1000)';
+  const leader = `const child = require('node:child_process').spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], {stdio:['ignore','inherit','inherit','ipc']}); child.once('message',()=>process.exit(0))`;
+  const result = await executeCommand(
+    root,
+    { argv: node(leader) },
+    { timeoutMs: 2000 },
+  );
+  assert.match(result.stdout, /^\d+$/);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.ok, true);
+  assert.equal(result.timedOut, false);
 });
 
 test("exec bounds combined output without splitting UTF-8 and clamps trusted limits", async (t) => {
@@ -507,7 +593,7 @@ test("fetch_url caps streamed responses and UTF-8 output, rejects binary and sto
   assert.ok(fixture.responses.every((response) => response.destroyed));
 });
 
-test("the review loop dispatches verification tools and retains structured evidence without logging content", async (t) => {
+test("the autonomous review loop explores with exec and retains outcomes without logging content", async (t) => {
   const globals = globalThis as typeof globalThis & { razborLogger?: Logger };
   const previousLogger = globals.razborLogger;
   globals.razborLogger = pino({ enabled: false });
@@ -537,8 +623,8 @@ test("the review loop dispatches verification tools and retains structured evide
       arguments: JSON.stringify({ url: "https://example.com/docs" }),
     },
     {
-      name: "read_file",
-      arguments: JSON.stringify({ path: "source.ts" }),
+      name: "exec",
+      arguments: JSON.stringify({ argv: ["cat", "source.ts"] }),
     },
   ];
   let turn = 0;
@@ -565,7 +651,14 @@ test("the review loop dispatches verification tools and retains structured evide
                 message.type === "function_call_output",
             );
           const index = input.length - offset - 1;
-          const output = JSON.parse(input[index].output);
+          const observation = input[index].output;
+          assert.match(
+            observation,
+            /^Observation reference tool-\d+ \(.*not a verification verdict\):\n/,
+          );
+          const output = JSON.parse(
+            observation.slice(observation.indexOf("\n") + 1),
+          );
           assert.deepEqual(
             {
               name: input[index - 1].name,
@@ -589,52 +682,12 @@ test("the review loop dispatches verification tools and retains structured evide
             assert.equal(output.ok, true);
           }
           if (turn === 4) {
-            assert.equal(output.state, "available");
-            assert.match(JSON.stringify(output), /new implementation/);
+            assert.equal(output.ok, true);
+            assert.match(output.stdout, /new implementation/);
           }
         }
-        const texts = JSON.stringify(body.input);
-        const stage = [
-          ...texts.matchAll(
-            /harness is now running the (investigate|verify|challenge) checkpoint/g,
-          ),
-        ].at(-1)?.[1];
-        const final = texts.includes(
-          "All three investigation checkpoints passed",
-        );
-        const sourceReads = body.input.filter(
-          (message: { type?: string; name?: string }) =>
-            message.type === "function_call" && message.name === "read_file",
-        ).length;
-        const call =
-          calls[turn] ??
-          (stage === "challenge" && sourceReads === 1 && !final
-            ? calls[3]
-            : undefined);
+        const call = calls[turn];
         turn++;
-        const checkpoint = {
-          summary: "Checked source and recorded verification tool outcomes.",
-          risks: [
-            {
-              id: "source-content",
-              path: "source.ts",
-              contract:
-                "The changed source retains the implementation and stable context.",
-              trigger:
-                "Read the changed implementation and its surrounding context.",
-              before:
-                "The diff shows the old implementation followed by stable context.",
-              after:
-                "The pinned source contains the new implementation; the command failed and web search was unavailable.",
-              evidenceIds: ["tool-4", ...(sourceReads > 1 ? ["tool-5"] : [])],
-            },
-          ],
-          candidates: [],
-          unresolved: [],
-          limitations: [
-            "The verification command exited with status 3; web search was not configured.",
-          ],
-        };
         return new Response(
           JSON.stringify({
             id: "fixture",
@@ -659,14 +712,11 @@ test("the review loop dispatches verification tools and retains structured evide
                     content: [
                       {
                         type: "output_text",
-                        text: JSON.stringify(
-                          final
-                            ? {
-                                summary: "No actionable findings.",
-                                findings: [],
-                              }
-                            : checkpoint,
-                        ),
+                        text: JSON.stringify({
+                          summary:
+                            "No actionable findings. The verification command exited with status 3; web search was unavailable.",
+                          findings: [],
+                        }),
                         annotations: [],
                       },
                     ],
@@ -692,7 +742,7 @@ test("the review loop dispatches verification tools and retains structured evide
   }).catch((error) => {
     throw modelFailure ?? error;
   });
-  assert.equal(turn, 9);
+  assert.equal(turn, 5);
   assert.ok(
     events.some(
       (event) =>

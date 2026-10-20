@@ -4,12 +4,21 @@ import { mkdtemp, mkdir, writeFile, symlink, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 
-import type { Tool } from "@modelcontextprotocol/client";
+import { Client, type Tool } from "@modelcontextprotocol/client";
 import pino from "pino";
 
-import { capabilityLimitsSchema, reviewResultSchema } from "@razbor/contracts";
+import {
+  capabilityLimitsSchema,
+  reviewResultSchema,
+  type PreparedCapabilities,
+} from "@razbor/contracts";
 import { SkillCatalog } from "@razbor/harness/skills";
-import { BoundTools, readOnlyTools, resultText } from "@razbor/harness/mcp";
+import {
+  BoundTools,
+  RemoteMemory,
+  readOnlyTools,
+  resultText,
+} from "@razbor/harness/mcp";
 import { ReviewCapabilities } from "@razbor/harness/capabilities";
 import { boundedText, boundedOutput } from "@razbor/harness/capability-files";
 
@@ -159,6 +168,202 @@ test("disabled capabilities and final-result validation remain intact", async ()
   );
 });
 
+/** Build approved optional connections without requiring a live MCP server. */
+function optionalCapabilities(): PreparedCapabilities {
+  return {
+    instructions: [],
+    skills: [],
+    limits: capabilityLimitsSchema.parse({}),
+    codebaseMemory: {
+      endpoint: "http://private-endpoint.invalid/mcp",
+      tokenEnv: "RAZBOR_MCP_TOKEN",
+      project: "private-project",
+      indexHeadSha: "a".repeat(40),
+      indexBranch: "private-branch",
+      startupMs: 100,
+      queryMs: 100,
+    },
+    mcpServers: [
+      {
+        id: "private-server",
+        name: "private-name",
+        endpoint: "http://private-endpoint.invalid/mcp",
+        tokenEnv: "RAZBOR_MCP_TOKEN",
+        startupMs: 100,
+        queryMs: 100,
+      },
+      {
+        id: "working-server",
+        name: "working-server",
+        endpoint: "http://private-endpoint.invalid/mcp",
+        tokenEnv: "RAZBOR_MCP_TOKEN",
+        startupMs: 100,
+        queryMs: 100,
+      },
+    ],
+    memory: {
+      endpoint: "http://private-endpoint.invalid/memory",
+      tokenEnv: "RAZBOR_MEMORY_TOKEN",
+      queryMs: 100,
+    },
+  };
+}
+
+test("unavailable optional services close partial clients and expose sanitized limitations", async (t) => {
+  const originalMcpToken = process.env.RAZBOR_MCP_TOKEN;
+  const originalMemoryToken = process.env.RAZBOR_MEMORY_TOKEN;
+  process.env.RAZBOR_MCP_TOKEN = "fixture-token";
+  delete process.env.RAZBOR_MEMORY_TOKEN;
+  t.after(() => {
+    if (originalMcpToken === undefined) delete process.env.RAZBOR_MCP_TOKEN;
+    else process.env.RAZBOR_MCP_TOKEN = originalMcpToken;
+    if (originalMemoryToken === undefined)
+      delete process.env.RAZBOR_MEMORY_TOKEN;
+    else process.env.RAZBOR_MEMORY_TOKEN = originalMemoryToken;
+  });
+  const observedLogs: string[] = [];
+  const localLog = pino(
+    {},
+    {
+      write: (chunk: string) => {
+        observedLogs.push(chunk);
+      },
+    },
+  );
+  let graphClosed = 0;
+  t.mock.method(
+    RemoteMemory.prototype,
+    "start",
+    async function (this: RemoteMemory) {
+      this.tools = [
+        { name: "partial-graph-tool", inputSchema: { type: "object" } },
+      ];
+      throw new Error("private-startup-error fixture-token");
+    },
+  );
+  t.mock.method(RemoteMemory.prototype, "close", async () => {
+    graphClosed++;
+  });
+  let closed = 0;
+  t.mock.method(Client.prototype, "connect", async () => {});
+  t.mock.method(Client.prototype, "close", async () => {
+    closed++;
+  });
+  let discoveries = 0;
+  t.mock.method(Client.prototype, "listTools", async () => ({
+    tools:
+      ++discoveries === 1
+        ? [
+            {
+              name: "a-partial",
+              inputSchema: { type: "object", properties: {} },
+            },
+            {
+              name: "z-invalid",
+              inputSchema: {
+                type: "object",
+                $schema: "private-unsupported-dialect",
+              },
+            },
+          ]
+        : [
+            {
+              name: "inspect",
+              inputSchema: { type: "object", properties: {} },
+            },
+          ],
+  }));
+  t.mock.method(Client.prototype, "callTool", async () => ({
+    structuredContent: { observed: true },
+  }));
+  const capabilities = new ReviewCapabilities(
+    optionalCapabilities(),
+    localLog,
+    new AbortController().signal,
+  );
+  await capabilities.start();
+  assert.equal(graphClosed, 1);
+  assert.equal(closed, 1);
+  assert.equal(capabilities.limitations.length, 3);
+  assert.deepEqual(
+    capabilities.tools.map(
+      (tool) => tool.type === "function" && tool.function.name,
+    ),
+    ["mcp_1_working-server_0_inspect"],
+  );
+  assert.deepEqual(
+    JSON.parse(await capabilities.call("mcp_1_working-server_0_inspect", {})),
+    { observed: true },
+  );
+  for (const name of [
+    "cbm_partial-graph-tool",
+    "mcp_0_private-name_0_a-partial",
+    "memory_read",
+  ])
+    await assert.rejects(capabilities.call(name, {}), /disabled/);
+  assert.doesNotMatch(
+    JSON.stringify(capabilities.limitations) + observedLogs.join(""),
+    /private-|fixture-token/,
+  );
+  await capabilities.close();
+  assert.equal(graphClosed, 1);
+  assert.equal(closed, 2);
+});
+
+test("cancellation during optional startup closes the client and remains fatal", async (t) => {
+  const abort = new AbortController();
+  let closed = 0;
+  t.mock.method(RemoteMemory.prototype, "start", async () => {
+    abort.abort(new Error("cancelled startup"));
+    throw new Error("upstream failure");
+  });
+  t.mock.method(RemoteMemory.prototype, "close", async () => {
+    closed++;
+  });
+  const capabilities = new ReviewCapabilities(
+    optionalCapabilities(),
+    log,
+    abort.signal,
+  );
+  await assert.rejects(
+    capabilities.start(),
+    (error) => error === abort.signal.reason,
+  );
+  assert.ok(closed >= 1);
+  assert.deepEqual(capabilities.limitations, []);
+  assert.deepEqual(capabilities.tools, []);
+});
+
+test("approved instruction and skill failures remain fatal before optional startup", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "razbor-required-guidance-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  let starts = 0;
+  t.mock.method(RemoteMemory.prototype, "start", async () => {
+    starts++;
+  });
+  const configs = [
+    {
+      ...optionalCapabilities(),
+      instructions: [
+        { path: path.join(root, "missing.md"), provenance: "approved" },
+      ],
+    },
+    { ...optionalCapabilities(), skills: [path.join(root, "missing-skills")] },
+  ];
+  for (const config of configs) {
+    const capabilities = new ReviewCapabilities(
+      config,
+      log,
+      new AbortController().signal,
+    );
+    await assert.rejects(capabilities.start());
+    assert.deepEqual(capabilities.limitations, []);
+  }
+  assert.equal(starts, 0);
+});
+
 test("bounded files reject symlinks/oversize and outputs declare truncation", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "razbor-text-"));
   try {
@@ -175,4 +380,58 @@ test("bounded files reject symlinks/oversize and outputs declare truncation", as
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("optional startup and final cleanup failures stay sanitized, nonfatal and idempotent", async (t) => {
+  let closes = 0;
+  const config = optionalCapabilities();
+  delete config.mcpServers;
+  delete config.memory;
+  t.mock.method(RemoteMemory.prototype, "start", async () => {
+    throw new Error("private startup token");
+  });
+  t.mock.method(RemoteMemory.prototype, "close", async () => {
+    closes++;
+    throw new Error("private cleanup token");
+  });
+  const capabilities = new ReviewCapabilities(
+    config,
+    log,
+    new AbortController().signal,
+  );
+  await capabilities.start();
+  await capabilities.close();
+  await capabilities.close();
+  assert.equal(closes, 1);
+  assert.equal(
+    capabilities.limitations.filter((value) => /cleanup/.test(value)).length,
+    1,
+  );
+  assert.match(capabilities.limitations.join(" "), /unavailable/);
+  assert.doesNotMatch(capabilities.limitations.join(" "), /private|token/);
+  await assert.rejects(capabilities.call("cbm_search_graph", {}), /disabled/);
+});
+
+test("optional final cleanup failure cannot replace a successful startup or swallow cancellation", async (t) => {
+  const config = optionalCapabilities();
+  delete config.mcpServers;
+  delete config.memory;
+  let closes = 0;
+  t.mock.method(RemoteMemory.prototype, "start", async () => {});
+  t.mock.method(RemoteMemory.prototype, "close", async () => {
+    closes++;
+    throw new Error("private cleanup token");
+  });
+  const abort = new AbortController();
+  const capabilities = new ReviewCapabilities(config, log, abort.signal);
+  await capabilities.start();
+  await capabilities.close();
+  await capabilities.close();
+  assert.equal(closes, 1);
+  assert.equal(capabilities.limitations.length, 1);
+  abort.abort(new Error("review cancelled"));
+  await assert.rejects(
+    capabilities.close(),
+    (error) => error === abort.signal.reason,
+  );
 });

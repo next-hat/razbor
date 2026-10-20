@@ -366,6 +366,15 @@ export async function prepareWorkspace(
       baseline,
       initialDiffMaxBytes: c.harness.initialDiffMaxBytes,
       maxTurns: c.model.max_requests,
+      reviewBudget: {
+        ...c.harness.reviewBudget,
+        maxOutputTokens: Math.min(
+          c.harness.reviewBudget.maxOutputTokens,
+          c.model.max_output_tokens,
+        ),
+      },
+      compactionThresholdTokens: c.harness.compactionThresholdTokens,
+      contextWindowTokens: c.harness.contextWindowTokens,
       supportsTools: c.model.supports_tools,
       previousFindings: job.previousFindings,
       conversation: job.conversation,

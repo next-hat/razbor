@@ -130,16 +130,31 @@ export function ReviewLog({
       viewport.current.scrollTop = viewport.current.scrollHeight;
   }, [lines, follow, showDetails]);
   const latest = lines.at(-1);
-  const model = lines.findLast(
-    (line) => line.attemptId === latest?.attemptId && line.model,
-  )?.model;
-  const maxTurns = lines.findLast(
-    (line) =>
-      line.attemptId === latest?.attemptId && line.maxTurns !== undefined,
+  const attempt = [...lines]
+    .reverse()
+    .filter((line) => line.attemptId === latest?.attemptId);
+  const model = attempt.find((line) => line.model)?.model;
+  const maxTurns = attempt.find(
+    (line) => line.maxTurns !== undefined,
   )?.maxTurns;
-  const stats = lines.findLast(
-    (line) => line.attemptId === latest?.attemptId && line.turn !== undefined,
-  );
+  // Transport may retain cumulative metric events without the older turn field.
+  // Select costs and token categories from the same latest snapshot.
+  const stats =
+    attempt.find((line) =>
+      [
+        line.modelTurns,
+        line.inputTokens,
+        line.outputTokens,
+        line.toolCalls,
+        line.estimatedCostUsd,
+        line.tokenUsageComplete,
+      ].some((value) => value !== undefined),
+    ) ?? attempt.find((line) => line.turn !== undefined);
+  const turn =
+    stats?.modelTurns ??
+    stats?.turn ??
+    attempt.find((line) => line.turn !== undefined)?.turn;
+  const cost = stats;
   const elapsed = elapsedSeconds(job, now);
   return (
     <section
@@ -190,7 +205,7 @@ export function ReviewLog({
           </strong>
         </span>
         <span>
-          <strong>{stats?.turn ?? 0}</strong>
+          <strong>{turn ?? 0}</strong>
           {maxTurns !== undefined && ` / ${maxTurns}`} turns{" "}
           <span className="text-muted-foreground">this attempt</span>
         </span>
@@ -203,6 +218,36 @@ export function ReviewLog({
         <span>
           <strong>{stats?.outputTokens ?? "—"}</strong> reported output tokens
         </span>
+        {stats?.uncachedInputTokens !== undefined && (
+          <span>
+            <strong>{stats.uncachedInputTokens}</strong> uncached input tokens
+          </span>
+        )}
+        {stats?.cachedInputTokens !== undefined && (
+          <span>
+            <strong>{stats.cachedInputTokens}</strong> cached input tokens
+          </span>
+        )}
+        {stats?.cacheWriteTokens !== undefined &&
+          stats.cacheWriteTokens > 0 && (
+            <span>
+              <strong>{stats.cacheWriteTokens}</strong> cache-write tokens
+            </span>
+          )}
+        {cost?.estimatedCostUsd !== undefined && (
+          <span
+            title={
+              cost.costEstimateComplete !== true
+                ? "Usage is incomplete; this estimate may differ from provider charges."
+                : "Estimated from recorded token categories and configured model prices."
+            }
+          >
+            <strong>{cost.estimatedCostUsd.toFixed(6)} USD</strong>{" "}
+            {cost.costEstimateComplete !== true
+              ? "estimated cost · incomplete usage"
+              : "estimated cost"}
+          </span>
+        )}
       </div>
       {!available && (
         <output className="block border-b px-4 py-3 text-sm text-destructive">

@@ -3,7 +3,9 @@ set -euo pipefail
 
 # Build one service at a time so release work does not saturate the workstation.
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-tag=${RAZBOR_IMAGE_TAG:-0.1.11}
+tag=${RAZBOR_IMAGE_TAG:-0.1.0}
+explicit_tag=false
+if [[ -n ${RAZBOR_IMAGE_TAG:-} ]]; then explicit_tag=true; fi
 output=--load
 services=()
 
@@ -13,6 +15,7 @@ Usage: scripts/publish-images.sh [--tag TAG] [--push] [SERVICE ...]
 
 Build linux/amd64 images for ghcr.io/next-hat/razbor-SERVICE.
 Without --push, load them into the local Docker image store.
+Publishing requires --tag or a nonempty RAZBOR_IMAGE_TAG.
 Services: web indexer runner embeddings postgres migrate (default: all).
 Authenticate with docker login ghcr.io before pushing private packages.
 USAGE
@@ -23,6 +26,7 @@ while (($#)); do
     --tag)
       [[ $# -ge 2 ]] || { echo >&2 "--tag requires a value"; exit 2; }
       tag=$2
+      explicit_tag=true
       shift 2
       ;;
     --push) output=--push; shift ;;
@@ -39,6 +43,10 @@ done
   echo >&2 "Invalid Docker image tag"
   exit 2
 }
+if [[ $output == --push && $explicit_tag != true ]]; then
+  echo >&2 "Publishing requires an explicit release tag: use --tag TAG or RAZBOR_IMAGE_TAG."
+  exit 2
+fi
 if ((${#services[@]} == 0)); then
   services=(web indexer runner embeddings postgres migrate)
 fi

@@ -19,6 +19,12 @@ const cumulativeKeys = [
   "inputTokens",
   "outputTokens",
   "cachedInputTokens",
+  "uncachedInputTokens",
+  "cacheWriteTokens",
+  "modelTurns",
+  "toolCalls",
+  "budgetTokens",
+  "estimatedCostUsd",
 ] as const;
 
 const comparisonKeys = ["addedLines", "deletedLines", "changedFiles"] as const;
@@ -48,6 +54,12 @@ function mergeMetrics(
   const merged = { ...previous, ...incoming };
   if (previous?.tokenUsageComplete === false) merged.tokenUsageComplete = false;
   if (
+    previous?.costEstimateComplete === false ||
+    (merged.tokenUsageComplete === false &&
+      merged.estimatedCostUsd !== undefined)
+  )
+    merged.costEstimateComplete = false;
+  if (
     merged.tokenUsageComplete === false ||
     (incoming.inputTokens !== undefined &&
       incoming.cachedInputTokens === undefined) ||
@@ -55,6 +67,13 @@ function mergeMetrics(
       previous.cachedInputTokens === undefined)
   )
     delete merged.cachedInputTokens;
+  for (const key of ["uncachedInputTokens", "cacheWriteTokens"] as const)
+    if (
+      merged.tokenUsageComplete === false ||
+      (incoming.inputTokens !== undefined && incoming[key] === undefined) ||
+      (previous?.inputTokens !== undefined && previous[key] === undefined)
+    )
+      delete merged[key];
   if (
     merged.cachedInputTokens !== undefined &&
     (merged.inputTokens === undefined ||

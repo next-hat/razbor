@@ -4,7 +4,7 @@ name: razbor-production
 
 services:
   postgres:
-    image: ghcr.io/next-hat/razbor-postgres:${RAZBOR_IMAGE_TAG:-0.1.11}
+    image: ghcr.io/next-hat/razbor-postgres:${RAZBOR_IMAGE_TAG:-0.1.0}
     restart: unless-stopped
     mem_limit: 2g
     cpus: 2
@@ -25,7 +25,7 @@ services:
       retries: 20
 
   migrate:
-    image: ghcr.io/next-hat/razbor-migrate:${RAZBOR_IMAGE_TAG:-0.1.11}
+    image: ghcr.io/next-hat/razbor-migrate:${RAZBOR_IMAGE_TAG:-0.1.0}
     init: true
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
@@ -40,7 +40,7 @@ services:
         condition: service_healthy
 
   embeddings:
-    image: ghcr.io/next-hat/razbor-embeddings:${RAZBOR_IMAGE_TAG:-0.1.11}
+    image: ghcr.io/next-hat/razbor-embeddings:${RAZBOR_IMAGE_TAG:-0.1.0}
     restart: unless-stopped
     init: true
     read_only: true
@@ -68,7 +68,7 @@ services:
     networks: [embeddings]
 
   indexer:
-    image: ghcr.io/next-hat/razbor-indexer:${RAZBOR_IMAGE_TAG:-0.1.11}
+    image: ghcr.io/next-hat/razbor-indexer:${RAZBOR_IMAGE_TAG:-0.1.0}
     restart: unless-stopped
     init: true
     stop_grace_period: 45s
@@ -104,7 +104,7 @@ services:
         condition: service_completed_successfully
 
   web:
-    image: ghcr.io/next-hat/razbor-web:${RAZBOR_WEB_IMAGE_TAG:-${RAZBOR_IMAGE_TAG:-0.1.12}}
+    image: ghcr.io/next-hat/razbor-web:${RAZBOR_WEB_IMAGE_TAG:-${RAZBOR_IMAGE_TAG:-0.1.0}}
     restart: unless-stopped
     init: true
     cap_drop: [ALL]
@@ -147,7 +147,7 @@ services:
 
   # Create a runner in the UI, then start this optional profile with its token.
   runner:
-    image: ghcr.io/next-hat/razbor-runner:${RAZBOR_IMAGE_TAG:-0.1.11}
+    image: ghcr.io/next-hat/razbor-runner:${RAZBOR_IMAGE_TAG:-0.1.0}
     profiles: [runner]
     restart: unless-stopped
     runtime: kata

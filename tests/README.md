@@ -18,14 +18,16 @@ changed; integration and smoke checks are separate commands.
 
 These suites need no Docker, database, model credentials, or live forge.
 
-| Command                                     | Coverage                                                                      | Extra requirements                             |
-| ------------------------------------------- | ----------------------------------------------------------------------------- | ---------------------------------------------- |
-| `pnpm test` or `pnpm run test:capabilities` | Skills, file/output limits, MCP validation, runner instructions               | Node 24 and Git                                |
-| `pnpm run test:diff`                        | Diff pagination, pinned source reads, cancellation, usage reporting           | Temporary Git repositories and child processes |
-| `pnpm run test:verification`                | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch | Child processes and stdio pipes                |
-| `pnpm run test:persistence:unit`            | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                      | Local sockets                                  |
-| `pnpm run test:presentation`                | Review contracts, forge formatting, server-rendered components                | The script selects its TSX configuration       |
-| `pnpm run test:coverage`                    | The default suite with a coverage report                                      | No additional requirements                     |
+| Command                                     | Coverage                                                                                       | Extra requirements                             |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `pnpm test` or `pnpm run test:capabilities` | Skills, file/output limits, MCP validation, runner instructions                                | Node 24 and Git                                |
+| `pnpm run test:review`                      | Autonomous loop, compaction, budgets, relay retry policy, cumulative progress, offline scoring | Temporary Git repositories and child processes |
+| `pnpm run test:diff`                        | Diff pagination, pinned source reads, cancellation, usage reporting                            | Temporary Git repositories and child processes |
+| `pnpm run test:verification`                | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
+| `pnpm run test:persistence:unit`            | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
+| `pnpm run test:presentation`                | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
+| `pnpm run test:release`                     | Explicit image publication tags and local-load defaults                                        | Bash; temporary fake Docker/Git, no daemon     |
+| `pnpm run test:coverage`                    | The default suite with a coverage report                                                       | No additional requirements                     |
 
 Run a spec or select tests by name:
 
@@ -43,6 +45,48 @@ Presentation checks cover text, Markdown safety, source links, and rendered HTML
 Check layout, clipboard actions, disclosures, keyboard navigation, and both themes
 in a browser.
 
+## Autonomous review harness
+
+Run the focused agent-loop, budget, context, relay and evaluation regressions:
+
+```sh
+pnpm run test:review
+pnpm run test:diff
+pnpm run test:verification
+```
+
+These deterministic provider fixtures exercise command-only exploration, immutable
+finding locations, exact manifest and previous-finding retention, compaction-window
+chunking without truncated tool-reference aliases, a 64k window with the default 80k trigger, immutable-context floors,
+large continuation notes followed by consecutive tools without redundant summaries,
+failure/cancellation, budget notices, final-response headroom, correction instructions
+retained after an invalid final output triggers compaction, and budget-limited
+conversation disclosures. Concrete missing required-tool warnings and summary
+limitations are enforced independently of model text without repeating generic
+preflight notices. They cover refused tool batches without command execution, strict token/cost reservations,
+independent missing input/output reservations, provider/model price selection
+and legacy configuration compatibility. Relay cases
+exercise opt-in known nonbillable throttles, capped fallback backoff, explicit
+Retry-After, shared credential pacing after oversized HTTP429 bodies, one request
+deadline and permanent/ambiguous error rejection. Cumulative progress cases preserve coherent
+usage/cost snapshots after 500 events and keep cache data unknown after usage gaps.
+`tests/apps/runner/finalization.spec.ts` sends native OpenAI Responses and Anthropic
+Messages payloads through the real model adapter and runner relay, intercepting
+only external provider I/O. It checks stable tool definitions with historical
+calls/results, explicit `none` during finalization and truncated-output correction,
+no execution of unexpected finalization calls, and tool-free independent compaction.
+These fixtures measure protocol behavior; scripted replies do not measure model finding recall or false
+positives. Verification checks use installed Git/rg/grep/cat/sed/awk/head/tail/find
+and deterministic process cleanup barriers; unavailable optional utilities are
+reported as skipped. No real model, database or infrastructure credentials are
+needed. All temporary repositories and evaluation files are removed by fixtures.
+
+The release-script regressions run the real shell script with temporary Docker
+and Git recorders. They verify rejection of implicit publication tags before any
+Docker invocation, explicit CLI/environment tag selection and unchanged local
+load defaults. They neither build nor publish images. Run `pnpm run test:release`
+separately from provider and database integration suites.
+
 ## Audited revision evaluation
 
 `tests/evaluation/audited-revisions.json` contains exact revision comparisons,
@@ -53,6 +97,14 @@ spec.
 pnpm evaluate validate tests/evaluation/audited-revisions.json
 pnpm evaluate plan tests/evaluation/audited-revisions.json
 ```
+
+The evaluation CLI regression specs also check historical-record compatibility,
+failed-attempt telemetry, cache splits, configuration grouping and runner-compatible
+single/multiple provider-model pricing, including duplicate identities and
+monetary caps without matching model prices. Both record and score reject those
+invalid caps while historical omitted settings remain unknown. Scoring exposes
+turns, tool calls, cached/uncached/cache-write tokens and conservative budget
+charges, preserving unknown fields. These specs never dispatch a model.
 
 The offline `record` and `score` commands process independently assessed execution
 records. They do not call a model or publish reviews. See the
@@ -211,9 +263,10 @@ Use disposable data and report these checks separately from automated results:
 | Pull requests                                       | Discover unreviewed PRs, retain IDs, confirm closure, preserve snapshots on refresh failure, repository grants, search, history, stale revisions, themes |
 | [Comment reviews](../docs/comment-reviews.md)       | Webhooks, publication, repeat assessments, recap edits, replies, resolution                                                                              |
 
-Model-loop fixtures return one tool call per response. They do not cover concurrent
-tool batches, multi-call result order, or cancellation during a batch. Integration
-success also does not measure retrieval relevance, autonomous tool selection, or
+Model-loop fixtures include serial command batches and budget rejection before
+any batch side effect. Live concurrent cancellation and retrieval relevance still
+need isolated runtime acceptance. Integration success does not measure model
+autonomous tool selection or
 [review quality](../docs/review-evaluation.md).
 
 `pnpm run submit <repository-key> <checkout> <base> <head>` submits committed

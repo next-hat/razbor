@@ -20,7 +20,6 @@ import {
   modelProviderSchema,
   reasoningEffortSchema,
   queueJobSchema,
-  reviewAttemptMetricsSchema,
   type ReviewAttemptMetrics,
   type ReviewProgress,
   type ReviewResult,
@@ -33,6 +32,7 @@ import { preflight, reconcile } from "@runner/src/docker.js";
 import { ModelRelay } from "@runner/src/relay.js";
 import { execute } from "@runner/src/executor.js";
 import { PermanentError } from "@runner/src/errors.js";
+import { AttemptProgress } from "@runner/src/progress.js";
 
 const identitySchema = z
   .object({
@@ -485,9 +485,7 @@ async function main() {
           : {}),
       };
       let logs = Promise.resolve();
-      let count = 0;
-      let lastMetrics = "{}";
-      let latestMetrics: ReviewAttemptMetrics | undefined;
+      const progress = new AttemptProgress();
       /**
        * Queue at most 500 full progress messages in order, then forward changed
        * validated cumulative metrics without repeated messages. Delivery failures
@@ -495,37 +493,8 @@ async function main() {
        * transport gaps when the outcome is accepted. Ownership expiry suppresses sends.
        */
       const onProgress = (event: ReviewProgress) => {
-        const metrics = reviewAttemptMetricsSchema.strip().parse(event);
-        // Omitted metrics must not erase values retained from earlier snapshots.
-        for (const key of Object.keys(
-          metrics,
-        ) as (keyof ReviewAttemptMetrics)[])
-          if (metrics[key] === undefined) delete metrics[key];
-        if (Object.keys(metrics).length) {
-          const incomplete = latestMetrics?.tokenUsageComplete === false;
-          latestMetrics = { ...latestMetrics, ...metrics };
-          if (
-            incomplete ||
-            metrics.tokenUsageComplete === false ||
-            (metrics.inputTokens !== undefined &&
-              metrics.cachedInputTokens === undefined)
-          )
-            delete latestMetrics.cachedInputTokens;
-          if (incomplete) latestMetrics.tokenUsageComplete = false;
-        }
-        const snapshot = JSON.stringify(metrics);
-        let payload = event;
-        if (count++ >= 500) {
-          if (snapshot === "{}" || snapshot === lastMetrics) return;
-          payload = {
-            time: event.time,
-            level: event.level,
-            stage: event.stage,
-            message: "Review metrics updated",
-            ...metrics,
-          };
-        }
-        if (snapshot !== "{}") lastMetrics = snapshot;
+        const payload = progress.capture(event);
+        if (!payload) return;
         logs = logs
           .then(async () => {
             if (await owns())
@@ -613,7 +582,7 @@ async function main() {
         }
         await logs;
         if (await owns())
-          await reportOutcome({ ...outcome, metrics: latestMetrics });
+          await reportOutcome({ ...outcome, metrics: progress.metrics });
       } catch {
         logger.warn(
           { attemptId: assignment.attemptId },

@@ -260,6 +260,26 @@ export class PreparedDiff {
     );
   }
 
+  /** Validates a new-side finding against one immutable changed hunk ending on an added line. */
+  validFindingRange(path: string, start: number, end: number): boolean {
+    const index = this.files.findIndex((file) => file.headPath === path);
+    if (index < 0) return false;
+    let line = 0;
+    let hunkStart = 0;
+    let hunkEnd = -1;
+    for (const text of this.patches[index].split("\n")) {
+      const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/.exec(text);
+      if (header) {
+        line = hunkStart = Number(header[1]);
+        hunkEnd = hunkStart + Number(header[2] ?? 1) - 1;
+      } else if (hunkEnd >= 0 && text.startsWith("+")) {
+        if (line === end && start >= hunkStart && end <= hunkEnd) return true;
+        line++;
+      } else if (text.startsWith(" ")) line++;
+    }
+    return false;
+  }
+
   /**
    * Partitions files once in manifest order while retaining pinned revisions and page
    * bounds. Multi-group views inline bounded patches; oversized single files page
