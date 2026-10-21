@@ -209,6 +209,7 @@
     color-mix(in srgb, var(--background) 88%, transparent) 34%,
     transparent 74%
   );
+  position: relative;
   border-bottom: 1px solid var(--border);
   background-color: var(--background);
   @variant dark {
@@ -229,10 +230,19 @@
   }
 }
 
-.console-hero > .console-container {
+.console-hero::before {
+  position: absolute;
+  inset: 0;
+  max-width: 90rem;
+  margin-inline: auto;
   background-image: var(--console-hero-overlay), url("/overview-hero.png");
   background-size: cover;
   background-position: center 25%;
+  content: "";
+}
+
+.console-hero > .console-container {
+  position: relative;
 }
 
 .console-hero-status {
