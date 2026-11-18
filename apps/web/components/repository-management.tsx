@@ -4,8 +4,10 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation.js";
 import { KeyRound, RotateCw, Trash2 } from "lucide-react";
 
+import type { ReviewTriggerMode } from "@razbor/contracts";
 import type { getRepository } from "@razbor/database";
 
+import { ReviewTriggerSelect } from "@web/components/review-trigger-select.js";
 import { Alert, AlertDescription } from "@web/components/ui/alert.js";
 import { Badge } from "@web/components/ui/badge.js";
 import { Button } from "@web/components/ui/button.js";
@@ -36,12 +38,13 @@ const setupLabels = {
   error: "Setup needs attention",
 };
 
-type RepositoryAction = "setup" | "token" | "memory" | "delete";
+type RepositoryAction = "setup" | "token" | "trigger" | "memory" | "delete";
 
 const actionMethods = {
   setup: "POST",
   token: "PATCH",
   memory: "PATCH",
+  trigger: "PATCH",
   delete: "DELETE",
 };
 
@@ -60,7 +63,9 @@ function repositoryUpdateBody(
   accessToken: string,
   confirmation: string,
   repository: Repository,
+  reviewTriggerMode: ReviewTriggerMode,
 ) {
+  if (action === "trigger") return { reviewTriggerMode };
   if (action === "token") return { accessToken: accessToken.trim() };
   if (action === "memory")
     return { codebaseMemoryEnabled: !repository.codebaseMemoryEnabled };
@@ -94,6 +99,7 @@ export function RepositoryManagement({
   const [error, setError] = useState("");
   const [refreshError, setRefreshError] = useState(false);
   const [message, setMessage] = useState("");
+  const [triggerChoice, setTriggerChoice] = useState<ReviewTriggerMode>();
   const [accessToken, setAccessToken] = useState("");
   const [tokenOpen, setTokenOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -179,6 +185,7 @@ export function RepositoryManagement({
               accessToken,
               deleting ? repositoryName : confirmation,
               repository,
+              triggerChoice ?? repository.reviewTriggerMode,
             ),
           ),
         },
@@ -203,7 +210,11 @@ export function RepositoryManagement({
         setTokenOpen(false);
         setMessage("Access token replaced.");
       }
-      if (action === "memory") {
+      if (action === "trigger" || action === "memory") {
+        if (action === "trigger") {
+          setTriggerChoice(undefined);
+          setMessage("Review trigger mode saved.");
+        }
         setRepository(result as Repository);
         return;
       }
@@ -338,6 +349,39 @@ export function RepositoryManagement({
                         : repository.codebaseMemoryEnabled
                           ? "Disable Codebase Memory"
                           : "Enable Codebase Memory"}
+                    </Button>
+                  )}
+                </div>
+              )}
+              {!deleting && (
+                <div className="flex flex-col items-start gap-3">
+                  <ReviewTriggerSelect
+                    value={triggerChoice ?? repository.reviewTriggerMode}
+                    onChange={setTriggerChoice}
+                    disabled={!!busy}
+                    fileManaged={!repository.reviewTriggerModeEditable}
+                  />
+                  {triggerChoice &&
+                    triggerChoice !== repository.reviewTriggerMode && (
+                      <p className="text-sm text-muted-foreground">
+                        Saving this change ends existing pull request opt-ins
+                        and retires queued automatic reviews.
+                      </p>
+                    )}
+                  {repository.reviewTriggerModeEditable && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={
+                        !!busy ||
+                        !triggerChoice ||
+                        triggerChoice === repository.reviewTriggerMode
+                      }
+                      onClick={() => void update("trigger")}
+                    >
+                      {busy === "trigger"
+                        ? "Saving…"
+                        : "Save review trigger mode"}
                     </Button>
                   )}
                 </div>

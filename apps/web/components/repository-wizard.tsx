@@ -4,8 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link.js";
 import { ArrowLeft, ArrowRight, Check, GitBranch } from "lucide-react";
 
+import type { ReviewTriggerMode } from "@razbor/contracts";
 import type { AgentView } from "@razbor/database";
 
+import {
+  ReviewTriggerSelect,
+  reviewTriggerLabels,
+} from "@web/components/review-trigger-select.js";
 import { AgentSelect } from "@web/components/agent-select.js";
 import {
   GithubAppConnection,
@@ -118,6 +123,8 @@ export function RepositoryWizard({
   const [callbackBase, setCallbackBase] = useState("");
   const [senders, setSenders] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
+  const [reviewTriggerMode, setReviewTriggerMode] =
+    useState<ReviewTriggerMode>("manual");
   const [memoryChoice, setMemoryChoice] = useState<boolean>();
   const [codebaseMemoryAvailable, setCodebaseMemoryAvailable] = useState<
     boolean | null
@@ -260,6 +267,7 @@ export function RepositoryWizard({
           body: JSON.stringify({
             ...connectionInput(),
             codebaseMemoryEnabled,
+            reviewTriggerMode,
             ...(agentId ? { agentId } : {}),
             callbackBase: selectedCallback.trim(),
             ...(forgeType === "github" && !usesGithubApp
@@ -602,6 +610,10 @@ export function RepositoryWizard({
                     </AlertDescription>
                   </Alert>
                 )}
+                <ReviewTriggerSelect
+                  value={reviewTriggerMode}
+                  onChange={setReviewTriggerMode}
+                />
                 <AgentSelect
                   initialAgents={agents}
                   value={agentId}
@@ -720,6 +732,10 @@ export function RepositoryWizard({
                         ? (agents?.find((agent) => agent.id === agentId)
                             ?.model ?? "Selected agent")
                         : "Runner default",
+                    ],
+                    [
+                      "Review trigger mode",
+                      reviewTriggerLabels[reviewTriggerMode],
                     ],
                     ["Permitted command senders", senders],
                     ["Webhook callback", selectedCallback],

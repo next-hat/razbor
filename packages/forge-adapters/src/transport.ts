@@ -83,7 +83,11 @@ export class HttpForgeTransport {
   }
 
   /** Read every page up to a fixed bound, failing rather than returning incomplete evidence. */
-  async list(route: string, pageSizeKey = "per_page"): Promise<unknown[]> {
+  async list(
+    route: string,
+    pageSizeKey = "per_page",
+    requireEmptyPage = false,
+  ): Promise<unknown[]> {
     const all: unknown[] = [];
     for (let page = 1; page <= 20; page++) {
       const rows = z
@@ -94,7 +98,8 @@ export class HttpForgeTransport {
           ),
         );
       all.push(...rows);
-      if (rows.length < 50) return all;
+      if (rows.length === 0 || (!requireEmptyPage && rows.length < 50))
+        return all;
     }
     throw new ForgeOperationError("invalid-response");
   }

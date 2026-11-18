@@ -23,6 +23,7 @@ import {
   type ReasoningEffort,
   type ResourceKind,
   type ReviewResult,
+  type ReviewTriggerMode,
   type ReviewEvaluation,
   type PreviousFinding,
   type ReviewConversation,
@@ -274,6 +275,10 @@ export const repositories = pgTable(
     setupError: text("setup_error"),
     indexOwner: text("index_owner").notNull(),
     persistent: boolean("persistent").notNull(),
+    reviewTriggerMode: text("review_trigger_mode")
+      .$type<ReviewTriggerMode>()
+      .notNull()
+      .default("manual"),
     codebaseMemoryEnabled: boolean("codebase_memory_enabled")
       .notNull()
       .default(true),
@@ -285,6 +290,10 @@ export const repositories = pgTable(
       .on(t.contextId, t.configKey)
       .nullsNotDistinct(),
     check("repository_status", sql`${t.status} in ('active','deleting')`),
+    check(
+      "repository_review_trigger_mode",
+      sql`${t.reviewTriggerMode} in ('manual','opt_in_continuous','automatic')`,
+    ),
     check(
       "repository_guidance_object",
       sql`${t.guidance} is null or jsonb_typeof(${t.guidance}) = 'object'`,
@@ -315,6 +324,16 @@ export const pullRequests = pgTable(
       .notNull()
       .references(() => repositories.id, { onDelete: "cascade" }),
     number: integer("number").notNull(),
+    draft: boolean("draft"),
+    mergeBase: text("merge_base"),
+    startSha: text("start_sha"),
+    continuousReviewSince: timestamp("continuous_review_since", {
+      withTimezone: true,
+    }),
+    reviewSessionResetAt: timestamp("review_session_reset_at", {
+      withTimezone: true,
+    }),
+    triggerGeneration: integer("trigger_generation").notNull().default(0),
     title: text("title").notNull(),
     url: text("url").notNull(),
     state: text("state").$type<"open" | "closed">().notNull(),
@@ -927,6 +946,18 @@ export const legacyRevocations = pgTable(
   (t) => [check("legacy_revocation_hash", sql`${t.hash} ~ '^[a-f0-9]{64}$'`)],
 );
 
+export type ReviewStatusComment = {
+  botId: string;
+  /** Persist the exact bytes before creation, so an uncertain POST is never repeated. */
+  creatingBody?: string;
+  remoteId?: string;
+  shown?: "queued" | "running" | "completed" | "failed";
+  headSha?: string;
+  error?: string;
+  /** Explicit repository deletion grants one last cleanup attempt before credentials disappear. */
+  retirementAttempted?: boolean;
+};
+
 export const dispatchOutbox = pgTable("dispatch_outbox", {
   id: uuid("id").primaryKey().defaultRandom(),
   reviewId: uuid("review_id")
@@ -944,6 +975,8 @@ export const dispatchOutbox = pgTable("dispatch_outbox", {
     error?: string;
   }>(),
   publication: jsonb("publication").$type<Publication>(),
+  statusComment: jsonb("status_comment").$type<ReviewStatusComment>(),
+  statusAfter: timestamp("status_after", { withTimezone: true }),
   interactionAfter: timestamp("interaction_after", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -968,6 +1001,11 @@ export type Publication = {
   writing?: boolean;
   mode?: "review" | "comment" | "recap";
   stale?: boolean;
+  /** An identical reviewed revision became current again after a stale decision. */
+  rearmed?: boolean;
+  staleNoticeId?: string;
+  /** PR observation fenced before a stale notice, including across uncertain response recovery. */
+  staleGeneration?: number;
 };
 
 export const repositoryWebhooks = pgTable(
@@ -1017,11 +1055,25 @@ export const reviewTriggers = pgTable(
       .notNull()
       .unique()
       .references(() => reviews.id),
-    commentId: text("comment_id").notNull(),
+    origin: text("origin")
+      .$type<"manual" | "automatic">()
+      .notNull()
+      .default("manual"),
+    commentId: text("comment_id"),
     change: jsonb("change").$type<ForgeChange>().notNull(),
   },
   (t) => [
     uniqueIndex("trigger_comment_identity").on(t.repositoryId, t.commentId),
+    index("trigger_revision").on(
+      t.repositoryId,
+      sql`(${t.change}->>'number')`,
+      sql`(${t.change}->>'headSha')`,
+      sql`(${t.change}->>'baseSha')`,
+    ),
+    check(
+      "trigger_origin_identity",
+      sql`(${t.origin} = 'manual' and ${t.commentId} is not null) or (${t.origin} = 'automatic' and ${t.commentId} is null)`,
+    ),
   ],
 );
 

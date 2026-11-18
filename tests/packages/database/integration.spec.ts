@@ -30,6 +30,7 @@ import {
   listTokens,
   pendingDispatches,
   updateRepositoryCodebaseMemory,
+  updateRepositoryReviewTriggerMode,
   createRepositoryFromUi,
   createReviewWorkspace,
   createIndexToken,
@@ -226,6 +227,26 @@ test("repository settings fence index grants while preserving an active attempt'
     const [repo] = await listRepositories(db);
     assert.equal(repo.codebaseMemoryEnabled, true);
     assert.equal(repo.codebaseMemoryEditable, false);
+    assert.equal(repo.reviewTriggerMode, "manual");
+    assert.equal(repo.reviewTriggerModeEditable, false);
+    await assert.rejects(
+      updateRepositoryReviewTriggerMode(db, repo.id, {
+        reviewTriggerMode: "automatic",
+      }),
+      /registry file/,
+    );
+    config.repositories.project.reviewTriggerMode = "automatic";
+    await applyRegistry(db, config);
+    assert.equal(
+      (await getRepository(db, repo.id))?.reviewTriggerMode,
+      "automatic",
+    );
+    delete config.repositories.project.reviewTriggerMode;
+    await applyRegistry(db, config);
+    assert.equal(
+      (await getRepository(db, repo.id))?.reviewTriggerMode,
+      "manual",
+    );
     await assert.rejects(
       updateRepositoryCodebaseMemory(db, repo.id, {
         codebaseMemoryEnabled: false,
@@ -426,12 +447,35 @@ test("repository settings fence index grants while preserving an active attempt'
       forgeType: "github",
       webhookMode: "manual",
       repositoryUrl,
+      reviewTriggerMode: "opt_in_continuous",
       accessToken: "local-test-credential",
       permittedSenders: ["fixture"],
       callbackBase: "https://razbor.invalid",
       codebaseMemoryEnabled: false,
     });
     assert.equal(created.codebaseMemoryEnabled, false);
+    assert.equal(created.reviewTriggerMode, "opt_in_continuous");
+    assert.equal(created.reviewTriggerModeEditable, true);
+    await assert.rejects(
+      updateRepositoryReviewTriggerMode(
+        db,
+        created.id,
+        { reviewTriggerMode: "automatic" },
+        "ctx_ABCDEFGHIJKLMNOP",
+      ),
+    );
+    assert.equal(
+      (await getRepository(db, created.id))?.reviewTriggerMode,
+      "opt_in_continuous",
+    );
+    assert.equal(
+      (
+        await updateRepositoryReviewTriggerMode(db, created.id, {
+          reviewTriggerMode: "manual",
+        })
+      )?.reviewTriggerMode,
+      "manual",
+    );
     assert.equal(created.setupState, "ready");
     await assert.rejects(
       updateRepositoryCodebaseMemory(

@@ -218,6 +218,11 @@ Keep registry and repository keys stable to preserve identities and history.
 Imports retain missing entries and only run explicitly. Remove registrations
 from the file when no longer needed; importing later can recreate a deleted one.
 
+Set `reviewTriggerMode` under `[repositories.<key>]` to `manual`,
+`opt_in_continuous` or `automatic`. Omitting it selects manual on import.
+Reapplying a different mode clears per-PR opt-ins and supersedes queued automatic
+work. Review history stays available. See [review triggering](comment-reviews.md#review-trigger-modes).
+
 An explicit `codebaseMemoryEnabled` in a repository table takes precedence.
 When it is omitted, a registry reapply keeps the existing repository's setting.
 For a new repository, `manage config apply` can read `RAZBOR_INDEX_CONFIG`

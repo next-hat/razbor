@@ -41,6 +41,14 @@ export {
   type ResourceKind,
 } from "@contracts/src/ids.js";
 
+export const reviewTriggerModeSchema = z.enum([
+  "manual",
+  "opt_in_continuous",
+  "automatic",
+]);
+
+export type ReviewTriggerMode = z.infer<typeof reviewTriggerModeSchema>;
+
 export const reviewReplacementSchema = z
   .object({
     startLine: z.number().int().positive(),

@@ -34,3 +34,35 @@ test("registry preserves omitted and explicit Codebase Memory preferences indepe
     false,
   );
 });
+
+test("registry accepts each trigger policy independently of indexing and rejects unknown policies", () => {
+  const repository = {
+    git: {
+      branch: "main",
+      upstream: "refs/remotes/origin/main",
+      remotes: { origin: "https://example.invalid/r.git" },
+    },
+    indexing: { owner: "fixture" },
+  };
+  for (const codebaseMemoryEnabled of [true, false]) {
+    for (const reviewTriggerMode of [
+      "manual",
+      "opt_in_continuous",
+      "automatic",
+      "always",
+    ]) {
+      const parsed = registrySchema.safeParse({
+        registry: { key: "file" },
+        repositories: {
+          project: { ...repository, codebaseMemoryEnabled, reviewTriggerMode },
+        },
+      });
+      assert.equal(parsed.success, reviewTriggerMode !== "always");
+      if (parsed.success)
+        assert.equal(
+          parsed.data.repositories.project.reviewTriggerMode,
+          reviewTriggerMode,
+        );
+    }
+  }
+});

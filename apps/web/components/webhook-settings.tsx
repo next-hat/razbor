@@ -150,7 +150,7 @@ export function WebhookSettings({
             <>
               <dl className="grid gap-4 text-sm sm:grid-cols-2">
                 <div className="flex flex-col gap-1">
-                  <dt className="text-muted-foreground">Review commands</dt>
+                  <dt className="text-muted-foreground">Webhook events</dt>
                   <dd>{hook.data?.enabled ? "Enabled" : "Disabled"}</dd>
                 </div>
                 <div className="flex flex-col gap-1">
@@ -266,7 +266,7 @@ export function WebhookSettings({
                     disabled={busy}
                   />
                   <FieldLabel htmlFor="enabled">
-                    Accept review commands
+                    Accept repository webhook events
                   </FieldLabel>
                 </Field>
                 <div className="flex flex-wrap gap-2">

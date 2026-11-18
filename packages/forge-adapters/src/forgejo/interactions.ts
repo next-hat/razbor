@@ -12,6 +12,8 @@ import type { ForgeConnection } from "@forge-adapters/src/types.js";
 import {
   ForgeOperationError,
   ForgeWebhookError,
+  removeIfPresent,
+  verifyStatusComment,
   type Forge,
   type ForgeChange,
   type ForgePullRequest,
@@ -90,25 +92,51 @@ export function parseForgejoComment(
   };
 }
 
-/**
- * Extract repository, pull request and author identity from an opened event,
- * ignoring other actions.
- */
+/** Normalize lifecycle actions; Forgejo reports title-based readiness as a PR edit. */
 export function parseForgejoPullRequest(raw: Uint8Array) {
   const value = parse(Buffer.from(raw).toString("utf8"));
-  if (z.object({ action: z.string() }).parse(value).action !== "opened")
+  const { action } = z.object({ action: z.string() }).parse(value);
+  if (
+    !["opened", "reopened", "edited", "synchronized", "closed"].includes(action)
+  )
     return undefined;
   const payload = z
     .object({
       repository: z.object({ id }),
-      pull_request: z.object({ number, user }),
+      pull_request: z.object({
+        number,
+        user,
+        draft: z.boolean().optional(),
+        updated_at: z.string().datetime({ offset: true }).optional(),
+        closed_at: z.string().datetime({ offset: true }).nullish(),
+      }),
+      changes: z
+        .object({ title: z.object({ from: z.string() }).nullish() })
+        .nullish(),
     })
     .parse(value);
-  return {
+  const pull = payload.pull_request;
+  const change = {
     repositoryId: payload.repository.id,
-    number: payload.pull_request.number,
-    author: payload.pull_request.user.login,
+    number: pull.number,
+    occurredAt:
+      action === "closed"
+        ? (pull.closed_at ?? pull.updated_at)
+        : pull.updated_at,
   };
+  switch (action) {
+    case "opened":
+      return { ...change, kind: action, author: pull.user.login } as const;
+    case "closed":
+    case "reopened":
+      return { ...change, kind: action } as const;
+    case "synchronized":
+      return { ...change, kind: "updated" } as const;
+    case "edited":
+      // Draft title prefixes are server-configurable. The REST draft flag is authoritative.
+      if (payload.changes?.title && pull.draft !== undefined)
+        return { ...change, kind: pull.draft ? "draft" : "ready" } as const;
+  }
 }
 
 /**
@@ -176,7 +204,12 @@ export class ForgejoInteractions implements Forge {
 
   readonly label = "Forgejo";
 
-  readonly hookEvents = ["pull_request", "pull_request_comment", "push"];
+  readonly hookEvents = [
+    "pull_request",
+    "pull_request_sync",
+    "pull_request_comment",
+    "push",
+  ];
 
   readonly capabilities = { resolveThreads: false };
 
@@ -215,7 +248,7 @@ export class ForgejoInteractions implements Forge {
     }
     if (headers["x-forgejo-event"] === "pull_request") {
       const event = parseForgejoPullRequest(raw);
-      return event ? { ...event, deliveryId, kind: "opened" } : undefined;
+      return event ? { ...event, deliveryId } : undefined;
     }
     const event = parseForgejoComment(raw, headers["x-forgejo-event"]);
     return event ? { ...event, deliveryId, kind: "comment" } : undefined;
@@ -384,6 +417,7 @@ export class ForgejoInteractions implements Forge {
         number,
         state: z.literal("open"),
         merged: z.literal(false),
+        draft: z.boolean().optional(),
         title: z.string(),
         user: user.optional(),
         html_url: z.string().url(),
@@ -394,6 +428,7 @@ export class ForgejoInteractions implements Forge {
       .parse(response);
     return {
       number: n,
+      draft: p.draft,
       baseSha: p.base.sha,
       headSha: p.head.sha,
       mergeBase: p.merge_base,
@@ -408,22 +443,42 @@ export class ForgejoInteractions implements Forge {
    * Read a comment's author, text and issue or pull request location for
    * independent webhook verification.
    */
-  async comment(commentId: string) {
-    return z
+  async comment(commentId: string, n?: number) {
+    const value = z
       .object({
         id,
         body: z.string(),
         user,
+        created_at: z.string().datetime({ offset: true }).optional(),
         issue_url: z.string(),
         pull_request_url: z.string().default(""),
       })
-      .parse(await this.request(`${this.route}/issues/comments/${commentId}`));
+      .parse(
+        await this.request(
+          `${this.route}/issues/comments/${id.parse(commentId)}`,
+        ),
+      );
+    if (value.id !== commentId)
+      throw new ForgeOperationError("invalid-response");
+    if (n !== undefined) {
+      const web = approvedUrl(
+        this.connection.webUrl,
+        this.connection.allowHttp,
+      );
+      const expected = `${web.href.replace(/\/$/, "")}/${this.route.slice("repos/".length)}/pulls/${number.parse(n)}`;
+      if (value.pull_request_url !== expected)
+        throw new ForgeOperationError("invalid-response");
+    }
+    return { ...value, createdAt: value.created_at };
   }
   /**
    * Read complete provider pagination within twenty pages; fail at the bound
    * so truncated results cannot be mistaken for absence.
    */
-  private async list(route: string): Promise<unknown[]> {
+  private async list(
+    route: string,
+    requireEmptyPage = false,
+  ): Promise<unknown[]> {
     const all: unknown[] = [];
     for (let page = 1; page <= 20; page++) {
       const rows =
@@ -432,7 +487,8 @@ export class ForgejoInteractions implements Forge {
           .nullable()
           .parse(await this.request(`${route}?limit=50&page=${page}`)) ?? [];
       all.push(...rows);
-      if (rows.length < 50) return all;
+      if (rows.length === 0 || (!requireEmptyPage && rows.length < 50))
+        return all;
     }
     throw new ForgeOperationError("invalid-response"); // Never treat a truncated list as absence.
   }
@@ -440,10 +496,15 @@ export class ForgejoInteractions implements Forge {
    * Read validated issue comments for a pull request using bounded complete
    * pagination.
    */
-  async comments(n: number) {
+  async comments(n: number, options?: { complete: boolean }) {
     return z
       .array(z.object({ id, body: z.string(), user }))
-      .parse(await this.list(`${this.route}/issues/${n}/comments`));
+      .parse(
+        await this.list(
+          `${this.route}/issues/${n}/comments`,
+          options?.complete,
+        ),
+      );
   }
   /**
    * Read native reviews with bot identity, commit and publication state for
@@ -543,11 +604,64 @@ export class ForgejoInteractions implements Forge {
   }
   /** Publish a pull request issue comment and return its lossless provider ID. */
   async postComment(n: number, body: string) {
-    return z.object({ id }).parse(
+    const result = z.object({ id }).safeParse(
       await this.request(`${this.route}/issues/${n}/comments`, "POST", {
         body,
       }),
-    ).id;
+    );
+    if (!result.success)
+      throw new ForgeOperationError("invalid-response", true);
+    return result.data.id;
+  }
+
+  /** Bind a top-level comment ID to the verified PR URL, status marker and author. */
+  private async statusRoute(
+    n: number,
+    commentId: string,
+    botId: string,
+    marker: string,
+  ) {
+    verifyStatusComment(
+      await this.comment(commentId, n),
+      commentId,
+      botId,
+      marker,
+    );
+    return `${this.route}/issues/comments/${commentId}`;
+  }
+
+  /** Replace only the verified top-level PR status. */
+  async editStatusComment(
+    n: number,
+    commentId: string,
+    botId: string,
+    marker: string,
+    body: string,
+  ) {
+    await this.request(
+      await this.statusRoute(n, commentId, botId, marker),
+      "PATCH",
+      { body },
+    );
+  }
+
+  /** Remove the verified comment and tolerate an already completed delete. */
+  async deleteStatusComment(
+    n: number,
+    commentId: string,
+    botId: string,
+    marker: string,
+  ) {
+    await removeIfPresent(
+      commentId,
+      async () => {
+        await this.request(
+          await this.statusRoute(n, commentId, botId, marker),
+          "DELETE",
+        );
+      },
+      () => this.comments(n, { complete: true }),
+    );
   }
   /**
    * Publish a new-side inline reply in the specified native review and return
@@ -753,7 +867,7 @@ export class ForgejoInteractions implements Forge {
     const body = {
       type: "forgejo",
       active: enabled,
-      events: ["pull_request", "pull_request_comment", "push"],
+      events: this.hookEvents,
       config: { url: callback, content_type: "json", secret },
     };
     if (!enabled && !owned) return null;

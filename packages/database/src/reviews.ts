@@ -24,6 +24,10 @@ import {
 } from "@razbor/contracts";
 
 import { reviewView, reviewViewSelection } from "@database/src/review-view.js";
+import {
+  automaticReviewReady,
+  retireObsoleteAutomaticRetry,
+} from "@database/src/review-triggers.js";
 import { snapshotRepositoryAgent } from "@database/src/agents.js";
 import type { Database, Transaction } from "@database/src/connection.js";
 import {
@@ -297,6 +301,8 @@ export async function pendingDispatches(
     .where(
       and(
         isNull(dispatchOutbox.dispatchedAt),
+        inArray(reviews.status, ["queued", "running"]),
+        automaticReviewReady(),
         eq(repositories.status, "active"),
         eligibleOnly
           ? sql`exists (select 1 from ${runners} where ${eligibleRunner(reviews.repositoryId, sql`(${reviews.source}->'agent' is not null or ${runners.fallbackModel})`)})`
@@ -362,6 +368,13 @@ async function beginAttemptInTransaction(
       result: reviewResultSchema.parse(row.result),
     };
   if (row.status === "failed") return { kind: "failed" as const };
+  if (row.version === 0) {
+    const [allowed] = await tx
+      .select({ id: reviews.id })
+      .from(reviews)
+      .where(and(eq(reviews.id, row.id), automaticReviewReady()));
+    if (!allowed) return { kind: "busy" as const, retryAt: Date.now() + 2000 };
+  }
   const now = new Date();
   const [previous] = await tx
     .select()
@@ -382,6 +395,8 @@ async function beginAttemptInTransaction(
       .update(reviewAttempts)
       .set({ status: "abandoned", finishedAt: now })
       .where(eq(reviewAttempts.id, previous.id));
+  if (row.version > 0 && (await retireObsoleteAutomaticRetry(tx, row)))
+    return { kind: "failed" as const };
   if (row.version >= 4) {
     await tx
       .update(reviews)
@@ -854,6 +869,12 @@ export async function finishAttempt(
       })
       .where(eq(reviewAttempts.id, attempt.id));
     const unsuccessfulStatus = terminal ? "failed" : "queued";
+    if (
+      !validated &&
+      !terminal &&
+      (await retireObsoleteAutomaticRetry(tx, review))
+    )
+      return;
     await tx
       .update(reviews)
       .set({
@@ -887,6 +908,12 @@ export async function recoverDispatches(database: Database) {
       .limit(50)
       .for("update", { skipLocked: true });
     for (const row of rows) {
+      if (
+        row.status === "queued" &&
+        row.version > 0 &&
+        (await retireObsoleteAutomaticRetry(tx, row))
+      )
+        continue;
       const [attempt] = await tx
         .select()
         .from(reviewAttempts)
@@ -932,6 +959,7 @@ export async function recoverDispatches(database: Database) {
           })
           .where(eq(reviewAttempts.id, attempt.id));
         const exhausted = row.version >= 4;
+        if (await retireObsoleteAutomaticRetry(tx, row)) continue;
         await tx
           .update(reviews)
           .set({

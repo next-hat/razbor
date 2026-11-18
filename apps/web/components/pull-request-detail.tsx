@@ -100,6 +100,11 @@ export default function PullRequestPage({
               <GitPullRequest aria-hidden="true" className="size-4" />
               {pr.state === "open" ? "Open · human review" : "Closed"}
             </span>
+            {pr.continuousReviewActive && (
+              <span className="console-hero-status">
+                Continuous review active
+              </span>
+            )}
             <span className="console-hero-status tabular-nums">
               {pr.reviewCount} review {pr.reviewCount === 1 ? "run" : "runs"}
             </span>
@@ -237,7 +242,7 @@ export default function PullRequestPage({
                     <EmptyDescription>
                       {pr.latestReview
                         ? "The latest review has no completed result. Open its run below for the current status."
-                        : "Select Trigger review to request a review of this pull request. Findings will appear here when it completes."}
+                        : "Completed reviews for this pull request will appear here."}
                     </EmptyDescription>
                   </EmptyHeader>
                 </Empty>

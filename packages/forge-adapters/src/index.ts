@@ -138,7 +138,12 @@ export function forgeWebhookSettings(type: ForgeConnection["type"]) {
   return {
     forgejo: {
       label: "Forgejo",
-      events: ["pull_request", "pull_request_comment", "push"],
+      events: [
+        "pull_request",
+        "pull_request_sync",
+        "pull_request_comment",
+        "push",
+      ],
       secretHeader: "X-Forgejo-Signature",
     },
     github: {

@@ -4,6 +4,8 @@ export type ForgeActor = { id: string; login: string };
 
 export type ForgeChange = {
   number: number;
+  /** Only an explicit false from the provider authorizes an automatic review. */
+  draft?: boolean;
   baseSha: string;
   headSha: string;
   mergeBase: string;
@@ -40,6 +42,7 @@ export type InlineComment = {
 
 export type ForgeComment = {
   id: string;
+  createdAt?: string;
   body: string;
   user: ForgeActor;
   issue_url: string;
@@ -74,6 +77,10 @@ export type ForgePublicationProgress = Record<
 
 export type ForgeReviewPublication = {
   progress: ForgePublicationProgress;
+  /** Persisted review snapshot against which a multi-step provider checks each write. */
+  revision?: ForgeChange;
+  /** Automatic reviews must still be ready when a provider publishes draft notes. */
+  requireReady?: boolean;
   /** Persist before each remote mutation; retain uncertain writes for reconciliation. */
   save(progress: ForgePublicationProgress): Promise<void>;
 };
@@ -81,7 +88,12 @@ export type ForgeReviewPublication = {
 export type ForgeWebhook = { deliveryId: string; repositoryId: string } & (
   | { kind: "ping" }
   | { kind: "push"; ref: string }
-  | { kind: "opened"; number: number; author: string }
+  | { kind: "opened"; number: number; author: string; occurredAt?: string }
+  | {
+      kind: "reopened" | "ready" | "draft" | "updated" | "closed";
+      number: number;
+      occurredAt?: string;
+    }
   | {
       kind: "comment";
       number: number;
@@ -118,6 +130,37 @@ export class ForgeWebhookError extends Error {
   }
 }
 
+/** Confirm a masked or repeated DELETE's 404 against a successful complete, change-scoped read. */
+export async function removeIfPresent(
+  commentId: string,
+  remove: () => Promise<void>,
+  list: () => Promise<{ id: string }[]>,
+) {
+  try {
+    await remove();
+  } catch (error) {
+    if (!(error instanceof ForgeOperationError && error.status === 404))
+      throw error;
+    if ((await list()).some((comment) => comment.id === commentId)) throw error;
+  }
+}
+
+/** Check the exact returned ID, owner and trailing status marker before editing or deleting. */
+export function verifyStatusComment(
+  comment: { id: string; body: string; user: ForgeActor },
+  commentId: string,
+  botId: string,
+  marker: string,
+) {
+  if (
+    comment.id !== commentId ||
+    comment.user.id !== botId ||
+    !/^<!-- razbor:rev_[A-Za-z0-9]{16}:status -->$/.test(marker) ||
+    !comment.body.endsWith(`\n${marker}`)
+  )
+    throw new ForgeOperationError("permission");
+}
+
 /** Repository-bound provider operations; arrays contain complete, bounded results. */
 export interface Forge {
   readonly type: ForgeType;
@@ -141,6 +184,7 @@ export interface Forge {
   /** Read top-level change comments for marker reconciliation. */
   comments(
     number: number,
+    options?: { complete: boolean },
   ): Promise<{ id: string; body: string; user: ForgeActor }[]>;
   /** Read published and pending reviews for marker and revision reconciliation. */
   reviews(number: number): Promise<ForgeReview[]>;
@@ -153,6 +197,21 @@ export interface Forge {
   react(commentId: string, botId: string, number?: number): Promise<void>;
   /** Create a top-level comment and return its exact provider ID. */
   postComment(number: number, body: string): Promise<string>;
+  /** Replace only this review's bot-owned top-level status in the indicated change. */
+  editStatusComment(
+    number: number,
+    id: string,
+    botId: string,
+    marker: string,
+    body: string,
+  ): Promise<void>;
+  /** Delete the verified status comment, tolerating a previously completed deletion. */
+  deleteStatusComment(
+    number: number,
+    id: string,
+    botId: string,
+    marker: string,
+  ): Promise<void>;
   /** Reply in the identified original thread without creating a new finding. */
   replyToReview(
     number: number,

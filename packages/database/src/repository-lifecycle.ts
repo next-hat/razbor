@@ -3,11 +3,12 @@ import { randomUUID } from "node:crypto";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 
-import { publicIdSchema } from "@razbor/contracts";
+import { publicIdSchema, reviewTriggerModeSchema } from "@razbor/contracts";
 import { createForge, verifyRegistration } from "@razbor/forge-adapters";
 
 import { requireContextSession } from "@database/src/contexts.js";
-import type { Database } from "@database/src/connection.js";
+import { resetRepositoryReviewTriggers } from "@database/src/review-triggers.js";
+import type { Database, Transaction } from "@database/src/connection.js";
 import {
   getRepository,
   isUiManagedRepository,
@@ -32,6 +33,82 @@ export class RepositoryManagementError extends Error {
   }
 }
 
+/** Lock a UI-owned repository after checking the caller's current management grant. */
+async function editableRepository(
+  tx: Transaction,
+  id: string,
+  setting: string,
+  contextId?: string,
+  sessionToken?: string,
+) {
+  if (sessionToken !== undefined)
+    await requireContextSession(
+      tx,
+      sessionToken,
+      contextId ?? "",
+      "repositories",
+    );
+  const [repo] = await tx
+    .select()
+    .from(repositories)
+    .where(
+      and(
+        eq(repositories.publicId, id),
+        contextId === undefined
+          ? undefined
+          : sql`${repositories.contextId} = (select id from account_contexts where public_id = ${contextId})`,
+      ),
+    )
+    .for("update");
+  if (!repo) throw new RepositoryManagementError(404, "Repository not found.");
+  if (repo.status !== "active")
+    throw new RepositoryManagementError(
+      409,
+      "Repository deletion is in progress.",
+    );
+  if (!isUiManagedRepository(repo))
+    throw new RepositoryManagementError(
+      409,
+      `Update ${setting} in the repository's registry file.`,
+    );
+  return repo;
+}
+
+/** Save the new policy and end any prior opt-ins and pending automatic work atomically. */
+export async function updateRepositoryReviewTriggerMode(
+  database: Database,
+  id: string,
+  input: unknown,
+  contextId?: string,
+  sessionToken?: string,
+) {
+  publicIdSchema("repository").parse(id);
+  const { reviewTriggerMode } = z
+    .object({ reviewTriggerMode: reviewTriggerModeSchema })
+    .strict()
+    .parse(input);
+  await database.transaction(async (tx) => {
+    const repo = await editableRepository(
+      tx,
+      id,
+      "review trigger mode",
+      contextId,
+      sessionToken,
+    );
+    if (repo.reviewTriggerMode === reviewTriggerMode) return;
+    await resetRepositoryReviewTriggers(tx, repo.id);
+    await tx
+      .update(repositories)
+      .set({
+        reviewTriggerMode,
+        version: repo.version + 1,
+        updatedAt: new Date(),
+      })
+      .where(eq(repositories.id, repo.id));
+  });
+  return getRepository(database, id, contextId);
+}
+
 /** Set indexing for future attempts and requeue setup when enabling a UI-managed repository. */
 export async function updateRepositoryCodebaseMemory(
   database: Database,
@@ -46,37 +123,13 @@ export async function updateRepositoryCodebaseMemory(
     .strict()
     .parse(input);
   await database.transaction(async (tx) => {
-    if (sessionToken !== undefined)
-      await requireContextSession(
-        tx,
-        sessionToken,
-        contextId ?? "",
-        "repositories",
-      );
-    const [repo] = await tx
-      .select()
-      .from(repositories)
-      .where(
-        and(
-          eq(repositories.publicId, id),
-          contextId === undefined
-            ? undefined
-            : sql`${repositories.contextId} = (select id from account_contexts where public_id = ${contextId})`,
-        ),
-      )
-      .for("update");
-    if (!repo)
-      throw new RepositoryManagementError(404, "Repository not found.");
-    if (repo.status !== "active")
-      throw new RepositoryManagementError(
-        409,
-        "Repository deletion is in progress.",
-      );
-    if (!isUiManagedRepository(repo))
-      throw new RepositoryManagementError(
-        409,
-        "Update Codebase Memory in the repository's registry file.",
-      );
+    const repo = await editableRepository(
+      tx,
+      id,
+      "Codebase Memory",
+      contextId,
+      sessionToken,
+    );
     if (repo.codebaseMemoryEnabled === codebaseMemoryEnabled) return;
     await tx
       .update(repositories)

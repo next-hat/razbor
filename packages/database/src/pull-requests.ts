@@ -22,6 +22,7 @@ import type { Database } from "@database/src/connection.js";
 import { getRepositoryGithubApp } from "@database/src/github-apps.js";
 import { publicId } from "@database/src/ids.js";
 import { readSecret } from "@database/src/registry.js";
+import { supersedeQueuedAutomaticReviews } from "@database/src/review-triggers.js";
 import { reviewView, reviewViewSelection } from "@database/src/review-view.js";
 import {
   forgeInstances,
@@ -52,6 +53,7 @@ export type PullRequestView = {
   syncedAt: string;
   latestReview?: PullRequestReviewView;
   reviewCount: number;
+  continuousReviewActive: boolean;
 };
 
 export type PullRequestDetail = PullRequestView & {
@@ -163,6 +165,8 @@ function pullRequestView(
         }
       : {}),
     reviewCount: row.reviewCount,
+    continuousReviewActive:
+      pr.state === "open" && pr.continuousReviewSince !== null,
   };
 }
 
@@ -395,12 +399,19 @@ export async function syncPullRequests(
                 .onConflictDoUpdate({
                   target: [pullRequests.repositoryId, pullRequests.number],
                   set: values,
+                  setWhere: lte(pullRequests.syncedAt, listingStartedAt),
                 });
             }
-            if (closedNumbers.length)
-              await tx
+            if (closedNumbers.length) {
+              const closed = await tx
                 .update(pullRequests)
-                .set({ state: "closed", syncedAt })
+                .set({
+                  state: "closed",
+                  syncedAt,
+                  continuousReviewSince: null,
+                  reviewSessionResetAt: syncedAt,
+                  triggerGeneration: sql`${pullRequests.triggerGeneration}+1`,
+                })
                 .where(
                   and(
                     eq(pullRequests.repositoryId, repo.id),
@@ -409,7 +420,11 @@ export async function syncPullRequests(
                     lte(pullRequests.syncedAt, listingStartedAt),
                     inArray(pullRequests.number, closedNumbers),
                   ),
-                );
+                )
+                .returning({ number: pullRequests.number });
+              for (const pr of closed)
+                await supersedeQueuedAutomaticReviews(tx, repo.id, pr.number);
+            }
           });
           return true;
         },

@@ -35,6 +35,8 @@ upstream = "refs/remotes/origin/master"
 remotes = { origin = "https://example.com/team/razbor.git" }
 
 [repositories.github-example]
+# Also accepts opt_in_continuous or automatic. Applies to PR events independent of indexing.
+reviewTriggerMode = "manual"
 forge = "github"
 selector = "example/project"
 indexing = { owner = "local-indexer", persistent = false }

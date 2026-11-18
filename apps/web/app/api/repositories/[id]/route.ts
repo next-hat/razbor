@@ -6,6 +6,7 @@ import {
   RepositoryManagementError,
   reconcileWebhook,
   updateRepositoryCodebaseMemory,
+  updateRepositoryReviewTriggerMode,
 } from "@razbor/database";
 
 import { canManageResource } from "@web/lib/auth.js";
@@ -85,7 +86,9 @@ async function change(
         ? requestRepositoryDeletion
         : input && typeof input === "object" && "codebaseMemoryEnabled" in input
           ? updateRepositoryCodebaseMemory
-          : replaceRepositoryToken;
+          : input && typeof input === "object" && "reviewTriggerMode" in input
+            ? updateRepositoryReviewTriggerMode
+            : replaceRepositoryToken;
     const result = await mutate(
       database,
       id,
@@ -127,7 +130,7 @@ export async function DELETE(request: Request, context: Context) {
   return change(request, context, "delete");
 }
 
-/** Updates repository indexing preferences or replaces access credentials. */
+/** Updates repository review and indexing preferences or replaces access credentials. */
 export async function PATCH(request: Request, context: Context) {
   const denied = await apiAccessResponse(request, { resource: "repository" });
   if (denied) return denied;

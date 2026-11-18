@@ -24,7 +24,7 @@ These suites need no Docker, database, model credentials, or live forge.
 | `pnpm run test:review`           | Autonomous loop, compaction, budgets, relay retry policy, cumulative progress, offline scoring | Temporary Git repositories and child processes |
 | `pnpm run test:diff`             | Diff pagination, pinned source reads, cancellation, usage reporting                            | Temporary Git repositories and child processes |
 | `pnpm run test:verification`     | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
-| `pnpm run test:persistence:unit` | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
+| `pnpm run test:persistence:unit` | Public IDs, trigger policy parsing, provider lifecycle events and bot-owned comment operations | Local sockets                                  |
 | `pnpm run test:presentation`     | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
 | `pnpm run test:release`          | Explicit image publication tags and local-load defaults                                        | Bash; temporary fake Docker/Git, no daemon     |
 | `pnpm run test:coverage`         | The default suite with a coverage report                                                       | No additional requirements                     |
@@ -44,6 +44,10 @@ and mocks.
 Presentation checks cover text, Markdown safety, source links, rendered HTML, and disabled repository indexes with stale preparation errors.
 Check layout, clipboard actions, disclosures, keyboard navigation, and both themes
 in a browser.
+
+Review trigger and comment checks use local HTTP provider fixtures and isolated PostgreSQL
+databases. They exercise source-only and indexed policy decisions with simulated
+attempts and controlled results. They do not need model credentials.
 
 ## Autonomous review harness
 
@@ -124,10 +128,10 @@ pnpm run test:comments
 pnpm run test:broker
 ```
 
-| Command                     | Coverage                                                                                                                 |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion          |
-| `pnpm run test:comments`    | Commands, webhook HMAC, deduplication, hook setup, acknowledgement fallback, Forgejo publication against a local fixture |
+| Command                     | Coverage                                                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion                   |
+| `pnpm run test:comments`    | Signed events, PR opt-in and reset, revision coalescing, same-revision re-review, status-comment recovery and Forgejo publication |
 
 The broker suite uses pg-boss and enrolled runner sessions, with a controlled
 loopback source service. It checks indexed and source-only assignments across a

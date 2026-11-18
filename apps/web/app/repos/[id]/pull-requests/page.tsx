@@ -27,6 +27,7 @@ export default async function Page({
     ]);
     return {
       reviewCommand: repository?.reviewCommand ?? null,
+      reviewTriggerMode: repository?.reviewTriggerMode,
       reviews: isAdmin ? reviews : reviews.map(sanitizeReviewView),
     };
   });
@@ -47,6 +48,7 @@ export default async function Page({
         id={id}
         isAdmin={isAdmin}
         reviewCommand={data?.reviewCommand ?? null}
+        reviewTriggerMode={data?.reviewTriggerMode}
         initialData={data?.reviews}
       />
     </>

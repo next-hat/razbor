@@ -6,15 +6,15 @@
 
 <p align="center">Self-hosted AI code reviews for Forgejo, GitHub, and GitLab.</p>
 
-Connect a repository, choose your model, and request a review with a comment:
+Connect a repository, choose your model, and request a review with a comment in the default manual mode:
 
 ```text
 /agentic_review
 ```
 
 Razbor checks the diff and surrounding code, then posts a summary and inline
-findings. Reply to a finding to discuss it, or request another review after pushing
-a fix. The web console keeps pull requests, review history, and worker status in
+findings. You can opt a pull request into continuous review or configure automatic
+reviews for every ready pull request. Reply to a finding to discuss it. The web console keeps pull requests, review history, and worker status in
 one place.
 
 - **Bring your model.** Connect an OpenAI Responses or Anthropic Messages endpoint.

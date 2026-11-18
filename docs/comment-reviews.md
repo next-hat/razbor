@@ -1,7 +1,7 @@
 # Review a pull request
 
-Request a review with `/agentic_review` on a Forgejo or GitHub pull request, or a
-GitLab merge request.
+Razbor can review Forgejo and GitHub pull requests and GitLab merge requests on
+command or in response to authenticated pull request events.
 
 You need a running [installation](getting-started.md), an assigned
 [runner](runner.md), a reviewer configured in **Agents**, and an HTTPS webhook
@@ -19,7 +19,7 @@ address reachable by your Git provider.
    overrides. If a self-hosted provider runs under a path, set its **Instance
    URL**, for example `https://git.example.com/gitlab`. Keep GitLab groups and
    subgroups in the repository URL.
-3. Choose an AI reviewer or use **Add agent**. Enter allowed command senders as
+3. Select a **Review trigger mode** and choose an AI reviewer or use **Add agent**. Enter allowed command senders as
    comma-separated provider usernames, such as `alice, bob`. Adding an agent
    saves it immediately, even if you cancel repository setup. Enter your public
    HTTPS origin as the webhook callback base; `RAZBOR_WEBHOOK_CALLBACK_BASE`
@@ -122,8 +122,9 @@ The instance must support Draft Notes publication with a summary and
 ignore these fields fail publication verification.
 
 Forgejo and GitLab hooks are created automatically. **Webhook → Remote hook
-setup** shows their callbacks and events. Forgejo needs pull request, pull request
-comment, and push events; GitLab needs merge request, note, and push events. After
+setup** shows their callbacks and events. Forgejo needs `pull_request`,
+`pull_request_sync`, `pull_request_comment`, and `push`. GitLab needs merge
+request, note, and push events. After
 fixing permissions, retry setup without deleting the registration.
 
 ## Public webhook proxy
@@ -188,18 +189,74 @@ Health should succeed; both proxy requests should return `404`. Check the blocke
 paths through the public HTTPS address too. razbor verifies deliveries with the
 provider's configured secret.
 
-## Request your first review
+## Review trigger modes
 
-1. Open a pull request or merge request in the connected repository.
-2. From an allowed account, post a new comment with `/agentic_review` on its first
-   line.
-3. Look for a thumbs-up reaction or queued acknowledgement.
-4. Follow queue, execution, and publication status in the razbor console.
-5. Read the summary and inline findings on the pull request.
+Choose a mode in the connection wizard or **Repository → Settings → General**.
+For a file-managed repository, set `reviewTriggerMode` under
+`[repositories.<key>]` and apply the registry.
 
-Opening a pull request posts a greeting without starting a review. For repositories with Codebase Memory enabled, a supported push webhook to the
-indexed branch refreshes the index without requesting a review. Reviews and replies
-use your model and may incur provider charges.
+| Mode                                       | When Razbor queues a review                                                                                                                                                                         |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual (`manual`, default)                 | A permitted user posts a new comment with `/agentic_review` on its first line. Repeat the command for another review.                                                                               |
+| On-demand continuous (`opt_in_continuous`) | The first permitted command queues a review and opts that PR into reviews of subsequent source changes. The opt-in survives restarts. Closing or merging ends it. Reopening requires a new command. |
+| Fully automatic (`automatic`)              | Opening or reopening a ready PR, marking a draft ready, or pushing a new source revision to an open, ready PR can queue a review.                                                                   |
+
+Explicit commands can request another review of the same revision in every
+mode, including on open drafts. Inline replies continue their existing finding
+discussion. If the forge timestamps a command in exactly the same instant as a
+session reset, Razbor queues the explicit review. A later command can activate
+continuous review unambiguously. The PR detail page shows an active opt-in.
+Changing modes ends previous opt-ins. A policy change applies to
+subsequent events and preserves review history. All three modes work with
+source-only and indexed checkouts. Each review can consume inference tokens and
+incur charges from the configured model provider.
+
+GitHub sends `pull_request` actions, including `synchronize` and
+`ready_for_review`. GitLab sends merge request events, including updates with a
+previous source revision or draft transition. Forgejo sends pull request
+lifecycle events and a separate synchronization subscription for source updates.
+Forgejo reports title edits with the resulting draft flag. Renaming an already-ready
+PR at the same recorded revision leaves its review history alone. When Razbor first
+observes a PR through such an edit, a verified ready revision can trigger its first review.
+Razbor verifies the repository and reads the current PR before queueing an
+automatic review. Providers must report draft status for automatic admission.
+A multi-commit push reviews the resulting head against its merge base. Forks are
+fetched from the configured target remote using `refs/pull/<number>/head` on
+GitHub and Forgejo, and `refs/merge-requests/<iid>/head` on GitLab.
+Default-branch push events still refresh enabled indexes.
+
+The delivery ID, trigger, and queue entry are recorded in PostgreSQL. Another
+delivery for a revision already queued, running or completed for that PR does
+not start a second automatic review. Later pushes replace the head and base of
+an unstarted automatic review. If an attempt is running, its revision stays
+pinned and the latest pending revision waits. Manual commands can request an
+additional review. When a review is waiting for a runner, assigning an eligible
+runner and reviewer lets the same review proceed. Before publishing findings,
+Razbor checks the current source and target revisions and any newer published
+decision. If a previously reviewed revision becomes current again, a saved
+result that was safely withheld as stale can be published without another model
+call. A failed delivery that was never accepted can be redelivered from the forge.
+
+Provider references cover
+[GitHub pull request events](https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request),
+[GitLab merge request events](https://docs.gitlab.com/user/project/integrations/webhook_events/#merge-request-events),
+and [Forgejo v15 webhook types](https://codeberg.org/forgejo/forgejo/src/tag/v15.0.0/modules/webhook/type.go).
+
+Follow a queued review in the console. A temporary top-level comment identifies
+the commit while Razbor waits for an eligible runner and reviewer. Once the
+attempt starts, Razbor edits the same comment. The bot needs permission to read,
+create, edit and delete its own issue comments (GitHub and Forgejo) or merge
+request notes (GitLab). Set `RAZBOR_PUBLIC_URL` to the HTTPS console origin
+to include a review-page link. If final publication takes time, the existing
+comment shows that publication is pending. Razbor removes the comment once the
+outbox confirms the result, failure message or stale outcome. The final result, failure messages and discussions remain.
+If the provider is unavailable or a write response is lost, the durable outbox
+retains the state needed to reconcile the bot-owned marker. Restore permissions
+or connectivity if cleanup is pending. An ambiguous create with no visible
+match stays pending because retrying the POST could create a duplicate. A fast review
+may finish before the status worker posts a comment. On explicit repository
+removal, Razbor attempts to clean up before discarding credentials. If that
+attempt fails, the forge may retain the comment.
 
 ## Read the result
 
@@ -253,7 +310,8 @@ review and available discussion. Sender restrictions still apply. Top-level
 comments do not start these conversations.
 
 Replies leave the review and summary unchanged. After fixing an issue or
-discussing a possible false positive, post a new review command. The next review
+discussing a possible false positive, a new review command explicitly requests
+a re-review in any mode. The next review
 checks earlier findings alongside the current changes:
 
 - **Open** and **uncertain** findings stay in the summary.
@@ -273,7 +331,8 @@ the thread. Forgejo leaves it open because its API adapter lacks resolution.
 Summary-only findings are reassessed but have no thread to update.
 
 If base or head commits change before publication, razbor reports a stale review.
-Post the command again for the current revisions.
+A manual command requests a fresh review. Active continuous policies also
+respond to source revision events.
 
 ## Troubleshooting
 

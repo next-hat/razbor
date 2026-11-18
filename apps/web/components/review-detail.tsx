@@ -20,13 +20,14 @@ import { Button } from "@web/components/ui/button.js";
 import { Skeleton } from "@web/components/ui/skeleton.js";
 
 /**
- * Distinguishes API submission from acknowledged or still-pending forge comment
- * requests.
+ * Show how the review was requested and whether a manual command was acknowledged.
  */
 function acknowledgementLabel(
   interaction: Awaited<ReturnType<typeof publicationView>> | undefined,
 ) {
   if (!interaction) return "Submitted through the API";
+  if (interaction.origin === "automatic")
+    return "Triggered automatically by a pull request event";
   return interaction.acknowledged
     ? "Request acknowledged"
     : "Acknowledgement pending";
@@ -179,9 +180,18 @@ export default function ReviewPage({
                 job.interaction?.acknowledgementError) && (
                 <Alert variant="destructive">
                   <AlertDescription>
-                    {job.error ??
+                    {(p?.stale ? p.error : undefined) ??
+                      job.error ??
                       p?.error ??
                       job.interaction?.acknowledgementError}
+                  </AlertDescription>
+                </Alert>
+              )}
+              {isAdmin && job.interaction?.statusCommentError && (
+                <Alert>
+                  <AlertDescription>
+                    Razbor will retry the temporary status comment (
+                    {job.interaction.statusCommentError}).
                   </AlertDescription>
                 </Alert>
               )}
@@ -210,7 +220,7 @@ export default function ReviewPage({
                     , assign this repository to a ready host with free capacity
                     and resume it if drained.
                     {!job.agent &&
-                      " This review has no saved AI reviewer; it needs a runner with a local model connection, or a new review after assigning an AI reviewer."}
+                      " Assign an AI reviewer in repository settings or use a runner with a local model connection. This queued review can then start."}
                   </AlertDescription>
                 </Alert>
               )}
