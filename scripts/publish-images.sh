@@ -16,7 +16,7 @@ Usage: scripts/publish-images.sh [--tag TAG] [--push] [SERVICE ...]
 Build linux/amd64 images for ghcr.io/next-hat/razbor-SERVICE.
 Without --push, load them into the local Docker image store.
 Publishing requires --tag or a nonempty RAZBOR_IMAGE_TAG.
-Services: web indexer runner embeddings postgres migrate (default: all).
+Services: web source indexer runner embeddings postgres-core postgres migrate (default: all).
 Authenticate with docker login ghcr.io before pushing private packages.
 USAGE
 }
@@ -31,7 +31,7 @@ while (($#)); do
       ;;
     --push) output=--push; shift ;;
     --help|-h) usage; exit 0 ;;
-    web|indexer|runner|embeddings|postgres|migrate)
+    web|source|indexer|runner|embeddings|postgres-core|postgres|migrate)
       services+=("$1")
       shift
       ;;
@@ -48,7 +48,7 @@ if [[ $output == --push && $explicit_tag != true ]]; then
   exit 2
 fi
 if ((${#services[@]} == 0)); then
-  services=(web indexer runner embeddings postgres migrate)
+  services=(web source indexer runner embeddings postgres-core postgres migrate)
 fi
 command -v docker >/dev/null || { echo >&2 "Docker is required"; exit 1; }
 docker buildx version >/dev/null
@@ -61,9 +61,15 @@ fi
 for service in "${services[@]}"; do
   image="ghcr.io/next-hat/razbor-$service:$tag"
   echo "Building $image ($output)"
+  dockerfile="$service"
+  target=()
+  case "$service" in
+    source) dockerfile=indexer; target=(--target source) ;;
+    postgres-core) dockerfile=postgres; target=(--target core) ;;
+  esac
   docker buildx build \
     --platform linux/amd64 \
-    --file "$root/docker/$service.Dockerfile" \
+    --file "$root/docker/$dockerfile.Dockerfile" "${target[@]}" \
     --tag "$image" \
     --build-arg "VERSION=$tag" \
     --build-arg "REVISION=$revision" \

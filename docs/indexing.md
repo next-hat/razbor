@@ -1,8 +1,18 @@
 # Repository indexing and search
 
-The indexer clones registered repositories and builds searchable code and
-documentation indexes. Reviews use them to find related code, then verify the
-exact source revisions under review.
+Every review gets an attempt-scoped Git checkout pinned to its base and head.
+The private Git source service runs under the existing `indexer` service name.
+With **Codebase Memory** enabled it also maintains a searchable branch index.
+Turn the setting on or off when connecting a repository or under **Repository
+Settings → General**. A file-managed repository reads `codebaseMemoryEnabled`
+from its registry table when you reapply the registry. The default is true.
+
+Disabling the setting stops new index work and hides index tools for subsequent
+attempts. Existing indexed attempts retain their leased revision, and stored
+indexes can be reused when indexing is enabled again. The separate
+`indexing.persistent` flag still controls advance provisioning versus on-demand
+indexing for enabled file-managed repositories. See [source-only deployment](deployment.md#deploy-without-codebase-memory)
+for the service configuration.
 
 An index follows the configured branch, usually the default branch. It does not
 include local uncommitted changes or create a graph for each pull request.
@@ -21,7 +31,7 @@ bash scripts/provision-cbm.sh "$RAZBOR_CBM_BUNDLE"
 ```
 
 Use the same path in `.env`. The script verifies the download, and the service
-checks the executable and version at startup. Updates are explicit.
+checks the executable and version when opening an index. Updates are explicit.
 
 Keep `RAZBOR_INDEX_DATA` outside the checkout. It holds private Git checkouts and
 graph files; do not use it as a developer worktree or share it between independent

@@ -8,6 +8,11 @@ Metadata:
   Name: Razbor platform
   About: PostgreSQL, migrations, embeddings, indexer and web UI on one Nanocl node.
 
+Args:
+  - Name: source-only
+    Kind: Boolean
+    Description: Run Git source preparation without Codebase Memory or embeddings.
+
 # Use independent credentials for bootstrap, migrations and runtime access.
 # Runtime containers never receive bootstrap or migration credentials.
 Secrets:
@@ -23,6 +28,7 @@ Secrets:
     Kind: nanocl.io/env
     Data:
       - RAZBOR_MIGRATION_DATABASE_URL=postgresql://razbor_migrator:__DB_MIGRATION_PASSWORD__@razbor-postgres:5432/razbor
+      - 'RAZBOR_MIGRATE_EMBEDDINGS={% if Args["source-only"] %}false{% else %}true{% endif %}'
   - Name: razbor-platform.web
     Kind: nanocl.io/env
     Data:
@@ -35,11 +41,13 @@ Secrets:
     Data:
       - RAZBOR_DATABASE_URL=postgresql://razbor_runtime:__DB_RUNTIME_PASSWORD__@razbor-postgres:5432/razbor
       - RAZBOR_INDEX_MANAGEMENT_TOKEN=__INDEX_MANAGEMENT_TOKEN__
+      # {% unless Args["source-only"] %}
       - RAZBOR_EMBEDDINGS_TOKEN=__EMBEDDINGS_TOKEN__
   - Name: razbor-platform.embeddings
     Kind: nanocl.io/env
     Data:
       - EMBEDDINGS_TOKEN=__EMBEDDINGS_TOKEN__
+# {% endunless %}
 
 # Nanocl starts Cargoes in declaration order. InitContainers gate application
 # startup; these are not Jobs, which state apply starts without awaiting success.
@@ -50,7 +58,7 @@ Cargoes:
     Hostname: razbor-postgres
     Containers:
       - Name: postgres
-        Image: ghcr.io/next-hat/razbor-postgres:0.1.0
+        Image: 'ghcr.io/next-hat/razbor-postgres{% if Args["source-only"] %}-core{% endif %}:0.2.0'
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.postgres]
         StopTimeout: 45
@@ -69,13 +77,14 @@ Cargoes:
             Type: json-file
             Config: { max-size: 10m, max-file: "3" }
 
+  # {% unless Args["source-only"] %}
   - Name: razbor-embeddings
     Replicas: 1
     NetworkMode: razbor-platform
     Hostname: razbor-embeddings
     Containers:
       - Name: embeddings
-        Image: ghcr.io/next-hat/razbor-embeddings:0.1.0
+        Image: ghcr.io/next-hat/razbor-embeddings:0.2.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.embeddings]
         Env: [EMBEDDINGS_CPU_THREADS=4]
@@ -102,13 +111,14 @@ Cargoes:
             Type: json-file
             Config: { max-size: 10m, max-file: "3" }
 
+  # {% endunless %}
   - Name: razbor-web
     Replicas: 1
     NetworkMode: razbor-platform
     Hostname: razbor-web
     InitContainers:
       - Name: migrate
-        Image: ghcr.io/next-hat/razbor-migrate:0.1.0
+        Image: ghcr.io/next-hat/razbor-migrate:0.2.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.migrations]
         HostConfig:
@@ -119,7 +129,7 @@ Cargoes:
           PidsLimit: 128
     Containers:
       - Name: web
-        Image: ghcr.io/next-hat/razbor-web:0.1.0
+        Image: ghcr.io/next-hat/razbor-web:0.2.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.web]
         Env:
@@ -157,7 +167,7 @@ Cargoes:
     Hostname: razbor-indexer
     InitContainers:
       - Name: configure
-        Image: ghcr.io/next-hat/razbor-migrate:0.1.0
+        Image: ghcr.io/next-hat/razbor-migrate:0.2.0
         ImagePullSecret: registry.ghcr.io
         User: "0:0"
         Entrypoint: [node, --input-type=module, -e]
@@ -175,6 +185,7 @@ Cargoes:
             sync_ms = 60000
             max_reviews = 8
 
+            # {% unless Args["source-only"] %}
             [memory]
             executable = "/cbm/codebase-memory-mcp"
             mode = "full"
@@ -189,6 +200,7 @@ Cargoes:
             request_ms = 60000
             index_ms = 3600000
             max_chunks = 20000
+            # {% endunless %}
             `);
             chmodSync('/index-config/indexer.toml', 0o644);
             chownSync('/index-data', 1000, 1000);
@@ -203,7 +215,7 @@ Cargoes:
           NanoCpus: 1000000000
           PidsLimit: 64
       - Name: wait-schema
-        Image: ghcr.io/next-hat/razbor-migrate:0.1.0
+        Image: ghcr.io/next-hat/razbor-migrate:0.2.0
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.migrations]
         Cmd: [--wait-schema]
@@ -215,7 +227,7 @@ Cargoes:
           PidsLimit: 128
     Containers:
       - Name: indexer
-        Image: ghcr.io/next-hat/razbor-indexer:0.1.0
+        Image: 'ghcr.io/next-hat/razbor-{% if Args["source-only"] %}source{% else %}indexer{% endif %}:0.2.0'
         ImagePullSecret: registry.ghcr.io
         Secrets: [razbor-platform.indexer]
         Cmd: [--config, /index-config/indexer.toml]

@@ -56,12 +56,22 @@ process.once("SIGINT", stop);
 process.once("SIGTERM", stop);
 
 try {
+  const baseUrl = process.env.LLM_BASE_URL ?? "http://127.0.0.1:8080/v1";
+  const provider = modelProviderSchema.parse(
+    process.env.LLM_PROVIDER ?? "openai",
+  );
+  // Only use the OpenAI account key for its own API. Relays supply LLM_API_KEY.
+  const openaiKey =
+    provider === "openai" &&
+    baseUrl.replace(/\/$/, "") === "https://api.openai.com/v1"
+      ? process.env.OPENAI_API_KEY
+      : undefined;
   const result = reviewResultSchema.parse(
     await reviewRepository(job.repository, job.base, job.head, {
-      baseUrl: process.env.LLM_BASE_URL ?? "http://127.0.0.1:8080/v1",
+      baseUrl,
       model: process.env.LLM_MODEL ?? "gpt-oss-20b",
-      apiKey: process.env.LLM_API_KEY ?? "local",
-      provider: modelProviderSchema.parse(process.env.LLM_PROVIDER ?? "openai"),
+      apiKey: process.env.LLM_API_KEY ?? openaiKey ?? "local",
+      provider,
       reasoningEffort: reasoningEffortSchema.parse(
         process.env.LLM_REASONING_EFFORT ?? "high",
       ),

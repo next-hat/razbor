@@ -11,23 +11,23 @@ pnpm run format:check
 ```
 
 If pnpm is unavailable, use `npx --yes pnpm@12.11.2` in its place. `pnpm test`
-runs the lightweight capability suite. Run the other suites for the area you
+runs the lightweight capability and registry compatibility checks. Run the other suites for the area you
 changed; integration and smoke checks are separate commands.
 
 ## Local checks
 
 These suites need no Docker, database, model credentials, or live forge.
 
-| Command                                     | Coverage                                                                                       | Extra requirements                             |
-| ------------------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| `pnpm test` or `pnpm run test:capabilities` | Skills, file/output limits, MCP validation, runner instructions                                | Node 24 and Git                                |
-| `pnpm run test:review`                      | Autonomous loop, compaction, budgets, relay retry policy, cumulative progress, offline scoring | Temporary Git repositories and child processes |
-| `pnpm run test:diff`                        | Diff pagination, pinned source reads, cancellation, usage reporting                            | Temporary Git repositories and child processes |
-| `pnpm run test:verification`                | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
-| `pnpm run test:persistence:unit`            | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
-| `pnpm run test:presentation`                | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
-| `pnpm run test:release`                     | Explicit image publication tags and local-load defaults                                        | Bash; temporary fake Docker/Git, no daemon     |
-| `pnpm run test:coverage`                    | The default suite with a coverage report                                                       | No additional requirements                     |
+| Command                          | Coverage                                                                                       | Extra requirements                             |
+| -------------------------------- | ---------------------------------------------------------------------------------------------- | ---------------------------------------------- |
+| `pnpm test`                      | Skills, file/output limits, MCP validation, runner instructions and legacy registry defaults   | Node 24 and Git                                |
+| `pnpm run test:review`           | Autonomous loop, compaction, budgets, relay retry policy, cumulative progress, offline scoring | Temporary Git repositories and child processes |
+| `pnpm run test:diff`             | Diff pagination, pinned source reads, cancellation, usage reporting                            | Temporary Git repositories and child processes |
+| `pnpm run test:verification`     | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
+| `pnpm run test:persistence:unit` | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
+| `pnpm run test:presentation`     | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
+| `pnpm run test:release`          | Explicit image publication tags and local-load defaults                                        | Bash; temporary fake Docker/Git, no daemon     |
+| `pnpm run test:coverage`         | The default suite with a coverage report                                                       | No additional requirements                     |
 
 Run a spec or select tests by name:
 
@@ -41,7 +41,7 @@ replace DNS and HTTP/HTTPS locally; provider tests use local HTTP fixtures.
 Fixtures clean up their temporary repositories, processes, environment changes,
 and mocks.
 
-Presentation checks cover text, Markdown safety, source links, and rendered HTML.
+Presentation checks cover text, Markdown safety, source links, rendered HTML, and disabled repository indexes with stale preparation errors.
 Check layout, clipboard actions, disclosures, keyboard navigation, and both themes
 in a browser.
 
@@ -121,12 +121,20 @@ on Docker bridge addresses, as with a local Linux Docker installation.
 docker pull postgres:17-alpine
 pnpm run test:persistence
 pnpm run test:comments
+pnpm run test:broker
 ```
 
 | Command                     | Coverage                                                                                                                 |
 | --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion          |
 | `pnpm run test:comments`    | Commands, webhook HMAC, deduplication, hook setup, acknowledgement fallback, Forgejo publication against a local fixture |
+
+The broker suite uses pg-boss and enrolled runner sessions, with a controlled
+loopback source service. It checks indexed and source-only assignments across a
+repository setting change, source forwarding, attempt tokens, the private index
+MCP endpoint and independent durable memory, without a model endpoint. Database
+regressions cover file ownership, legacy defaults, attempt snapshots and index
+token authorization.
 
 The fixture creates PostgreSQL migration and restricted runtime roles, including
 the pg-boss schema. Comment tests use local sockets and never contact a real forge
@@ -141,7 +149,7 @@ replies, or the full repeat-review flow. See [reviews and webhooks](../docs/comm
 Use disposable provider data and a running Razbor instance. You need an admin
 session, permission to create and install a private GitHub App, a test repository,
 and a public HTTPS webhook callback. The console return URL may be local if your
-signed-in browser can reach it. Full reviews also need an agent, ready index, and
+signed-in browser can reach it. Full reviews also need an agent, any enabled index, and
 assigned runner.
 
 - Create and install an App through the console. Check cancellation, expired or
@@ -164,9 +172,16 @@ the local suites.
 
 ## Indexer integration
 
-This suite uses Codebase Memory, Git, PostgreSQL, local sockets, and temporary
-repositories. It covers fetching, refresh, revision boundaries, token expiry and
-revocation, dirty checkouts, divergence recovery, and cleanup.
+Both cases run the service against local bare Git repositories and a disposable
+PostgreSQL database. The source-only case needs Git, Docker, local sockets and
+`postgres:17-alpine`. It imports the pinned base and feature-branch commits through the runner
+checkout path and checks attempt authorization, lease expiry and removal. It also
+checks that stale Git policies and invalid or symlinked index directories cannot
+block source preparation or cause cleanup to delete unrelated files. The fixture
+runs without a graph binary, vector extension or embedding endpoint.
+
+The indexed case also exercises fetching, refresh, pinned graph access,
+revocation, dirty checkouts, divergence recovery and cleanup.
 
 Provision the pinned v0.11.0 bundle using the [indexing guide](../docs/indexing.md):
 
@@ -175,8 +190,8 @@ export RAZBOR_CBM_BUNDLE=/absolute/path/to/codebase-memory-bundle
 CBM_EXECUTABLE="$RAZBOR_CBM_BUNDLE/codebase-memory-mcp" pnpm run test:indexer
 ```
 
-Docker and `postgres:17-alpine` are also required. The spec skips without
-`CBM_EXECUTABLE`; report that as skipped. It uses its own database and source
+Docker and `postgres:17-alpine` are also required. Only the indexed case skips without
+`CBM_EXECUTABLE`. It uses its own database and source
 directory, reads no live credentials, and does not enable embeddings.
 
 ## Kata runner smoke check

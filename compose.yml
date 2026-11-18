@@ -25,7 +25,7 @@ services:
     volumes:
       - razbor_embedding_models:/models:ro
     environment:
-      EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:?Set the embedding service token in .env}
+      EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:-}
       EMBEDDINGS_CPU_THREADS: "2"
     healthcheck:
       test:
@@ -175,19 +175,17 @@ services:
       - razbor_node_modules:/workspace/node_modules:ro
       - ${RAZBOR_INDEX_CONFIG:-./config/indexer.example.toml}:/index-config/indexer.toml:ro
       - ${RAZBOR_INDEX_DATA:?Set a persistent absolute index data path}:/index-data
-      - ${RAZBOR_CBM_BUNDLE:?Set the pinned Codebase Memory bundle directory}:/cbm:ro
+      - ${RAZBOR_CBM_BUNDLE:-${HOME}/.local/share/razbor/cbm}:/cbm:ro
       - ${RAZBOR_FORGEJO_TOKEN_FILE:-./config/razbor.forgejo.token}:/forge-secrets/razbor.forgejo.token:ro
     environment:
       RAZBOR_DATABASE_URL: postgresql://razbor_runtime:${RAZBOR_DB_RUNTIME_PASSWORD:?Set runtime database password}@postgres:5432/razbor
       RAZBOR_INDEX_MANAGEMENT_TOKEN: ${RAZBOR_INDEX_MANAGEMENT_TOKEN:-}
-      RAZBOR_EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:?Set the embedding service token in .env}
+      RAZBOR_EMBEDDINGS_TOKEN: ${RAZBOR_EMBEDDINGS_TOKEN:-}
     networks:
       control: {}
       database: {}
       embeddings: {}
     depends_on:
-      embeddings:
-        condition: service_healthy
       migrate:
         condition: service_completed_successfully
       postgres:

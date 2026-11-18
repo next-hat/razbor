@@ -118,6 +118,7 @@ export function RepositoryWizard({
   const [callbackBase, setCallbackBase] = useState("");
   const [senders, setSenders] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
+  const [codebaseMemoryEnabled, setCodebaseMemoryEnabled] = useState(true);
   const [verified, setVerified] = useState<VerifiedRepository>();
   const [created, setCreated] = useState<{
     id: string;
@@ -249,6 +250,7 @@ export function RepositoryWizard({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...connectionInput(),
+            codebaseMemoryEnabled,
             ...(agentId ? { agentId } : {}),
             callbackBase: selectedCallback.trim(),
             ...(forgeType === "github" && !usesGithubApp
@@ -604,6 +606,27 @@ export function RepositoryWizard({
                   }
                 />
                 <Field>
+                  <Field orientation="horizontal">
+                    <input
+                      id="repository-codebase-memory"
+                      type="checkbox"
+                      checked={codebaseMemoryEnabled}
+                      onChange={(event) =>
+                        setCodebaseMemoryEnabled(event.target.checked)
+                      }
+                      aria-describedby="repository-codebase-memory-description"
+                      className="size-4 accent-primary"
+                    />
+                    <FieldLabel htmlFor="repository-codebase-memory">
+                      Enable Codebase Memory
+                    </FieldLabel>
+                  </Field>
+                  <FieldDescription id="repository-codebase-memory-description">
+                    Index this repository for graph navigation and semantic
+                    search. Reviews always receive the full checkout.
+                  </FieldDescription>
+                </Field>
+                <Field>
                   <FieldLabel htmlFor="repository-senders">
                     Who can request reviews?
                   </FieldLabel>
@@ -674,7 +697,13 @@ export function RepositoryWizard({
                       : []),
                     ["Repository", verified?.fullPath ?? repositoryUrl],
                     ["Bot account", verified?.botLogin],
-                    ["Index branch", verified?.branch],
+                    [
+                      "Codebase Memory",
+                      codebaseMemoryEnabled ? "Enabled" : "Disabled",
+                    ],
+                    ...(codebaseMemoryEnabled
+                      ? [["Index branch", verified?.branch]]
+                      : []),
                     [
                       "AI reviewer",
                       agentId
@@ -696,10 +725,12 @@ export function RepositoryWizard({
                 <Alert>
                   <AlertDescription>
                     {usesGithubApp
-                      ? "Connecting uses your installed GitHub App and starts indexing."
+                      ? "Connecting uses your installed GitHub App."
                       : forgeType === "github"
-                        ? "Connecting saves the bot token and starts indexing. Next, copy the webhook URL and generated secret into GitHub."
-                        : "Connecting saves the bot token, configures the webhook, and starts indexing. You can then copy the generated webhook secret."}{" "}
+                        ? "Connecting saves the bot token. Next, copy the webhook URL and generated secret into GitHub."
+                        : "Connecting saves the bot token and configures the webhook. You can then copy the generated webhook secret."}{" "}
+                    {codebaseMemoryEnabled &&
+                      "Indexing starts in the background. "}
                     {canManageRunners
                       ? "You can set up a runner after connecting."
                       : "A super admin manages runner assignments."}

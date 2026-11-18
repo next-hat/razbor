@@ -35,13 +35,18 @@ export PGDATABASE="${database_fields[2]}" PGUSER="${database_fields[3]}"
 export PGPASSWORD="${database_fields[4]}"
 export PGCONNECT_TIMEOUT=5
 
+embeddings="${RAZBOR_MIGRATE_EMBEDDINGS:-true}"
+case "$embeddings" in true|false) ;; *) echo >&2 "Invalid RAZBOR_MIGRATE_EMBEDDINGS"; exit 2 ;; esac
+
 if [[ "$mode" == --wait-schema ]]; then
   # Drizzle records SHA-256 hashes of the SQL files in its existing journals.
-  # Waiting for both current hashes also gates upgrades, not just fresh installs.
-  hashes="$(node --input-type=module <<'JS'
+  # Check each enabled migration journal, including during upgrades.
+  hashes="$(node --input-type=module - "$embeddings" <<'JS'
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-for (const directory of ['migrations', 'embedding-migrations']) {
+const directories = ['migrations'];
+if (process.argv[2] === 'true') directories.push('embedding-migrations');
+for (const directory of directories) {
   const root = `packages/database/${directory}`;
   const journal = JSON.parse(readFileSync(`${root}/meta/_journal.json`, 'utf8'));
   const tag = journal.entries.at(-1).tag;
@@ -51,7 +56,12 @@ JS
   )"
   base_hash="${hashes%%$'\n'*}"
   embedding_hash="${hashes##*$'\n'}"
-  readiness="SELECT EXISTS (SELECT 1 FROM drizzle.__drizzle_migrations WHERE hash='$base_hash') AND EXISTS (SELECT 1 FROM drizzle.__drizzle_embeddings_migrations WHERE hash='$embedding_hash');"
+  readiness="SELECT EXISTS (SELECT 1 FROM drizzle.__drizzle_migrations WHERE hash='$base_hash')"
+  if [[ "$embeddings" == true ]]; then
+    readiness+=" AND EXISTS (SELECT 1 FROM drizzle.__drizzle_embeddings_migrations WHERE hash='$embedding_hash')"
+  fi
+elif [[ "$embeddings" == false ]]; then
+  readiness="SELECT true"
 else
   readiness="SELECT EXISTS (SELECT 1 FROM pg_extension e JOIN pg_namespace n ON n.oid=e.extnamespace WHERE e.extname='vector' AND n.nspname='public');"
 fi
@@ -68,4 +78,6 @@ done
 
 if [[ "$mode" == --wait-schema ]]; then exit 0; fi
 node --import=tsx scripts/manage.ts database migrate
-exec node --import=tsx scripts/manage.ts database migrate-embeddings
+if [[ "$embeddings" == true ]]; then
+  exec node --import=tsx scripts/manage.ts database migrate-embeddings
+fi

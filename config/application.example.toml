@@ -20,6 +20,10 @@ web_url = "https://forgejo.example.com"
 credential = { file = "/forge-secrets/razbor.forgejo.token" }
 
 # Plain Git remains supported without a hosted forge binding.
+[repositories.razbor]
+# Set false for Git-only reviews, including when indexing.persistent is true.
+codebaseMemoryEnabled = true
+
 [repositories.razbor.indexing]
 owner = "local-indexer"
 persistent = true

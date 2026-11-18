@@ -27,11 +27,11 @@ RUN test "$TARGETARCH" = amd64 \
 COPY scripts/provision-cbm.sh /tmp/provision-cbm.sh
 RUN bash /tmp/provision-cbm.sh /cbm
 
-FROM node:${NODE_VERSION}-bookworm-slim AS runtime
+FROM node:${NODE_VERSION}-bookworm-slim AS source
 ARG VERSION=0.1.0
 ARG REVISION=unknown
-LABEL org.opencontainers.image.title="razbor-indexer" \
-      org.opencontainers.image.description="Razbor repository indexing with pinned Codebase Memory" \
+LABEL org.opencontainers.image.title="razbor-source" \
+      org.opencontainers.image.description="Razbor revision-pinned Git source service" \
       org.opencontainers.image.source="https://github.com/next-hat/razbor" \
       org.opencontainers.image.url="https://github.com/next-hat/razbor" \
       org.opencontainers.image.version="${VERSION}" \
@@ -47,8 +47,12 @@ COPY --from=dependencies /workspace ./
 COPY tsconfig.json tsconfig.base.json ./
 COPY apps/indexer/src apps/indexer/src
 COPY packages packages
-COPY --from=memory /cbm /cbm
 USER node
 EXPOSE 8790
 ENTRYPOINT ["node", "--import=tsx", "apps/indexer/src/index.ts"]
 CMD ["--config", "/index-config/indexer.toml"]
+
+FROM source AS runtime
+LABEL org.opencontainers.image.title="razbor-indexer" \
+      org.opencontainers.image.description="Razbor Git source and Codebase Memory"
+COPY --from=memory /cbm /cbm

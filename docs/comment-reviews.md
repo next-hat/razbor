@@ -197,8 +197,8 @@ provider's configured secret.
 4. Follow queue, execution, and publication status in the razbor console.
 5. Read the summary and inline findings on the pull request.
 
-Opening a pull request posts a greeting without starting a review. A push to the
-indexing branch refreshes the index without requesting one. Reviews and replies
+Opening a pull request posts a greeting without starting a review. For repositories with Codebase Memory enabled, a supported push webhook to the
+indexed branch refreshes the index without requesting a review. Reviews and replies
 use your model and may incur provider charges.
 
 ## Read the result

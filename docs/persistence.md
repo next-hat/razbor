@@ -48,7 +48,8 @@ To apply pending migrations manually:
 docker compose run --rm migrate
 ```
 
-This applies base SQL, pg-boss schema setup, and embedding migrations. The
+This applies base SQL and pg-boss schema setup. The indexed Compose deployment
+also applies embedding migrations. The
 migration role manages schemas; the runtime role only accesses data. Use the
 checked-in migrations rather than a schema push or reset. Back up before
 upgrades and stop old workers before changing their dependencies or protocol.

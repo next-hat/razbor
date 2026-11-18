@@ -102,3 +102,25 @@ test("local image loads retain their template tag without publishing", async (t)
     "ghcr.io/next-hat/razbor-web:0.1.0",
   );
 });
+
+test("source-only release targets exclude the graph bundle and vector extension", async (t) => {
+  const f = await fixture(t);
+  const result = await f.run(["source", "postgres-core"]);
+  assert.equal(result.status, 0, result.stderr);
+  const builds = result.docker.slice(1);
+  assert.deepEqual(
+    builds.map((args) => [
+      path.basename(args[args.indexOf("--file") + 1]),
+      args[args.indexOf("--target") + 1],
+      args[args.indexOf("--tag") + 1],
+    ]),
+    [
+      ["indexer.Dockerfile", "source", "ghcr.io/next-hat/razbor-source:0.1.0"],
+      [
+        "postgres.Dockerfile",
+        "core",
+        "ghcr.io/next-hat/razbor-postgres-core:0.1.0",
+      ],
+    ],
+  );
+});

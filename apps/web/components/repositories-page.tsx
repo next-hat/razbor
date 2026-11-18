@@ -122,11 +122,12 @@ export function RepositoriesPage({
   const query = search.trim().toLowerCase();
   const metrics: Record<string, RepositoryCardMetrics> = {};
   for (const repository of data ?? []) {
-    const index = canReadIndexes
-      ? indexes.data?.projects.find(
-          (entry) => entry.repositoryId === repository.id,
-        )
-      : undefined;
+    const index =
+      canReadIndexes && repository.codebaseMemoryEnabled
+        ? indexes.data?.projects.find(
+            (entry) => entry.repositoryId === repository.id,
+          )
+        : undefined;
     metrics[repository.id] = {
       pullRequests: pullRequests.data?.filter(
         (entry) =>
@@ -160,7 +161,9 @@ export function RepositoriesPage({
       : undefined
     : data?.filter(
         (repository) =>
-          repository.status === "active" && repository.setupState === "ready",
+          repository.status === "active" &&
+          repository.codebaseMemoryEnabled &&
+          repository.setupState === "ready",
       ).length;
   const lastIndexed = data?.reduce<string | undefined>((latest, repository) => {
     const date = metrics[repository.id]?.indexedAt;

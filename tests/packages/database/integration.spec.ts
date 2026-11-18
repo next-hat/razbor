@@ -25,6 +25,14 @@ import {
   tokenHash,
   listTokens,
   pendingDispatches,
+  updateRepositoryCodebaseMemory,
+  createRepositoryFromUi,
+  createReviewWorkspace,
+  createIndexToken,
+  listIndexProjects,
+  pendingRepositoryIndexes,
+  repositoryIndexSetup,
+  workspaceState,
 } from "@razbor/database";
 import {
   registrySchema,
@@ -35,6 +43,239 @@ import { importLegacy } from "@razbor/database/legacy";
 import { createQueue, dispatchPending } from "@razbor/queue";
 
 import { databaseFixture } from "@tests/packages/database/fixture.js";
+
+test("repository settings fence index grants while preserving an active attempt's source and index policy", async (t) => {
+  const fixture = await databaseFixture();
+  const db = fixture.database;
+  const owner = "fixture";
+  const revision = { baseSha: "a".repeat(40), headSha: "b".repeat(40) };
+  const root = "/fixture/data";
+  try {
+    const config = registrySchema.parse({
+      registry: { key: "ui" },
+      repositories: {
+        project: {
+          git: {
+            branch: "main",
+            upstream: "refs/remotes/origin/main",
+            remotes: { origin: "https://example.invalid/repo.git" },
+          },
+          indexing: { owner },
+        },
+      },
+    });
+    await applyRegistry(db, config);
+    const [repo] = await listRepositories(db);
+    assert.equal(repo.codebaseMemoryEnabled, true);
+    assert.equal(repo.codebaseMemoryEditable, false);
+    await assert.rejects(
+      updateRepositoryCodebaseMemory(db, repo.id, {
+        codebaseMemoryEnabled: false,
+      }),
+      /registry file/,
+    );
+    await ensureDevelopmentWorkspaces(db, owner, root);
+    const [workspace] = await ownedWorkspaces(db, owner);
+    const grant = await createIndexToken(db, workspace.id, true);
+    const request = { repositoryId: repo.id, ...revision };
+    const indexedReview = await submitReview(db, request);
+    const indexed = await beginAttempt(db, indexedReview.id, owner, 60000);
+    assert.ok(indexed.kind === "started" && indexed.codebaseMemoryEnabled);
+    const queued = await submitReview(db, request);
+    config.repositories.project.codebaseMemoryEnabled = false;
+    await applyRegistry(db, config);
+    const [project] = await listIndexProjects(db, repo.id);
+    assert.deepEqual(
+      [
+        project.state,
+        project.indexedAt,
+        project.headSha,
+        project.canCreateToken,
+      ],
+      ["disabled", null, null, false],
+    );
+    assert.deepEqual(await pendingRepositoryIndexes(db, owner), []);
+    await assert.rejects(authorizeHash(db, tokenHash(grant.token), owner));
+    await assert.rejects(createIndexToken(db, workspace.id, false));
+    await assert.rejects(ensureDevelopmentWorkspaces(db, owner, root, repo.id));
+    const lease = {
+      ...request,
+      reviewId: indexedReview.id,
+      attemptId: indexed.attemptId,
+      ttlMs: 60000,
+    };
+    const pinned = await createReviewWorkspace(db, owner, root, lease);
+    assert.equal(pinned.codebaseMemoryEnabled, true);
+    // The shared graph tracks its own branch, which can be behind the PR head.
+    await workspaceState(
+      db,
+      owner,
+      pinned.id,
+      "ready",
+      revision.headSha,
+      undefined,
+      revision.baseSha,
+    );
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "indexing"),
+      false,
+    );
+    await ensureDevelopmentWorkspaces(
+      db,
+      owner,
+      root,
+      repo.id,
+      indexed.attemptId,
+    );
+    assert.equal(
+      await repositoryIndexSetup(
+        db,
+        owner,
+        repo.id,
+        "indexing",
+        undefined,
+        pinned.git,
+        indexed.attemptId,
+      ),
+      true,
+    );
+    assert.equal((await getRepository(db, repo.id))!.setupState, "ready");
+    const source = await beginAttempt(db, queued.id, owner, 60000);
+    assert.ok(source.kind === "started" && !source.codebaseMemoryEnabled);
+    await assert.rejects(
+      ensureDevelopmentWorkspaces(db, owner, root, repo.id, source.attemptId),
+    );
+    await finishAttempt(db, indexedReview.id, indexed.attemptId, owner, {
+      summary: "Fixture complete",
+      findings: [],
+    });
+    await assert.rejects(
+      ensureDevelopmentWorkspaces(db, owner, root, repo.id, indexed.attemptId),
+    );
+    config.repositories.project.codebaseMemoryEnabled = true;
+    await applyRegistry(db, config);
+    assert.deepEqual(await pendingRepositoryIndexes(db, owner), [
+      { id: repo.id },
+    ]);
+    const checkout = await createReviewWorkspace(db, owner, root, {
+      ...lease,
+      reviewId: queued.id,
+      attemptId: source.attemptId,
+    });
+    assert.equal(checkout.codebaseMemoryEnabled, false);
+    await workspaceState(
+      db,
+      owner,
+      checkout.id,
+      "ready",
+      revision.headSha,
+      undefined,
+      null,
+    );
+    await assert.rejects(
+      workspaceState(
+        db,
+        owner,
+        workspace.id,
+        "ready",
+        revision.headSha,
+        undefined,
+        null,
+      ),
+    );
+    await assert.rejects(
+      workspaceState(
+        db,
+        owner,
+        workspace.id,
+        "ready",
+        revision.headSha,
+        undefined,
+        revision.baseSha,
+      ),
+    );
+    // An existing index with stale Git policy stays fenced when unrelated
+    // workspaces are provisioned at source-service startup.
+    config.repositories.project.git.remotes.origin =
+      "https://example.invalid/moved.git";
+    config.repositories.another = structuredClone(config.repositories.project);
+    await applyRegistry(db, config);
+    await ensureDevelopmentWorkspaces(db, owner, root);
+    assert.equal(
+      (await ownedWorkspaces(db, owner)).filter((item) => !item.temporary)
+        .length,
+      2,
+    );
+    await assert.rejects(
+      ensureDevelopmentWorkspaces(db, owner, root, repo.id),
+      /policy changed/,
+    );
+    const repositoryUrl = "https://forge.invalid/team/ui";
+    const providerResponses = new Map<string, unknown>([
+      ["/api/v3/user", { id: 1, login: "fixture" }],
+      [
+        "/api/v3/repos/team/ui",
+        {
+          id: 2,
+          full_name: "team/ui",
+          html_url: repositoryUrl,
+          default_branch: "main",
+          private: true,
+          archived: false,
+          clone_url: `${repositoryUrl}.git`,
+        },
+      ],
+      [
+        "/api/v3/repos/team/ui/branches/main",
+        { name: "main", commit: { sha: revision.headSha } },
+      ],
+    ]);
+    t.mock.method(globalThis, "fetch", async (url: URL) => {
+      assert.equal(url.origin, "https://forge.invalid");
+      assert.ok(providerResponses.has(url.pathname));
+      return Response.json(providerResponses.get(url.pathname));
+    });
+    const created = await createRepositoryFromUi(db, {
+      forgeType: "github",
+      webhookMode: "manual",
+      repositoryUrl,
+      accessToken: "local-test-credential",
+      permittedSenders: ["fixture"],
+      callbackBase: "https://razbor.invalid",
+      codebaseMemoryEnabled: false,
+    });
+    assert.equal(created.codebaseMemoryEnabled, false);
+    assert.equal(created.setupState, "ready");
+    await assert.rejects(
+      updateRepositoryCodebaseMemory(
+        db,
+        created.id,
+        { codebaseMemoryEnabled: true },
+        "ctx_ABCDEFGHIJKLMNOP",
+      ),
+    );
+    await assert.rejects(
+      updateRepositoryCodebaseMemory(db, created.id, {
+        codebaseMemoryEnabled: "false",
+      }),
+    );
+    const saved = await updateRepositoryCodebaseMemory(db, created.id, {
+      codebaseMemoryEnabled: true,
+    });
+    assert.ok(saved?.codebaseMemoryEditable && saved.codebaseMemoryEnabled);
+    assert.equal(saved.setupState, "pending");
+    assert.equal(
+      (
+        await updateRepositoryCodebaseMemory(db, created.id, {
+          codebaseMemoryEnabled: false,
+        })
+      )?.setupState,
+      "ready",
+    );
+  } finally {
+    await fixture.close();
+  }
+});
 
 test(
   "durable identities, migration, scope, recovery and no UUID leakage with PostgreSQL/pg-boss",

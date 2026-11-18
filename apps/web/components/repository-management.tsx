@@ -36,9 +36,14 @@ const setupLabels = {
   error: "Setup needs attention",
 };
 
-type RepositoryAction = "setup" | "token" | "delete";
+type RepositoryAction = "setup" | "token" | "memory" | "delete";
 
-const actionMethods = { setup: "POST", token: "PATCH", delete: "DELETE" };
+const actionMethods = {
+  setup: "POST",
+  token: "PATCH",
+  memory: "PATCH",
+  delete: "DELETE",
+};
 
 const setupDescriptions = {
   pending: "Repository registered. Webhook and index setup are pending.",
@@ -48,15 +53,17 @@ const setupDescriptions = {
 };
 
 /**
- * Builds only the fields needed for token replacement, deletion confirmation, or setup
- * retry.
+ * Builds the strict payload for the selected repository mutation.
  */
 function repositoryUpdateBody(
   action: RepositoryAction,
   accessToken: string,
   confirmation: string,
+  repository: Repository,
 ) {
   if (action === "token") return { accessToken: accessToken.trim() };
+  if (action === "memory")
+    return { codebaseMemoryEnabled: !repository.codebaseMemoryEnabled };
   if (action === "delete") return { confirmation };
   return {};
 }
@@ -93,7 +100,9 @@ export function RepositoryManagement({
   const [confirmation, setConfirmation] = useState("");
   const deleting = repository?.status === "deleting";
   const repositoryName = repository?.selector ?? repository?.configKey ?? "";
-  const setupState = repository?.setupState;
+  const setupState = repository?.codebaseMemoryEnabled
+    ? repository.setupState
+    : undefined;
   const status = repository?.status;
 
   useEffect(() => {
@@ -169,6 +178,7 @@ export function RepositoryManagement({
               action,
               accessToken,
               deleting ? repositoryName : confirmation,
+              repository,
             ),
           ),
         },
@@ -192,6 +202,10 @@ export function RepositoryManagement({
         setAccessToken("");
         setTokenOpen(false);
         setMessage("Access token replaced.");
+      }
+      if (action === "memory") {
+        setRepository(result as Repository);
+        return;
       }
       const updated = await fetch(`/api/repositories/${id}`, {
         cache: "no-store",
@@ -249,28 +263,42 @@ export function RepositoryManagement({
                   {repository.metadata?.fullPath ?? repositoryName}
                 </span>
                 <Badge
-                  variant={repository.setupError ? "destructive" : "secondary"}
+                  variant={
+                    (deleting || repository.codebaseMemoryEnabled) &&
+                    repository.setupError
+                      ? "destructive"
+                      : "secondary"
+                  }
                 >
-                  {deleting ? "Deleting" : setupLabels[repository.setupState]}
+                  {deleting
+                    ? "Deleting"
+                    : repository.codebaseMemoryEnabled
+                      ? setupLabels[repository.setupState]
+                      : "Connected"}
                 </Badge>
               </div>
               <output className="block text-sm text-muted-foreground">
                 {deleting
                   ? "Stopping work and removing local repository data. This page will return to the repository list when deletion is complete."
-                  : setupDescriptions[repository.setupState]}
+                  : repository.codebaseMemoryEnabled
+                    ? setupDescriptions[repository.setupState]
+                    : "Reviews use the repository checkout."}
               </output>
-              {repository.setupError && (
-                <Alert variant="destructive">
-                  <AlertDescription>{repository.setupError}</AlertDescription>
-                </Alert>
-              )}
-              {!deleting && (
+              {(deleting || repository.codebaseMemoryEnabled) &&
+                repository.setupError && (
+                  <Alert variant="destructive">
+                    <AlertDescription>{repository.setupError}</AlertDescription>
+                  </Alert>
+                )}
+              {!deleting && repository.codebaseMemoryEnabled && (
                 <p className="text-xs text-muted-foreground">
                   Index branch:{" "}
                   <span className="font-mono">{repository.branch}</span>
                 </p>
               )}
-              {((!deleting && repository.setupState === "error") ||
+              {((!deleting &&
+                repository.codebaseMemoryEnabled &&
+                repository.setupState === "error") ||
                 (deleting && repository.setupError)) && (
                 <div>
                   <Button
@@ -281,6 +309,37 @@ export function RepositoryManagement({
                     <RotateCw data-icon="inline-start" />
                     {retryLabel(!!busy, deleting)}
                   </Button>
+                </div>
+              )}
+              {!deleting && (
+                <div className="flex flex-col items-start gap-2">
+                  <div className="flex items-center gap-2">
+                    <h3 className="text-sm font-medium">Codebase Memory</h3>
+                    <Badge variant="outline">
+                      {repository.codebaseMemoryEnabled
+                        ? "Enabled"
+                        : "Disabled"}
+                    </Badge>
+                  </div>
+                  <p className="text-sm text-muted-foreground">
+                    {repository.codebaseMemoryEditable
+                      ? "Use indexed code and document search in new review attempts."
+                      : "Change this setting in the repository registry file."}
+                  </p>
+                  {repository.codebaseMemoryEditable && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!!busy}
+                      onClick={() => void update("memory")}
+                    >
+                      {busy === "memory"
+                        ? "Saving…"
+                        : repository.codebaseMemoryEnabled
+                          ? "Disable Codebase Memory"
+                          : "Enable Codebase Memory"}
+                    </Button>
+                  )}
                 </div>
               )}
               {repository.connectionMode === "github-app" ? (

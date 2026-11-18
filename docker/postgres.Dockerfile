@@ -9,18 +9,20 @@ RUN apk add --no-cache build-base \
     && mkdir -p /usr/share/doc/pgvector \
     && cp /tmp/pgvector-0.8.2/LICENSE /usr/share/doc/pgvector/
 
-FROM postgres:17-alpine AS runtime
+FROM postgres:17-alpine AS core
 ARG VERSION=0.1.0
 ARG REVISION=unknown
 LABEL org.opencontainers.image.title="razbor-postgres" \
-      org.opencontainers.image.description="Razbor PostgreSQL 17 with pgvector and separated database roles" \
+      org.opencontainers.image.description="Razbor PostgreSQL 17 with separated database roles" \
       org.opencontainers.image.source="https://github.com/next-hat/razbor" \
       org.opencontainers.image.url="https://github.com/next-hat/razbor" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}"
+# Initialization runs only for new volumes; existing database ownership is preserved.
+COPY --chmod=0755 scripts/postgres/bootstrap.sh /docker-entrypoint-initdb.d/10-razbor.sh
+
+FROM core AS runtime
 COPY --from=vector /usr/local/lib/postgresql/vector.so /usr/local/lib/postgresql/
 COPY --from=vector /usr/local/share/postgresql/extension/vector* /usr/local/share/postgresql/extension/
 COPY --from=vector /usr/share/doc/pgvector /usr/share/doc/pgvector
-# Initialization runs only for new volumes; existing database ownership is preserved.
-COPY --chmod=0755 scripts/postgres/bootstrap.sh /docker-entrypoint-initdb.d/10-razbor.sh
 RUN printf '%s\n' 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;' > /docker-entrypoint-initdb.d/20-vector.sql

@@ -183,6 +183,13 @@
       "when": 1790000000025,
       "tag": "0025_queued_review_agent_index",
       "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1790000000026,
+      "tag": "0026_optional_codebase_memory",
+      "breakpoints": true
     }
   ]
 }

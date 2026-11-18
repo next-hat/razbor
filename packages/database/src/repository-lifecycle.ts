@@ -8,7 +8,10 @@ import { createForge, verifyRegistration } from "@razbor/forge-adapters";
 
 import { requireContextSession } from "@database/src/contexts.js";
 import type { Database } from "@database/src/connection.js";
-import { getRepository } from "@database/src/registry.js";
+import {
+  getRepository,
+  isUiManagedRepository,
+} from "@database/src/registry.js";
 import {
   forgeInstances,
   indexWorkspaces,
@@ -27,6 +30,66 @@ export class RepositoryManagementError extends Error {
   ) {
     super(message);
   }
+}
+
+/** Set indexing for future attempts and requeue setup when enabling a UI-managed repository. */
+export async function updateRepositoryCodebaseMemory(
+  database: Database,
+  id: string,
+  input: unknown,
+  contextId?: string,
+  sessionToken?: string,
+) {
+  publicIdSchema("repository").parse(id);
+  const { codebaseMemoryEnabled } = z
+    .object({ codebaseMemoryEnabled: z.boolean() })
+    .strict()
+    .parse(input);
+  await database.transaction(async (tx) => {
+    if (sessionToken !== undefined)
+      await requireContextSession(
+        tx,
+        sessionToken,
+        contextId ?? "",
+        "repositories",
+      );
+    const [repo] = await tx
+      .select()
+      .from(repositories)
+      .where(
+        and(
+          eq(repositories.publicId, id),
+          contextId === undefined
+            ? undefined
+            : sql`${repositories.contextId} = (select id from account_contexts where public_id = ${contextId})`,
+        ),
+      )
+      .for("update");
+    if (!repo)
+      throw new RepositoryManagementError(404, "Repository not found.");
+    if (repo.status !== "active")
+      throw new RepositoryManagementError(
+        409,
+        "Repository deletion is in progress.",
+      );
+    if (!isUiManagedRepository(repo))
+      throw new RepositoryManagementError(
+        409,
+        "Update Codebase Memory in the repository's registry file.",
+      );
+    if (repo.codebaseMemoryEnabled === codebaseMemoryEnabled) return;
+    await tx
+      .update(repositories)
+      .set({
+        codebaseMemoryEnabled,
+        setupState:
+          codebaseMemoryEnabled && repo.persistent ? "pending" : "ready",
+        setupError: null,
+        updatedAt: new Date(),
+      })
+      .where(eq(repositories.id, repo.id));
+  });
+  return getRepository(database, id, contextId);
 }
 
 /**
@@ -199,7 +262,11 @@ export async function retryRepositorySetup(
       );
     await tx
       .update(repositories)
-      .set({ setupState: "pending", setupError: null, updatedAt: new Date() })
+      .set({
+        setupState: repo.codebaseMemoryEnabled ? "pending" : "ready",
+        setupError: null,
+        updatedAt: new Date(),
+      })
       .where(eq(repositories.id, repo.id));
     await tx
       .update(repositoryWebhooks)
@@ -411,7 +478,7 @@ export async function replaceRepositoryToken(
       .set({
         git,
         apiCredential: { stored: tokenId },
-        setupState: "pending",
+        setupState: repo.codebaseMemoryEnabled ? "pending" : "ready",
         setupError: null,
         version: repo.version + 1,
         externalRepositoryId: verified.metadata.externalRepositoryId,

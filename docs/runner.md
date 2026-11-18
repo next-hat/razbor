@@ -394,7 +394,8 @@ directory's owner before dropping privileges. If needed, set the TOML IDs from
 IDs later does not update ownership of existing files; back up and adjust those
 deliberately.
 
-The app supplies source, model access, and index access per attempt. Runners need
+The app supplies source and model access per attempt, plus index access when
+the repository has Codebase Memory enabled at reservation. Runners need
 no shared database, forge, or index-management credentials. Limit HTTP enrollment
 to the local development network and use HTTPS remotely.
 

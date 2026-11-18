@@ -1,0 +1,28 @@
+# Use with compose.yml for a deployment without Codebase Memory.
+services:
+  embedding-model:
+    profiles: [indexing]
+  embeddings:
+    profiles: [indexing]
+  database-extensions:
+    profiles: [indexing]
+  postgres:
+    image: postgres:17-alpine
+    build: !reset null
+  migrate:
+    command: [node, --import=tsx, scripts/manage.ts, database, migrate]
+    depends_on: !override
+      postgres:
+        condition: service_healthy
+      dependencies:
+        condition: service_completed_successfully
+  indexer:
+    environment:
+      RAZBOR_EMBEDDINGS_TOKEN: !reset null
+    networks: !override [control, database]
+    volumes: !override
+      - .:/workspace:ro
+      - razbor_node_modules:/workspace/node_modules:ro
+      - ${RAZBOR_INDEX_CONFIG:-./config/source.example.toml}:/index-config/indexer.toml:ro
+      - ${RAZBOR_INDEX_DATA:?Set a persistent absolute source data path}:/index-data
+      - ${RAZBOR_FORGEJO_TOKEN_FILE:-./config/razbor.forgejo.token}:/forge-secrets/razbor.forgejo.token:ro

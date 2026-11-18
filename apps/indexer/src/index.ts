@@ -43,7 +43,7 @@ try {
   await service.listen();
 } catch {
   logger.error(
-    "index service startup failed; check operator configuration, bundle and data storage",
+    "source service startup failed; check service configuration, database access and data storage",
   );
   await stop();
   process.exitCode = 1;

@@ -293,6 +293,44 @@ test(
       const repo = (await listRepositories(db))[0];
       const hook = (await webhookView(db, repo.id))!;
       assert.equal(hook.setup, "ready");
+      const push = Buffer.from(
+        JSON.stringify({
+          ref: "refs/heads/main",
+          after: head,
+          repository: { id: 1 },
+        }),
+      );
+      const pushHeaders = {
+        "x-forgejo-delivery": "push",
+        "x-forgejo-event": "push",
+        "x-forgejo-signature": createHmac("sha256", secret)
+          .update(push)
+          .digest("hex"),
+      };
+      let refreshed = 0;
+      /** Count local refresh requests without starting an index or embedding backend. */
+      const refresh = async () => {
+        refreshed++;
+      };
+      assert.equal(
+        await acceptWebhook(db, hook.id, push, pushHeaders, refresh),
+        200,
+      );
+      config.repositories.project.codebaseMemoryEnabled = false;
+      config.repositories.project.indexing.persistent = true;
+      await applyRegistry(db, config);
+      assert.equal((await listRepositories(db))[0].verifiedAt, repo.verifiedAt);
+      assert.equal(
+        await acceptWebhook(
+          db,
+          hook.id,
+          push,
+          { ...pushHeaders, "x-forgejo-delivery": "source-only-push" },
+          refresh,
+        ),
+        204,
+      );
+      assert.equal(refreshed, 1);
       /** Submit a signed Forgejo comment webhook with selectable delivery and comment IDs to exercise deduplication. */
       async function deliver(delivery: string, comment = 10) {
         const raw = Buffer.from(
@@ -329,6 +367,7 @@ test(
       const attempt = await beginAttempt(db, review.id, "test", 30000);
       assert.equal(attempt.kind, "started");
       if (attempt.kind !== "started") throw new Error();
+      assert.equal(attempt.codebaseMemoryEnabled, false);
       await finishAttempt(db, review.id, attempt.attemptId, "test", {
         summary: "One finding",
         findings: [

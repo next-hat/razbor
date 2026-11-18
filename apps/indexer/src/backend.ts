@@ -24,6 +24,11 @@ export const releaseVersion = "0.11.0";
 export const binarySha256 =
   "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510";
 
+/** Use a short, workspace-specific directory for the daemon's Unix sockets. */
+export function daemonRuntimeDirectory(state: string) {
+  return `/tmp/rdm-${createHash("sha256").update(state).digest("hex").slice(0, 20)}`;
+}
+
 export type BackendConfig = {
   executable: string;
   mode?: "fast" | "moderate" | "full";
@@ -90,7 +95,7 @@ export class MemoryBackend {
       CBM_CACHE_DIR: path.join(state, "cache"),
       // Keep AF_UNIX rendezvous paths below the kernel's short path limit.
       // The namespace is private to this exact service-owned state directory.
-      CBM_RUNTIME_DIR: `/tmp/rdm-${createHash("sha256").update(state).digest("hex").slice(0, 20)}`,
+      CBM_RUNTIME_DIR: daemonRuntimeDirectory(state),
       CBM_ALLOWED_ROOT: repository,
       CBM_WORKERS: "2",
       CBM_MEM_BUDGET_MB: "512",

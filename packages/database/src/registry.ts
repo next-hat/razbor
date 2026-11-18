@@ -83,6 +83,7 @@ export const registrySchema = z
       z
         .object({
           webhook: webhookSettingsSchema.optional(),
+          codebaseMemoryEnabled: z.boolean().default(true),
           forge: identifier.optional(),
           selector: z.string().min(1).max(1024).optional(),
           git: repositoryConfigSchema,
@@ -124,6 +125,15 @@ export const registrySchema = z
   });
 
 export type RegistryConfig = z.infer<typeof registrySchema>;
+
+/** Distinguish UI-generated repository keys from a file registry that is itself named "ui". */
+export function isUiManagedRepository(row: {
+  managedBy: string;
+  configKey: string;
+  publicId: string;
+}) {
+  return row.managedBy === "ui" && row.configKey === `ui-${row.publicId}`;
+}
 
 /**
  * Read TOML registry configuration and validate declared forge, repository and
@@ -296,6 +306,7 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
       if (
         existing &&
         (existing.status !== "active" ||
+          isUiManagedRepository(existing) ||
           existing.managedBy !== managedBy ||
           existing.forgeId !== forgeId ||
           existing.indexOwner !== r.indexing.owner)
@@ -310,6 +321,7 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
         git: r.git,
         indexOwner: r.indexing.owner,
         persistent: r.indexing.persistent,
+        codebaseMemoryEnabled: r.codebaseMemoryEnabled,
       };
       if (!existing)
         await tx.insert(repositories).values({
@@ -317,29 +329,33 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
           contextId: ownerId,
           publicId: publicId("repository"),
         });
-      else if (
-        !isDeepStrictEqual(
-          {
-            git: existing.git,
-            selector: existing.selector,
-            persistent: existing.persistent,
-          },
-          {
-            git: r.git,
-            selector: r.selector ?? null,
-            persistent: r.indexing.persistent,
-          },
-        )
-      )
+      else {
+        const sourceChanged =
+          !isDeepStrictEqual(existing.git, r.git) ||
+          existing.selector !== values.selector;
+        const indexingChanged =
+          existing.codebaseMemoryEnabled !== r.codebaseMemoryEnabled ||
+          existing.persistent !== r.indexing.persistent;
+        if (!sourceChanged && !indexingChanged) continue;
         await tx
           .update(repositories)
           .set({
             ...values,
             version: existing.version + 1,
-            verifiedAt: null,
+            ...(sourceChanged ? { verifiedAt: null } : {}),
+            ...(indexingChanged
+              ? {
+                  setupState:
+                    r.codebaseMemoryEnabled && r.indexing.persistent
+                      ? "pending"
+                      : "ready",
+                  setupError: null,
+                }
+              : {}),
             updatedAt: new Date(),
           })
           .where(eq(repositories.id, existing.id));
+      }
     }
   });
 }
@@ -347,6 +363,8 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
 export const repositorySelection = {
   publicId: repositories.publicId,
   configKey: repositories.configKey,
+  managedBy: repositories.managedBy,
+  codebaseMemoryEnabled: repositories.codebaseMemoryEnabled,
   forgePublicId: forgeInstances.publicId,
   forgeType: forgeInstances.type,
   agentId: agents.publicId,
@@ -376,6 +394,8 @@ export const repositorySelection = {
 function repositoryView(row: {
   publicId: string;
   configKey: string;
+  managedBy: string;
+  codebaseMemoryEnabled: boolean;
   forgePublicId: string | null;
   forgeType: "github" | "gitlab" | "forgejo" | null;
   agentId: string | null;
@@ -394,6 +414,8 @@ function repositoryView(row: {
   return {
     id: row.publicId,
     configKey: row.configKey,
+    codebaseMemoryEditable: isUiManagedRepository(row),
+    codebaseMemoryEnabled: row.codebaseMemoryEnabled,
     forgeId: row.forgePublicId,
     forgeType: row.forgeType,
     agentId: row.agentId,
@@ -780,6 +802,7 @@ const verifyRepositorySchema = z
   .strict();
 
 const createRepositorySchema = verifyRepositorySchema.extend({
+  codebaseMemoryEnabled: z.boolean().default(true),
   agentId: publicIdSchema("agent").nullable().optional(),
   callbackBase: webhookSettingsSchema.shape.callback_base.optional(),
   permittedSenders: webhookSettingsSchema.shape.permitted_senders,
@@ -1201,7 +1224,8 @@ export async function createRepositoryFromUi(
           : { stored: tokenId },
         indexOwner,
         persistent: true,
-        setupState: "pending",
+        codebaseMemoryEnabled: request.codebaseMemoryEnabled,
+        setupState: request.codebaseMemoryEnabled ? "pending" : "ready",
       })
       .returning();
     if (!app)
