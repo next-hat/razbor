@@ -13,10 +13,12 @@ import {
   ForgeOperationError,
   ForgeWebhookError,
   removeIfPresent,
+  reviewRevision,
   verifyStatusComment,
   type Forge,
   type ForgeChange,
   type ForgePullRequest,
+  type ForgeReviewPublication,
   type ForgeWebhook,
   type InlineComment,
 } from "@forge-adapters/src/interactions.js";
@@ -725,6 +727,7 @@ export class ForgejoInteractions implements Forge {
     body: string,
     comments: InlineComment[],
     event: "COMMENT" | "REQUEST_CHANGES",
+    publication?: ForgeReviewPublication,
   ) {
     const reviewBody =
       event === "COMMENT" &&
@@ -735,6 +738,7 @@ export class ForgejoInteractions implements Forge {
     const ranges =
       comments.some((comment) => comment.lineStart < comment.lineEnd) &&
       (await this.supportsLineRanges());
+    if (publication) await reviewRevision(this, n, head, publication);
     try {
       return z.object({ id }).parse(
         await this.request(`${this.route}/pulls/${n}/reviews`, "POST", {

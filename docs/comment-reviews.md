@@ -215,6 +215,8 @@ GitHub sends `pull_request` actions, including `synchronize` and
 `ready_for_review`. GitLab sends merge request events, including updates with a
 previous source revision or draft transition. Forgejo sends pull request
 lifecycle events and a separate synchronization subscription for source updates.
+For that subscription, Forgejo sends `pull_request` in `X-Forgejo-Event` and
+`pull_request_sync` in `X-Forgejo-Event-Type`.
 Forgejo reports title edits with the resulting draft flag. Renaming an already-ready
 PR at the same recorded revision leaves its review history alone. When Razbor first
 observes a PR through such an edit, a verified ready revision can trigger its first review.
@@ -235,7 +237,10 @@ runner and reviewer lets the same review proceed. Before publishing findings,
 Razbor checks the current source and target revisions and any newer published
 decision. If a previously reviewed revision becomes current again, a saved
 result that was safely withheld as stale can be published without another model
-call. A failed delivery that was never accepted can be redelivered from the forge.
+call. If a delivery fails, redeliver it from the forge. Razbor records a close
+or reopen before reading review history. Redelivery resumes that work. If a
+closed-PR command was already declined, redelivery reconciles the explanation
+even if the PR has since reopened.
 
 Provider references cover
 [GitHub pull request events](https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request),
@@ -251,12 +256,15 @@ to include a review-page link. If final publication takes time, the existing
 comment shows that publication is pending. Razbor removes the comment once the
 outbox confirms the result, failure message or stale outcome. The final result, failure messages and discussions remain.
 If the provider is unavailable or a write response is lost, the durable outbox
-retains the state needed to reconcile the bot-owned marker. Restore permissions
-or connectivity if cleanup is pending. An ambiguous create with no visible
-match stays pending because retrying the POST could create a duplicate. A fast review
-may finish before the status worker posts a comment. On explicit repository
-removal, Razbor attempts to clean up before discarding credentials. If that
-attempt fails, the forge may retain the comment.
+retains the state needed to reconcile the bot-owned marker. A lost create
+response can delay status updates until the comment appears. During cleanup,
+Razbor checks the full comment list again after 30 seconds if the bot's marker
+is missing. Two complete reads without the marker finish cleanup. A fast review
+may finish before the status worker posts a comment.
+
+Repository deletion waits for temporary comment cleanup before discarding
+credentials. If the forge is unavailable or rejects a delete, restore
+connectivity or the bot's permissions. Razbor retries with the saved identity.
 
 ## Read the result
 

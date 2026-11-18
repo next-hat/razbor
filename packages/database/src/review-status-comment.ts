@@ -1,4 +1,4 @@
-import { eq, sql } from "drizzle-orm";
+import { and, eq, isNotNull, sql } from "drizzle-orm";
 
 import { ForgeOperationError, type Forge } from "@razbor/forge-adapters";
 import { logger } from "@razbor/harness/logger";
@@ -13,17 +13,21 @@ import {
   type ReviewStatusComment,
 } from "@database/src/schema.js";
 
-/** Select changed activity or safely finished publications that still own a status comment. */
-export function statusCommentDue() {
-  return sql`(${dispatchOutbox.statusAfter} is null or ${dispatchOutbox.statusAfter} <= now())
-    and ${reviews.source}->'conversation' is null
+/** Honor the retry deadline for both normal status changes and forced cleanup. */
+export function statusCommentDue(retire = false) {
+  return and(
+    sql`(${dispatchOutbox.statusAfter} is null or ${dispatchOutbox.statusAfter} <= now())`,
+    retire
+      ? isNotNull(dispatchOutbox.statusComment)
+      : sql`${reviews.source}->'conversation' is null
     and ((${reviews.status} in ('queued', 'running')
       and (${dispatchOutbox.statusComment}->>'shown' is distinct from ${reviews.status}
         or ${dispatchOutbox.statusComment}->>'headSha' is distinct from ${reviews.headSha}))
       or (${reviews.status} in ('completed', 'failed')
         and (${dispatchOutbox.publication}->>'state' in ('published', 'stale')
           or ${dispatchOutbox.statusComment}->>'shown' is distinct from ${reviews.status})
-        and ${dispatchOutbox.statusComment} is not null))`;
+        and ${dispatchOutbox.statusComment} is not null))`,
+  );
 }
 
 /** Render only server-owned data. A callback endpoint need not expose the console. */
@@ -62,7 +66,6 @@ export async function syncStatusComment(
   currentBotId: string | null,
   adapter: () => Promise<Forge>,
   retire = false,
-  deleting = false,
 ) {
   const [entry] = await database.db
     .select({
@@ -76,9 +79,7 @@ export async function syncStatusComment(
     .from(dispatchOutbox)
     .innerJoin(reviews, eq(reviews.id, dispatchOutbox.reviewId))
     .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
-    .where(
-      sql`${reviews.publicId} = ${reviewId} and (${retire ? sql`${dispatchOutbox.statusComment} is not null` : statusCommentDue()})`,
-    );
+    .where(and(eq(reviews.publicId, reviewId), statusCommentDue(retire)));
   if (!entry) return;
   const { phase, head, change } = entry;
   const terminal = phase === "completed" || phase === "failed";
@@ -120,12 +121,20 @@ export async function syncStatusComment(
       ).filter(
         (comment) =>
           comment.user.id === state.botId &&
-          comment.body === state.creatingBody &&
           comment.body.endsWith(`\n${marker}`),
       );
-      if (matches.length !== 1)
+      // A delayed POST may appear after the first complete read. Once retiring,
+      // confirm absence on the next retry before releasing its creation fence.
+      if (remove && matches.length === 0) {
+        if (state.missingOnRetirement) await save(null);
+        else await save({ ...state, missingOnRetirement: true }, true);
+        return;
+      }
+      if (matches.length !== 1 || matches[0].body !== state.creatingBody) {
+        state = { ...state, missingOnRetirement: undefined };
         throw new ForgeOperationError("unavailable", true);
-      state = { ...state, remoteId: matches[0].id, creatingBody: undefined };
+      }
+      state = { botId, remoteId: matches[0].id };
       await save(state);
     }
 
@@ -164,8 +173,9 @@ export async function syncStatusComment(
         body,
       );
     } else {
-      state = { botId, creatingBody: body };
-      await save(state);
+      const creating = { botId, creatingBody: body };
+      await save(creating);
+      state = creating;
       try {
         const remoteId = await api.postComment(change.number, body);
         state = { botId, remoteId };
@@ -186,10 +196,7 @@ export async function syncStatusComment(
   } catch (error) {
     const reason =
       error instanceof ForgeOperationError ? error.reason : "unavailable";
-    await save(
-      { ...state, error: reason, retirementAttempted: deleting || undefined },
-      true,
-    );
+    await save({ ...state, error: reason }, true);
     logger.warn(
       { reviewId, reason },
       "review status comment reconciliation deferred",

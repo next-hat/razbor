@@ -330,7 +330,7 @@ export async function syncPullRequests(
                   : undefined,
               ),
             );
-          const closedNumbers: number[] = [];
+          const closedObservations: { number: number; observedAt: Date }[] = [];
           // Offset pagination can skip an open PR when earlier rows close mid-list.
           // Only its direct closed-state response permits removing it from the queue.
           for (const missing of absent) {
@@ -341,7 +341,10 @@ export async function syncPullRequests(
                 error instanceof ForgeOperationError &&
                 error.reason === "change-closed"
               ) {
-                closedNumbers.push(missing.number);
+                closedObservations.push({
+                  number: missing.number,
+                  observedAt: new Date(),
+                });
               } else {
                 throw error;
               }
@@ -349,7 +352,7 @@ export async function syncPullRequests(
           }
           const syncedAt = new Date();
           await database.transaction(async (tx) => {
-            // Source-policy changes and deletion during provider I/O invalidate this snapshot.
+            // Also fence admission for a first observation, before a PR row exists to lock.
             const [current] = await tx
               .select({ id: repositories.id })
               .from(repositories)
@@ -366,7 +369,7 @@ export async function syncPullRequests(
                   eq(repositories.verifiedAt, repo.verifiedAt!),
                 ),
               )
-              .for("share");
+              .for("update");
             if (!current) throw new Error("Repository changed during refresh");
             const [currentForge] = await tx
               .select({ updatedAt: forgeInstances.updatedAt })
@@ -395,21 +398,29 @@ export async function syncPullRequests(
                   publicId: publicId("pullRequest"),
                   repositoryId: repo.id,
                   number: change.number,
+                  triggerGeneration: 1,
                 })
                 .onConflictDoUpdate({
                   target: [pullRequests.repositoryId, pullRequests.number],
-                  set: values,
+                  set: {
+                    ...values,
+                    // A webhook that read the previous revision must refresh before admission.
+                    triggerGeneration: sql`${pullRequests.triggerGeneration} + case
+                      when (${pullRequests.state}, ${pullRequests.headSha}, ${pullRequests.baseSha})
+                        is distinct from (excluded.state, excluded.head_sha, excluded.base_sha)
+                      then 1 else 0 end`,
+                  },
                   setWhere: lte(pullRequests.syncedAt, listingStartedAt),
                 });
             }
-            if (closedNumbers.length) {
-              const closed = await tx
+            for (const { number, observedAt } of closedObservations) {
+              const [closed] = await tx
                 .update(pullRequests)
                 .set({
                   state: "closed",
                   syncedAt,
                   continuousReviewSince: null,
-                  reviewSessionResetAt: syncedAt,
+                  reviewSessionResetAt: sql`greatest(${pullRequests.reviewSessionResetAt}, ${observedAt.toISOString()}::timestamptz)`,
                   triggerGeneration: sql`${pullRequests.triggerGeneration}+1`,
                 })
                 .where(
@@ -418,12 +429,12 @@ export async function syncPullRequests(
                     eq(pullRequests.state, "open"),
                     // A webhook can capture a new PR after this provider snapshot began.
                     lte(pullRequests.syncedAt, listingStartedAt),
-                    inArray(pullRequests.number, closedNumbers),
+                    eq(pullRequests.number, number),
                   ),
                 )
                 .returning({ number: pullRequests.number });
-              for (const pr of closed)
-                await supersedeQueuedAutomaticReviews(tx, repo.id, pr.number);
+              if (closed)
+                await supersedeQueuedAutomaticReviews(tx, repo.id, number);
             }
           });
           return true;

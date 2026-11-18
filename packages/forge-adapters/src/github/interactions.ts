@@ -12,11 +12,13 @@ import {
   ForgeOperationError,
   ForgeWebhookError,
   removeIfPresent,
+  reviewRevision,
   verifyStatusComment,
   type Forge,
   type ForgeChange,
   type ForgePullRequest,
   type ForgeReviewComment,
+  type ForgeReviewPublication,
   type ForgeWebhook,
   type InlineComment,
 } from "@forge-adapters/src/interactions.js";
@@ -767,8 +769,10 @@ export class GithubForge implements Forge {
     body: string,
     comments: InlineComment[],
     event: "COMMENT" | "REQUEST_CHANGES",
+    publication?: ForgeReviewPublication,
   ) {
     sha.parse(head);
+    if (publication) await reviewRevision(this, n, head, publication);
     const result = await this.create(`${this.route}/pulls/${n}/reviews`, {
       event,
       commit_id: head,

@@ -77,9 +77,9 @@ export type ForgePublicationProgress = Record<
 
 export type ForgeReviewPublication = {
   progress: ForgePublicationProgress;
-  /** Persisted review snapshot against which a multi-step provider checks each write. */
+  /** Persisted review snapshot to verify before submitting a native review. */
   revision?: ForgeChange;
-  /** Automatic reviews must still be ready when a provider publishes draft notes. */
+  /** Automatic reviews must still be ready when the provider receives the review. */
   requireReady?: boolean;
   /** Persist before each remote mutation; retain uncertain writes for reconciliation. */
   save(progress: ForgePublicationProgress): Promise<void>;
@@ -127,6 +127,35 @@ export class ForgeWebhookError extends Error {
     readonly reason: string,
   ) {
     super(reason);
+  }
+}
+
+/** Read the reviewed revision immediately before a provider write and classify a rejected preflight as unsubmitted. */
+export async function reviewRevision(
+  forge: Forge,
+  number: number,
+  head: string,
+  {
+    revision,
+    requireReady,
+  }: Pick<ForgeReviewPublication, "revision" | "requireReady">,
+) {
+  try {
+    const current = await forge.change(number);
+    if (
+      current.headSha !== head ||
+      (requireReady && current.draft !== false) ||
+      (revision &&
+        (revision.headSha !== current.headSha ||
+          revision.baseSha !== current.baseSha ||
+          revision.mergeBase !== current.mergeBase ||
+          revision.startSha !== current.startSha))
+    )
+      throw new ForgeOperationError("invalid-response");
+    return current;
+  } catch (error) {
+    if (error instanceof ForgeOperationError) throw error;
+    throw new ForgeOperationError("invalid-response");
   }
 }
 

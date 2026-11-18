@@ -47,7 +47,11 @@ in a browser.
 
 Review trigger and comment checks use local HTTP provider fixtures and isolated PostgreSQL
 databases. They exercise source-only and indexed policy decisions with simulated
-attempts and controlled results. They do not need model credentials.
+attempts and controlled results. The delayed-delivery check inspects the queued
+head before sending another update. The stale-publication check retries a saved
+result after the PR moves away from its reviewed revision and returns. Provider
+tests also exercise readiness changes before native review submission. These
+checks do not need model credentials.
 
 ## Autonomous review harness
 

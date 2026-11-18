@@ -41,6 +41,22 @@ type Observation = {
   commandAt?: string;
 };
 
+/** Match a redelivery or an already declined command replayed under a different delivery ID. */
+export function triggerDelivery(hookId: string, event: ChangeEvent) {
+  return and(
+    eq(webhookDeliveries.webhookId, hookId),
+    or(
+      eq(webhookDeliveries.deliveryId, event.deliveryId),
+      event.kind === "comment"
+        ? eq(
+            webhookDeliveries.closedCommandId,
+            `${event.number}:${event.commentId}`,
+          )
+        : undefined,
+    ),
+  );
+}
+
 /** Match a provider change by its repository-scoped number, including records predating trigger modes. */
 function sameChange(repositoryId: string, number?: number) {
   return and(
@@ -137,6 +153,7 @@ async function queueReview(
   forge: ForgeType,
   change: ForgeChange,
   observation: Observation,
+  generation: number,
 ) {
   const { event, previous, conversation } = observation;
   const automatic = event.kind !== "comment";
@@ -182,7 +199,7 @@ async function queueReview(
         existing.id,
       );
       if (existing.status === "completed" && existing.triggerId)
-        await rearmStalePublication(tx, existing.id);
+        await rearmStalePublication(tx, existing.id, generation);
       return undefined;
     }
     const [pending] = await tx
@@ -323,12 +340,32 @@ export async function acceptReviewTrigger(
       .for("update");
     if ((session?.triggerGeneration ?? 0) !== observation.generation)
       return { retry: true } as const;
-    const received = await tx
-      .insert(webhookDeliveries)
-      .values({ webhookId: hook.id, deliveryId: event.deliveryId })
-      .onConflictDoNothing()
-      .returning({ id: webhookDeliveries.id });
-    if (!received.length) return { duplicate: true } as const;
+    let [receipt] = await tx
+      .select()
+      .from(webhookDeliveries)
+      .where(triggerDelivery(hook.id, event));
+    if (receipt && receipt.pendingAction !== "review-history") {
+      if (
+        receipt.pendingAction &&
+        event.kind === "comment" &&
+        receipt.closedCommandId === `${event.number}:${event.commentId}`
+      )
+        return { closedReplyId: receipt.id } as const;
+      return { duplicate: true } as const;
+    }
+    if (!receipt) {
+      [receipt] = await tx
+        .insert(webhookDeliveries)
+        .values({ webhookId: hook.id, deliveryId: event.deliveryId })
+        .onConflictDoNothing()
+        .returning();
+      if (!receipt) return { duplicate: true } as const;
+    } else {
+      await tx
+        .update(webhookDeliveries)
+        .set({ pendingAction: null })
+        .where(eq(webhookDeliveries.id, receipt.id));
+    }
     await tx
       .update(repositoryWebhooks)
       .set({ lastDelivery: "accepted", lastDeliveryAt: new Date() })
@@ -353,7 +390,7 @@ export async function acceptReviewTrigger(
       const boundary =
         event.kind !== "comment" && event.occurredAt
           ? new Date(event.occurredAt)
-          : new Date();
+          : receipt.createdAt;
       if (!reset || reset < boundary) reset = boundary;
       if (!change || (since && since <= reset)) since = null;
     }
@@ -434,7 +471,29 @@ export async function acceptReviewTrigger(
         (!automaticAllowed || change.draft !== false))
     ) {
       await supersedeQueuedAutomaticReviews(tx, repo.id, event.number);
+      if (!change && event.kind === "comment") {
+        await tx
+          .update(webhookDeliveries)
+          .set({
+            closedCommandId: `${event.number}:${event.commentId}`,
+            pendingAction: "closed-reply",
+          })
+          .where(eq(webhookDeliveries.id, receipt.id));
+        return { closedReplyId: receipt.id } as const;
+      }
       return {} as const;
+    }
+    if (
+      (event.kind === "closed" || event.kind === "reopened") &&
+      !observation.previous
+    ) {
+      // Commit the reset before optional remote history reads. A failed read
+      // leaves the delivery resumable at the same boundary on redelivery.
+      await tx
+        .update(webhookDeliveries)
+        .set({ pendingAction: "review-history" })
+        .where(eq(webhookDeliveries.id, receipt.id));
+      return { historyGeneration: sessionValues.triggerGeneration } as const;
     }
     // Forgejo reports an edited title and the resulting draft flag. An
     // unchanged, already-ready snapshot is an ordinary rename.
@@ -447,6 +506,7 @@ export async function acceptReviewTrigger(
       forge,
       change,
       observation,
+      sessionValues.triggerGeneration,
     );
     return { reviewId } as const;
   });

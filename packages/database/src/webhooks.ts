@@ -26,6 +26,7 @@ import {
 import {
   acceptReviewTrigger,
   reviewTriggerSession,
+  triggerDelivery,
 } from "@database/src/review-triggers.js";
 import { reviewConversation } from "@database/src/conversation.js";
 import type { Database } from "@database/src/connection.js";
@@ -742,7 +743,8 @@ export async function reconcileWebhook(
 
 /**
  * Remove only managed provider hooks during repository deletion. Manual hooks
- * and shared App hooks remain with their owner; return false while locked.
+ * and shared App hooks remain with their owner. Defer removal while locked or
+ * while a temporary comment still needs its saved credentials for cleanup.
  */
 export async function removeRepositoryWebhook(
   database: Database,
@@ -777,7 +779,7 @@ export async function removeRepositoryWebhook(
               .where(
                 and(
                   eq(reviews.repositoryId, repository.id),
-                  sql`${dispatchOutbox.statusComment} is not null and ${dispatchOutbox.statusComment}->>'retirementAttempted' is null`,
+                  sql`${dispatchOutbox.statusComment} is not null`,
                 ),
               )
               .limit(1);
@@ -1002,7 +1004,8 @@ export async function acceptWebhook(
   async function handlePullRequest(
     event: Exclude<ForgeWebhook, { kind: "push" | "ping" | "comment" }>,
   ) {
-    if (!h.botId) return outcome(503, "bot-identity-unavailable");
+    const botId = h.botId;
+    if (!botId) return outcome(503, "bot-identity-unavailable");
     const session = await reviewTriggerSession(
       database,
       row.repo.id,
@@ -1024,22 +1027,17 @@ export async function acceptWebhook(
     }
     const eligible =
       change?.draft === false &&
+      event.kind !== "closed" &&
+      event.kind !== "reopened" &&
       (row.repo.reviewTriggerMode === "automatic" ||
         (row.repo.reviewTriggerMode === "opt_in_continuous" &&
           session?.continuousReviewSince));
-    const previous = eligible
-      ? (
-          await previousFindings(
-            database,
-            row.repo.id,
-            event.number,
-            h.botId,
-            api,
-          )
-        ).findings
-      : undefined;
+    /** Read prior published findings only after the event is eligible to queue work. */
+    const readHistory = () =>
+      previousFindings(database, row.repo.id, event.number, botId, api);
+    const previous = eligible ? (await readHistory()).findings : undefined;
     stage = "persist-lifecycle";
-    const accepted = await acceptReviewTrigger(
+    let accepted = await acceptReviewTrigger(
       database,
       row.repo,
       h,
@@ -1051,6 +1049,23 @@ export async function acceptWebhook(
         previous,
       },
     );
+    if (accepted.historyGeneration !== undefined) {
+      stage = "read-previous-findings";
+      const history = await readHistory();
+      stage = "persist-lifecycle";
+      accepted = await acceptReviewTrigger(
+        database,
+        row.repo,
+        h,
+        row.forge.type,
+        {
+          event,
+          change,
+          previous: history.findings,
+          generation: accepted.historyGeneration,
+        },
+      );
+    }
     if ("retry" in accepted) return 409;
     if ("duplicate" in accepted) return outcome(202, "duplicate-delivery");
     if (event.kind === "opened" && change) {
@@ -1119,7 +1134,7 @@ export async function acceptWebhook(
     );
   }
 
-  /** Explain a closed change once per verified command, reconciling bot-owned replies on retries. */
+  /** Admit the verified command at the observed generation before any closed-PR reply can be sent. */
   async function handleClosedComment(
     api: Forge,
     event: Extract<ForgeWebhook, { kind: "comment" }>,
@@ -1136,6 +1151,24 @@ export async function acceptWebhook(
       !reviewCommand(comment.body)
     )
       return outcome(403, "comment-does-not-match-command");
+    const accepted = await acceptReviewTrigger(
+      database,
+      row.repo,
+      h,
+      row.forge.type,
+      { event, generation },
+    );
+    if ("retry" in accepted) return 409;
+    if (!accepted.closedReplyId) return outcome(202, "duplicate-delivery");
+    return explainClosedCommand(api, event, accepted.closedReplyId);
+  }
+
+  /** Deliver the recorded closed-command decision and reconcile a possibly successful POST before retrying. */
+  async function explainClosedCommand(
+    api: Forge,
+    event: Extract<ForgeWebhook, { kind: "comment" }>,
+    receiptId: string,
+  ) {
     stage = "explain-closed-pull-request";
     const result = await interactionLock(
       database,
@@ -1148,33 +1181,41 @@ export async function acceptWebhook(
           current.hook.updatedAt.getTime() !== h.updatedAt.getTime()
         )
           return outcome(404, "repository-unavailable");
-        const [duplicate] = await database.db
-          .select({ id: webhookDeliveries.id })
+        const [receipt] = await database.db
+          .select({ pending: webhookDeliveries.pendingAction })
           .from(webhookDeliveries)
-          .where(
-            and(
-              eq(webhookDeliveries.webhookId, h.id),
-              eq(webhookDeliveries.deliveryId, delivery),
-            ),
-          );
-        if (duplicate) return outcome(202, "duplicate-delivery");
+          .where(eq(webhookDeliveries.id, receiptId));
+        if (!receipt?.pending) return outcome(202, "duplicate-delivery");
+        /** Persist the reply fence independently of the command admission. */
+        const save = (
+          pendingAction: "closed-reply" | "posting-closed-reply" | null,
+        ) =>
+          database.db
+            .update(webhookDeliveries)
+            .set({ pendingAction })
+            .where(eq(webhookDeliveries.id, receiptId));
         const marker = `<!-- razbor:${row.repo.publicId}:${event.number}:${event.commentId}:closed -->`;
-        const existing = (await api.comments(event.number)).some(
+        const existing = (
+          await api.comments(event.number, { complete: true })
+        ).some(
           (reply) => reply.user.id === h.botId && reply.body.includes(marker),
         );
-        if (!existing)
-          await api.postComment(
-            event.number,
-            `I can only review open pull requests. This pull request is closed or has already been merged, so I haven't started a review. Request a review on an open pull request with \`${reviewCommandText()}\`.\n\n${marker}`,
-          );
-        const accepted = await acceptReviewTrigger(
-          database,
-          row.repo,
-          h,
-          row.forge.type,
-          { event, generation },
-        );
-        if ("retry" in accepted) return 409;
+        if (!existing) {
+          if (receipt.pending === "posting-closed-reply")
+            return outcome(503, "closed-pull-request-reply-unconfirmed");
+          await save("posting-closed-reply");
+          try {
+            await api.postComment(
+              event.number,
+              `This pull request was closed or merged when I checked the command, so I didn't start a review. Request a review on an open pull request with \`${reviewCommandText()}\`.\n\n${marker}`,
+            );
+          } catch (error) {
+            if (error instanceof ForgeOperationError && !error.uncertain)
+              await save("closed-reply");
+            throw error;
+          }
+        }
+        await save(null);
         return outcome(200, "closed-pull-request-explained");
       },
     );
@@ -1186,7 +1227,7 @@ export async function acceptWebhook(
    * data, then snapshot source and reviewer state into one durable,
    * deduplicated review.
    */
-  async function handleComment() {
+  async function handleComment(closedReplyId?: string) {
     const event =
       normalizedEvent?.kind === "comment" ? normalizedEvent : undefined;
     // Bot replies can contain the command as usage guidance. Never enqueue them.
@@ -1205,12 +1246,13 @@ export async function acceptWebhook(
       if (!(await wildcardRepositoryIsPrivate()))
         return outcome(403, "wildcard-requires-private-repository");
     }
+    const api = await adapter(database, row, 30000, !h.senders.includes("*"));
+    if (closedReplyId) return explainClosedCommand(api, event, closedReplyId);
     const session = await reviewTriggerSession(
       database,
       row.repo.id,
       event.number,
     );
-    const api = await adapter(database, row, 30000, !h.senders.includes("*"));
     stage = "read-pull-request";
     let change: ForgeChange;
     try {
@@ -1287,6 +1329,8 @@ export async function acceptWebhook(
       },
     );
     if ("retry" in accepted) return 409;
+    if (accepted.closedReplyId)
+      return explainClosedCommand(api, event, accepted.closedReplyId);
     const reviewId = "reviewId" in accepted && accepted.reviewId;
     if (reviewId) {
       log.info({ deliveryId: delivery, reviewId }, "comment review queued");
@@ -1302,15 +1346,23 @@ export async function acceptWebhook(
     // authoritative PR after a conflict instead of accepting an older snapshot.
     for (let attempt = 0; attempt < 4; attempt++) {
       const [received] = await database.db
-        .select({ id: webhookDeliveries.id })
+        .select()
         .from(webhookDeliveries)
-        .where(
-          and(
-            eq(webhookDeliveries.webhookId, h.id),
-            eq(webhookDeliveries.deliveryId, delivery),
-          ),
-        );
-      if (received) return outcome(202, "duplicate-delivery");
+        .where(triggerDelivery(h.id, normalizedEvent));
+      if (received && !received.pendingAction)
+        return outcome(202, "duplicate-delivery");
+      if (
+        received?.pendingAction &&
+        received.pendingAction !== "review-history"
+      ) {
+        if (
+          normalizedEvent.kind !== "comment" ||
+          received.closedCommandId !==
+            `${normalizedEvent.number}:${normalizedEvent.commentId}`
+        )
+          return outcome(202, "duplicate-delivery");
+        return await handleComment(received.id);
+      }
       const status =
         normalizedEvent.kind === "comment"
           ? await handleComment()
@@ -1449,7 +1501,11 @@ export async function processInteraction(database: Database, reviewId: string) {
               (values.publication?.staleGeneration ?? entry.generation ?? 0) &&
             sessionAllowsReview(session)
           )
-            await rearmStalePublication(tx, review.id);
+            await rearmStalePublication(
+              tx,
+              review.id,
+              session.pr.triggerGeneration,
+            );
         });
         return;
       }
@@ -1983,6 +2039,13 @@ export async function processInteraction(database: Database, reviewId: string) {
      * stale or failed.
      */
     async function publishReview() {
+      const bulk = api.type === "gitlab" && progress.providerProgress?.bulk;
+      if (bulk && (bulk.writing || bulk.id) && progress.reviewPayload) {
+        // A submitted GitLab verdict may already be visible. Recover its frozen
+        // notes and summary before a fresh change observation can retire the run.
+        await submitNativeReview(progress.reviewPayload);
+        return;
+      }
       const newer = await hasNewerPublishedReview();
       const change = await api.change(trigger.change.number);
       const stale = !!newer || !(await currentRevision(change));
@@ -2000,6 +2063,7 @@ export async function processInteraction(database: Database, reviewId: string) {
               remoteId: progress.staleNoticeId,
               state: "stale",
               stale: true,
+              staleGeneration: entry.generation ?? 0,
             },
           });
           return;
@@ -2190,6 +2254,13 @@ export async function processInteraction(database: Database, reviewId: string) {
         await finishReviewPublication();
         return;
       }
+      await submitNativeReview(payload);
+    }
+
+    /** Submit or reconcile the frozen provider payload, then record its remote review and inline identities. */
+    async function submitNativeReview(
+      payload: NonNullable<Publication["reviewPayload"]>,
+    ) {
       const remoteId = await api.postReview(
         trigger.change.number,
         review.headSha,
@@ -2345,9 +2416,8 @@ export async function processStatusComments(database: Database) {
     )
     .where(
       sql`((${repositories.status} = 'active' and ${repositoryWebhooks.enabled} and ${repositoryWebhooks.botId} is not null and (${statusCommentDue()}))
-          or (${repositories.status} = 'active' and not ${repositoryWebhooks.enabled} and ${dispatchOutbox.statusComment} is not null
-            and (${dispatchOutbox.statusAfter} is null or ${dispatchOutbox.statusAfter} <= now()))
-          or (${repositories.status} = 'deleting' and ${dispatchOutbox.statusComment} is not null and ${dispatchOutbox.statusComment}->>'retirementAttempted' is null))`,
+          or ((${repositories.status} = 'deleting' or (${repositories.status} = 'active' and not ${repositoryWebhooks.enabled}))
+            and (${statusCommentDue(true)})))`,
     )
     .orderBy(
       sql`coalesce(${dispatchOutbox.statusAfter}, ${dispatchOutbox.createdAt})`,
@@ -2364,7 +2434,6 @@ export async function processStatusComments(database: Database) {
         row.hook.botId,
         () => adapter(database, row, 6000, true),
         retire,
-        row.repo.status === "deleting",
       );
     });
   }

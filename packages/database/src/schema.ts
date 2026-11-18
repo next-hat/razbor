@@ -950,12 +950,12 @@ export type ReviewStatusComment = {
   botId: string;
   /** Persist the exact bytes before creation, so an uncertain POST is never repeated. */
   creatingBody?: string;
+  /** A complete listing during retirement found no matching bot-owned marker. */
+  missingOnRetirement?: boolean;
   remoteId?: string;
   shown?: "queued" | "running" | "completed" | "failed";
   headSha?: string;
   error?: string;
-  /** Explicit repository deletion grants one last cleanup attempt before credentials disappear. */
-  retirementAttempted?: boolean;
 };
 
 export const dispatchOutbox = pgTable("dispatch_outbox", {
@@ -1085,9 +1085,18 @@ export const webhookDeliveries = pgTable(
       .notNull()
       .references(() => repositoryWebhooks.id),
     deliveryId: text("delivery_id").notNull(),
+    closedCommandId: text("closed_command_id"),
+    pendingAction: text("pending_action").$type<
+      "review-history" | "closed-reply" | "posting-closed-reply"
+    >(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
-  (t) => [uniqueIndex("delivery_identity").on(t.webhookId, t.deliveryId)],
+  (t) => [
+    uniqueIndex("delivery_identity").on(t.webhookId, t.deliveryId),
+    uniqueIndex("delivery_closed_command")
+      .on(t.webhookId, t.closedCommandId)
+      .where(sql`${t.closedCommandId} is not null`),
+  ],
 );

@@ -199,7 +199,6 @@ test("current change reads use the target repository, immutable fork revisions a
   let draft = true;
   let outdatedDiff = false;
   let foreign = false;
-  let convertDuringPublication = false;
   t.mock.method(globalThis, "fetch", async (input: URL, init: RequestInit) => {
     assert.equal(init.method, "GET");
     assert.equal(input.origin, origin);
@@ -207,10 +206,8 @@ test("current change reads use the target repository, immutable fork revisions a
     if (url === "/api/v4/user")
       return Response.json({ id: 5, username: "razbor" });
     if (url.endsWith("/merge_requests/12/notes")) return Response.json([]);
-    if (url.endsWith("/merge_requests/12/draft_notes")) {
-      if (convertDuringPublication) draft = true;
+    if (url.endsWith("/merge_requests/12/draft_notes"))
       return Response.json([]);
-    }
     const project = foreign ? "fork/project" : "team/project";
     if (url === `/api/v3/repos/team/project/compare/${base}...${head}`)
       return Response.json({ merge_base_commit: { sha: mergeBase } });
@@ -276,36 +273,39 @@ test("current change reads use the target repository, immutable fork revisions a
           error.reason === "unavailable",
       );
       outdatedDiff = false;
-      /** A pre-write revision or readiness rejection must leave the outbox free of uncertain writes. */
-      const rejectsPublication = async (expectedBase: string) => {
-        await assert.rejects(
-          forge.postReview(
-            12,
-            head,
-            "<!-- razbor:rev_abcdefghijklmnop:result -->",
-            [],
-            "COMMENT",
-            {
-              progress: {},
-              revision: { ...change, baseSha: expectedBase },
-              requireReady: true,
-              /** Any checkpoint here would permit a mutation for an unreviewed revision. */
-              async save() {
-                assert.fail("unexpected publication write");
-              },
-            },
-          ),
-          (error: unknown) =>
-            error instanceof ForgeOperationError &&
-            error.reason === "invalid-response" &&
-            !error.uncertain,
-        );
-      };
-      await rejectsPublication("4".repeat(40));
-      convertDuringPublication = true;
-      await rejectsPublication(base);
-      assert.equal(draft, true);
     }
+    /** Reject revision changes and draft conversion before a native write, clearing any unsent bulk checkpoint. */
+    const rejectsPublication = async (expectedBase: string) => {
+      let bulkWriting = false;
+      await assert.rejects(
+        forge.postReview(
+          12,
+          head,
+          "<!-- razbor:rev_abcdefghijklmnop:result -->",
+          [],
+          "COMMENT",
+          {
+            progress: {},
+            revision: { ...change, baseSha: expectedBase },
+            requireReady: true,
+            /** Convert the MR after GitLab saves its intention to submit the native verdict. */
+            async save(progress) {
+              bulkWriting = !!progress.bulk?.writing;
+              if (bulkWriting) draft = true;
+            },
+          },
+        ),
+        (error: unknown) =>
+          error instanceof ForgeOperationError &&
+          error.reason === "invalid-response" &&
+          !error.uncertain,
+      );
+      assert.equal(bulkWriting, false);
+    };
+    await rejectsPublication("4".repeat(40));
+    draft = type !== "gitlab";
+    await rejectsPublication(base);
+    assert.equal(draft, true);
     closed = true;
     await assert.rejects(
       forge.change(12),

@@ -595,6 +595,33 @@ test(
         (await lifecycle("reopened", "reopen-at-reviewed-revision")) < 300,
       );
       assert.equal((await listReviews(db)).length, count);
+      // The provider moved again before the rearmed result could be published.
+      head = "c".repeat(40);
+      await processInteraction(db, next.id);
+      assert.equal(
+        (await publicationView(db, next.id))?.publication?.state,
+        "stale",
+      );
+      head = "b".repeat(40);
+      assert.equal(
+        await lifecycle("synchronized", "same-session-revision"),
+        202,
+      );
+      assert.equal(
+        (await publicationView(db, next.id))?.publication?.state,
+        "stale",
+      );
+      // A later observed C -> B transition grants one new publication attempt.
+      head = "c".repeat(40);
+      assert.equal(
+        await lifecycle("synchronized", "observe-intervening-head"),
+        202,
+      );
+      head = "b".repeat(40);
+      assert.equal(
+        await lifecycle("synchronized", "restore-reviewed-head"),
+        202,
+      );
       await processInteraction(db, next.id);
       assert.equal(
         (await publicationView(db, next.id))?.publication?.state,

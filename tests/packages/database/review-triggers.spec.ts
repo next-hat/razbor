@@ -285,13 +285,21 @@ test(
       head = "d".repeat(40);
       pauseRead = true;
       const earlier = lifecycle("synchronized");
-      await observed.promise;
+      await Promise.race([
+        observed.promise,
+        earlier.then((status) => {
+          throw new Error(
+            `Delivery returned HTTP ${status} before reading the PR`,
+          );
+        }),
+      ]);
       head = "e".repeat(40);
       assert.equal(await lifecycle("synchronized"), 202);
       release.resolve();
-      await earlier;
+      assert.equal(await earlier, 202);
+      assert.equal((await history())[0].headSha, head);
       head = "f".repeat(40);
-      await lifecycle("synchronized");
+      assert.equal(await lifecycle("synchronized"), 202);
       const runs = await history();
       assert.equal(runs.length, 4);
       const [pending] = runs;

@@ -8,6 +8,7 @@ import {
   ForgeOperationError,
   ForgeWebhookError,
   removeIfPresent,
+  reviewRevision,
   verifyStatusComment,
   type Forge,
   type ForgeChange,
@@ -192,21 +193,6 @@ function sameLineRange(
       actual[key].type === expected[key].type &&
       actual[key].new_line === expected[key].new_line &&
       (actual[key].old_line ?? undefined) === expected[key].old_line,
-  );
-}
-
-/** Confirm all diff revisions still match before continuing a multi-request publication. */
-function sameRevision(
-  expected: ForgeChange,
-  actual: ForgeChange,
-  requireReady = false,
-) {
-  return (
-    (!requireReady || actual.draft === false) &&
-    expected.headSha === actual.headSha &&
-    expected.baseSha === actual.baseSha &&
-    expected.mergeBase === actual.mergeBase &&
-    expected.startSha === actual.startSha
   );
 }
 
@@ -853,32 +839,27 @@ export class GitlabForge implements Forge {
     if (summaries.length > 1)
       throw new ForgeOperationError("invalid-response", true);
     if (summaries[0]?.body === completeBody) return summaries[0].id;
-    const current = await this.change(n);
-    const revision = publication.revision ?? current;
-    if (
-      current.headSha !== head ||
-      !sameRevision(revision, current, publication.requireReady)
-    )
-      throw new ForgeOperationError(
-        "invalid-response",
-        !!publication.progress.bulk?.writing,
-      );
     const progress = { ...publication.progress };
     const expected = comments.map((comment, index) => ({
       comment,
       key: `draft-${index}`,
       body: `${comment.body}\n\n<!-- razbor-gitlab-draft:${run}:${index}:${head} -->`,
     }));
-    let drafts = await this.drafts(n);
-    if (
-      drafts.some(
-        (item) =>
-          item.author_id !== bot.id ||
-          !expected.some((entry) => entry.body === item.note),
+    if (!summaries.length && !progress.bulk?.writing && !progress.bulk?.id) {
+      const current = await reviewRevision(this, n, head, publication);
+      const guard = {
+        revision: publication.revision ?? current,
+        requireReady: publication.requireReady,
+      };
+      let drafts = await this.drafts(n);
+      if (
+        drafts.some(
+          (item) =>
+            item.author_id !== bot.id ||
+            !expected.some((entry) => entry.body === item.note),
+        )
       )
-    )
-      throw new ForgeOperationError("invalid-response");
-    if (!summaries.length && !progress.bulk?.writing) {
+        throw new ForgeOperationError("invalid-response");
       const files = comments.length
         ? z
             .array(fileDiff)
@@ -895,17 +876,10 @@ export class GitlabForge implements Forge {
         if (!remote) {
           if (progress[entry.key]?.writing || progress[entry.key]?.id)
             throw new ForgeOperationError("unavailable", true);
-          if (
-            !sameRevision(
-              revision,
-              await this.change(n),
-              publication.requireReady,
-            )
-          )
-            throw new ForgeOperationError("invalid-response");
           progress[entry.key] = { writing: true };
           await publication.save(progress);
           try {
+            await reviewRevision(this, n, head, guard);
             remote = draft.parse(
               await this.transport.request(
                 `${this.changeRoute(n)}/draft_notes`,
@@ -971,12 +945,16 @@ export class GitlabForge implements Forge {
         )
       )
         throw new ForgeOperationError("invalid-response");
-      if (
-        !sameRevision(revision, await this.change(n), publication.requireReady)
-      )
-        throw new ForgeOperationError("invalid-response");
       progress.bulk = { writing: true };
       await publication.save(progress);
+      try {
+        await reviewRevision(this, n, head, guard);
+      } catch (error) {
+        // The bulk request has not been sent. Recovery may still retire these drafts.
+        progress.bulk = {};
+        await publication.save(progress);
+        throw error;
+      }
       try {
         await this.transport.request(
           `${this.changeRoute(n)}/draft_notes/bulk_publish`,
@@ -1023,10 +1001,13 @@ export class GitlabForge implements Forge {
       if (published.length !== 1)
         throw new ForgeOperationError("invalid-response", true);
     }
-    if ((await this.reviewerState(n, bot.id)) !== state)
+    if (
+      progress.summary?.id !== summary.id &&
+      (await this.reviewerState(n, bot.id)) !== state
+    )
       throw new ForgeOperationError("unsupported", true);
-    if (!sameRevision(revision, await this.change(n), publication.requireReady))
-      throw new ForgeOperationError("invalid-response", true);
+    // The bulk request already submitted the verdict and these revision-bound notes.
+    // Completing its existing summary is safe even if the MR has since changed.
     progress.summary = { id: summary.id, writing: true };
     await publication.save(progress);
     const finalized = note.parse(

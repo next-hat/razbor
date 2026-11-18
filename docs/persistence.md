@@ -286,9 +286,10 @@ preparation makes saved indexes queryable again. For lost runner credentials or 
 database reset, see [runner recovery](runner.md#after-deliberately-resetting-the-database).
 
 Delete repositories through **Settings → Delete repository**. Razbor blocks new
-work, then removes the webhook, indexes, credentials, and local history. Retry an
-interrupted cleanup; repair credentials if webhook removal fails. The upstream
-repository and published comments remain.
+work and retires temporary status comments before removing the webhook, indexes,
+credentials, and local history. If comment or webhook removal stalls, restore
+provider connectivity or repair the bot's credentials. The upstream repository
+and published review results remain.
 
 ## Import a legacy indexer
 
