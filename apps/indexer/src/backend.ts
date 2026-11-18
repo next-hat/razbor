@@ -474,6 +474,25 @@ export class MemoryBackend {
     ).stdout;
   }
 
+  /** Require the daemon's explicit stopped status; retain OS errors when status could not run. */
+  private async daemonStopped(signal: AbortSignal) {
+    try {
+      await this.command(["daemon", "status"], signal);
+      return false;
+    } catch (error) {
+      const result = error as { code?: unknown; stdout?: string };
+      if (typeof result.code !== "number")
+        throw new Error(
+          "isolated Codebase Memory daemon status could not be confirmed",
+          { cause: error },
+        );
+      return (
+        result.code === 1 &&
+        String(result.stdout).includes("daemon: not running")
+      );
+    }
+  }
+
   /**
    * Cancel MCP work, stop the isolated daemon, and remove its runtime directory only after
    * confirming daemon exit; fail if shutdown cannot be verified.
@@ -492,24 +511,24 @@ export class MemoryBackend {
     const signal = AbortSignal.timeout(15000);
     try {
       await this.command(["daemon", "stop"], signal);
-    } catch {
-      const stopped = await this.command(["daemon", "status"], signal).then(
-        () => false,
-        (error) =>
-          error.code === 1 &&
-          String(error.stdout).includes("daemon: not running"),
-      );
-      if (!stopped)
-        throw new Error("isolated Codebase Memory daemon could not be stopped");
+    } catch (error) {
+      if (!(await this.daemonStopped(signal)))
+        throw new Error(
+          "isolated Codebase Memory daemon could not be stopped",
+          { cause: error },
+        );
     }
+    let statusError: unknown;
     for (let i = 0; i < 30; i++) {
+      if (signal.aborted && statusError) throw statusError;
       signal.throwIfAborted();
-      const stopped = await this.command(["daemon", "status"], signal).then(
-        () => false,
-        (error) =>
-          error.code === 1 &&
-          String(error.stdout).includes("daemon: not running"),
-      );
+      let stopped = false;
+      try {
+        stopped = await this.daemonStopped(signal);
+        statusError = undefined;
+      } catch (error) {
+        statusError = error;
+      }
       if (stopped) {
         await rm(this.env.CBM_RUNTIME_DIR, { recursive: true, force: true });
         this.log.info(
@@ -520,6 +539,7 @@ export class MemoryBackend {
       }
       await delay(100);
     }
+    if (statusError) throw statusError;
     throw new Error("isolated Codebase Memory daemon did not stop");
   }
 }

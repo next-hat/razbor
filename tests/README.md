@@ -193,15 +193,22 @@ dispatch. Each barrier fails if its request ends early. Condition polling
 shares a deadline with the underlying HTTP fetch. A stalled predicate exercises
 that deadline. Capability checks cover missing and invalid bundles. Startup recovery
 tests exercise an invalid temporary mapping and empty or occupied daemon runtime
-directories. Repeated cleanup scans check for a single warning and cancellation
-for a quarantined temporary checkout, followed by cleanup once its path is
-repaired. The fixtures remove their workspaces, sockets and databases.
+directories. Across repeated cleanup scans, each invalid mapping logs one
+warning. The tests check that the service revokes a quarantined temporary
+checkout, resumes a pending persistent deletion after its path is repaired,
+and preserves an active persistent checkout and unrelated files.
+The fixtures remove their workspaces, sockets and databases.
 
 The indexed case simulates a transient read error on the pinned executable.
 It verifies that health reports unknown graph capability, reviews can retry,
 and an interrupted on-demand index waits for another request. It also checks
-read and execute permission denials. Removing and restoring the fixture's
-bundle verifies the outage diagnostic and automatic recovery of queued setup.
+read and execute permission denials. After read permission returns on the same
+executable, the test checks that requests during the digest retry cooldown
+receive a retryable response. Removing and restoring the fixture's bundle
+verifies the outage diagnostic and automatic recovery of queued setup. A
+separate case restores the bundle immediately after a failed process launch
+and checks that persistent indexing resumes automatically. A missing checkout
+exercises the same OS error and must still produce a setup error.
 It also exercises fetching, refresh, pinned graph access,
 revocation, dirty checkouts, divergence recovery and cleanup. The concurrent
 refresh check waits for the stored workspace state before querying the graph.

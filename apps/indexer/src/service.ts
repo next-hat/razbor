@@ -60,7 +60,7 @@ class CodebaseMemoryUnavailable extends Error {
   constructor(readonly retryable: boolean) {
     super(
       retryable
-        ? "Codebase Memory verification is temporarily unavailable. Retry shortly."
+        ? "Codebase Memory is temporarily unavailable. Retry shortly."
         : codebaseMemoryUnavailableMessage,
     );
   }
@@ -347,10 +347,15 @@ export class IndexService {
           },
           "workspace storage unavailable; verify its owned path before recovery",
         );
+      if (
+        w.temporary ||
+        w.state === "deleting" ||
+        w.repositoryStatus === "deleting"
+      )
+        this.cleanupPending.add(w.id);
       if (w.temporary) {
         // Revoke by durable ID. Keep the unsafe path out of filesystem cleanup
         // until an operator repairs the mapping and the reaper validates it.
-        this.cleanupPending.add(w.id);
         if (firstFailure || w.state !== "deleting")
           this.tokens.cancelWorkspace(w.id);
         if (w.state !== "deleting") {
@@ -413,7 +418,11 @@ export class IndexService {
         };
         this.binaryCheck = check;
       }
-      return this.binaryCheck.available;
+      // Callers sharing a live read get its fresh result. During the I/O cooldown
+      // the last denial cannot confirm whether the bundle is still inaccessible.
+      return this.binaryCheck.retryAt === Infinity
+        ? this.binaryCheck.available
+        : null;
     } catch (error) {
       return bundleAccessUnavailable(error) ? false : null;
     }
@@ -569,10 +578,9 @@ export class IndexService {
         w.repositoryStatus !== "deleting" &&
         !(
           w.temporary &&
-          w.expiresAt !== undefined &&
-          w.expiresAt <= Date.now()
-        ) &&
-        !this.cleanupPending.has(w.id)
+          (this.cleanupPending.has(w.id) ||
+            (w.expiresAt !== undefined && w.expiresAt <= Date.now()))
+        )
       )
         continue;
       if (!this.workspaces.has(w.id)) {
@@ -647,6 +655,43 @@ export class IndexService {
         },
       );
     });
+  }
+
+  /** Retain a bundle launch failure even if the file becomes executable again before cleanup ends. */
+  private async graphPreparationFailure(
+    cause: unknown,
+    workspace?: IndexWorkspace,
+  ) {
+    const unavailable = await this.codebaseMemoryFailure();
+    if (unavailable) return unavailable;
+    const executable = this.config.memory?.executable;
+    // Recovery diagnostics preserve the underlying verification or daemon command failure.
+    const error = (
+      cause instanceof Error && cause.cause instanceof Error
+        ? cause.cause
+        : cause
+    ) as NodeJS.ErrnoException | undefined;
+    if (
+      !executable ||
+      !bundleAccessUnavailable(error) ||
+      error?.path !== executable
+    )
+      return cause;
+    if (error.syscall === "lstat" || error.syscall === "open")
+      return new CodebaseMemoryUnavailable(true);
+    if (!workspace || error.syscall !== `spawn ${executable}`) return cause;
+
+    // Node reports the executable path for a missing or inaccessible cwd as
+    // well. The trailing /. requires a searchable directory even if the
+    // checkout path has since been replaced by a regular file.
+    const cwdAvailable = await access(
+      `${workspace.source.repository}/.`,
+      constants.X_OK,
+    ).then(
+      () => true,
+      () => false,
+    );
+    return cwdAvailable ? new CodebaseMemoryUnavailable(true) : cause;
   }
 
   /**
@@ -763,7 +808,7 @@ export class IndexService {
             (phase === "graph_bootstrap" || phase === "graph_readiness") &&
             !(cause instanceof SynchronizationError) &&
             !this.stop.signal.aborted
-              ? ((await this.codebaseMemoryFailure()) ?? cause)
+              ? await this.graphPreparationFailure(cause, workspace)
               : cause;
           try {
             await repositoryIndexSetup(

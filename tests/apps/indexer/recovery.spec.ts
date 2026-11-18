@@ -85,11 +85,23 @@ test("source-only recovery quarantines invalid checkouts and preserves occupied 
         repositories: {
           source: { ...registration, codebaseMemoryEnabled: false },
           formerIndex: registration,
+          activeIndex: registration,
+          deletingIndex: registration,
         },
       }),
     );
     await ensureDevelopmentWorkspaces(database, owner, dataRoot);
-    const [index] = await ownedWorkspaces(database, owner);
+    const mappings = await ownedWorkspaces(database, owner);
+    /** Find a provisioned mapping by its declared repository name. */
+    async function mapping(name: string) {
+      const id = await resolveRepository(database, name);
+      const workspace = mappings.find((row) => row.repositoryId === id);
+      assert.ok(workspace);
+      return workspace;
+    }
+    const index = await mapping("formerIndex");
+    const active = await mapping("activeIndex");
+    const deleting = await mapping("deletingIndex");
     await mkdir(index.root, { recursive: true, mode: 0o700 });
     const indexSentinel = path.join(index.root, "retain");
     await writeFile(indexSentinel, "existing checkout");
@@ -191,6 +203,21 @@ test("source-only recovery quarantines invalid checkouts and preserves occupied 
     await requestRepositoryDeletion(database, index.repositoryId, {
       confirmation: "formerIndex",
     });
+    // Both persisted paths point outside of owned storage. Only one repository
+    // has requested deletion, including after both mappings are repaired.
+    for (const workspace of [active, deleting]) {
+      await mkdir(workspace.root, { recursive: true });
+      await writeFile(path.join(workspace.root, "retain"), "owned checkout");
+      await administrator.query(
+        "update index_workspaces set root=$1 where public_id=$2",
+        [path.join(oldRoot, workspace.id), workspace.id],
+      );
+      await mkdir(path.join(oldRoot, workspace.id));
+      await writeFile(path.join(oldRoot, workspace.id, "retain"), "unrelated");
+    }
+    await requestRepositoryDeletion(database, deleting.repositoryId, {
+      confirmation: "deletingIndex",
+    });
     service = new IndexService(
       indexerConfigSchema.parse({
         ...config,
@@ -208,18 +235,46 @@ test("source-only recovery quarantines invalid checkouts and preserves occupied 
     assert.equal(await readFile(indexSentinel, "utf8"), "existing checkout");
     await access(socket);
 
-    // Repair only the invalid binding and release the fixture listener. The
-    // reaper retries both durable deletions without a configured graph binary.
-    await administrator.query(
-      "update index_workspaces set root=$1 where public_id=$2",
-      [invalid.root, invalid.id],
+    const observedPolls = polls.mock.callCount();
+    await eventually(
+      async () => polls.mock.callCount() >= observedPolls + 3,
+      8000,
     );
+    /** Count diagnostics for these mappings, including any inappropriate attempt to remove the active one. */
+    function workspaceWarnings(id: string) {
+      return warnings.mock.calls.filter(
+        (call) =>
+          (call.arguments[0] as { workspaceId?: string })?.workspaceId === id,
+      ).length;
+    }
+    assert.equal(workspaceWarnings(deleting.id), 1);
+    assert.equal(workspaceWarnings(active.id), 1);
+
+    // Restore the declared paths and release the fixture listener. The
+    // reaper retries the durable deletions without a configured graph binary.
+    for (const workspace of [invalid, active, deleting])
+      await administrator.query(
+        "update index_workspaces set root=$1 where public_id=$2",
+        [workspace.root, workspace.id],
+      );
     await new Promise<void>((resolve, reject) =>
       occupancy.close((error) => (error ? reject(error) : resolve())),
     );
-    await eventually(
-      async () => !(await ownedWorkspaces(database, owner)).length,
+    await eventually(async () => {
+      const remaining = await ownedWorkspaces(database, owner);
+      return remaining.length === 1 && remaining[0].id === active.id;
+    });
+    assert.equal(workspaceWarnings(active.id), 1);
+    assert.equal(
+      await readFile(path.join(active.root, "retain"), "utf8"),
+      "owned checkout",
     );
+    await assert.rejects(access(deleting.root), { code: "ENOENT" });
+    for (const workspace of [active, deleting])
+      assert.equal(
+        await readFile(path.join(oldRoot, workspace.id, "retain"), "utf8"),
+        "unrelated",
+      );
     await assert.rejects(access(runtime), { code: "ENOENT" });
     await assert.rejects(access(index.root), { code: "ENOENT" });
     assert.equal(

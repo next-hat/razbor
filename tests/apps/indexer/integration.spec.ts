@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
+import { channel } from "node:diagnostics_channel";
 import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -139,6 +141,10 @@ test(
             git: repo,
             indexing: { owner: "local-indexer", persistent: true },
           },
+          launch: {
+            git: repo,
+            indexing: { owner: "local-indexer", persistent: true },
+          },
           onDemand: {
             git: repo,
             indexing: { owner: "local-indexer", persistent: false },
@@ -148,6 +154,7 @@ test(
       await applyRegistry(database, registry);
       const read = fs.createReadStream;
       let failedReads = 0;
+      let deniedAt: number | undefined;
       let readError = "EIO";
       const unavailable = t.mock.method(
         fs,
@@ -155,6 +162,7 @@ test(
         (...[file, options]: Parameters<typeof read>) => {
           if (file === bundle) {
             failedReads++;
+            if (readError === "EACCES") deniedAt = performance.now();
             throw Object.assign(new Error("fixture bundle read interrupted"), {
               code: readError,
             });
@@ -256,17 +264,43 @@ test(
         (await getRepository(database, recoveryId))?.setupState,
         "pending",
       );
-      // A read denied by policy is a confirmed outage even though the file is executable.
-      readError = "EACCES";
-      await eventually(
-        async (signal) =>
-          (
-            await (
-              await request("/health", "GET", admin, undefined, signal)
-            ).json()
-          ).capabilities?.codebaseMemory === false,
+      await t.test(
+        "a cached read denial leaves graph capability unknown after access is repaired",
+        async (t) => {
+          // The reaper observes the fresh denial first. Freeze its cooldown at that instant
+          // so subsequent requests exercise the cached result regardless of HTTP scheduling.
+          const clock = performance.now.bind(performance);
+          t.mock.method(performance, "now", () => deniedAt ?? clock());
+          readError = "EACCES";
+          await eventually(
+            async () =>
+              (await getRepository(database, recoveryId))?.setupError ===
+              codebaseMemoryUnavailableMessage,
+          );
+          unavailable.mock.restore();
+          syncBuiltinESMExports();
+          assert.deepEqual(
+            await (await request("/health", "GET", admin)).json(),
+            { status: "ready" },
+          );
+          const cached = await request(
+            `/repositories/${recoveryId}/index`,
+            "POST",
+            admin,
+            { prepare: false },
+          );
+          assert.equal(cached.status, 503);
+          assert.equal(cached.headers.get("x-razbor-error-code"), null);
+          assert.match((await cached.json()).error, /temporarily unavailable/);
+        },
       );
       await unlink(bundleDirectory);
+      await repositoryIndexSetup(
+        database,
+        "local-indexer",
+        recoveryId,
+        "pending",
+      );
       assert.deepEqual(await (await request("/health", "GET", admin)).json(), {
         status: "ready",
         capabilities: { codebaseMemory: false },
@@ -277,8 +311,6 @@ test(
           codebaseMemoryUnavailableMessage,
       );
       // Restore the same executable after a confirmed missing-bundle outage.
-      unavailable.mock.restore();
-      syncBuiltinESMExports();
       await symlink(path.dirname(executable), bundleDirectory);
       await eventually(
         async (signal) =>
@@ -349,6 +381,118 @@ test(
           assert.equal(
             (await getRepository(database, onDemandId))?.setupState,
             "ready",
+          );
+        },
+      );
+      await t.test(
+        "a restored bundle retries its failed launch while a missing checkout stays failed",
+        async (t) => {
+          const launchId = await resolveRepository(database, "launch");
+          const launch = workspaces.find((w) => w.repositoryId === launchId);
+          assert.ok(launch);
+          const onDemandId = await resolveRepository(database, "onDemand");
+          assert.ok(onDemandId);
+          await ensureDevelopmentWorkspaces(
+            database,
+            "local-indexer",
+            config.service.data_root,
+            onDemandId,
+          );
+          const onDemand = (
+            await ownedWorkspaces(database, "local-indexer")
+          ).find((w) => w.repositoryId === onDemandId);
+          assert.ok(onDemand);
+          const checkout = path.join(onDemand.root, "repository");
+          const parked = path.join(onDemand.root, "parked");
+          let moved = false;
+          let hidden = false;
+          let restored = false;
+          const children = channel("child_process");
+          /** Restore the fixture's bundle as soon as the OS rejects its actual spawn, before the capability recheck. */
+          function observeSpawn(message: unknown) {
+            if (!hidden || restored) return;
+            (message as { process: ChildProcess }).process.once(
+              "error",
+              (error: NodeJS.ErrnoException) => {
+                if (
+                  error.code === "ENOENT" &&
+                  error.path === bundle &&
+                  error.syscall === `spawn ${bundle}`
+                ) {
+                  fs.symlinkSync(path.dirname(executable!), bundleDirectory);
+                  restored = true;
+                }
+              },
+            );
+          }
+          children.subscribe(observeSpawn);
+          const write = fs.promises.writeFile;
+          const interrupt = t.mock.method(
+            fs.promises,
+            "writeFile",
+            async (...args: Parameters<typeof write>) => {
+              await write(...args);
+              // Writing the CBM configuration immediately precedes its version command.
+              if (
+                !moved &&
+                args[0] === path.join(onDemand.root, "state/cache/config.json")
+              ) {
+                await fs.promises.rename(checkout, parked);
+                moved = true;
+              }
+              if (
+                !hidden &&
+                args[0] === path.join(launch.root, "state/cache/config.json")
+              ) {
+                await unlink(bundleDirectory);
+                hidden = true;
+              }
+            },
+          );
+          syncBuiltinESMExports();
+          t.after(async () => {
+            interrupt.mock.restore();
+            syncBuiltinESMExports();
+            children.unsubscribe(observeSpawn);
+            if (moved) await fs.promises.rename(parked, checkout);
+            if (hidden && !restored)
+              await symlink(path.dirname(executable!), bundleDirectory);
+          });
+          /** Request preparation once; the persistent workspace's recovery must come from the reaper. */
+          const prepare = (repository: string) =>
+            request(`/repositories/${repository}/index`, "POST", admin, {
+              prepare: true,
+            });
+          const missingCheckout = await prepare(onDemand.repositoryId);
+          assert.equal(missingCheckout.status, 503);
+          assert.match(
+            (await missingCheckout.json()).error,
+            /index operation failed/,
+          );
+          assert.ok(moved);
+          assert.equal(
+            (await getRepository(database, onDemand.repositoryId))?.setupState,
+            "error",
+          );
+          const lost = await prepare(launch.repositoryId);
+          assert.equal(lost.status, 503);
+          assert.equal(lost.headers.get("x-razbor-error-code"), null);
+          assert.match((await lost.json()).error, /temporarily unavailable/);
+          assert.ok(restored);
+          await eventually(
+            async () =>
+              (await getRepository(database, launch.repositoryId))
+                ?.setupState === "ready",
+            90000,
+          );
+          assert.equal(
+            (await ownedWorkspaces(database, "local-indexer", launch.id))[0]
+              ?.headSha,
+            first,
+          );
+          assert.equal(
+            (await getRepository(database, onDemand.repositoryId))?.setupState,
+            "error",
           );
         },
       );

@@ -119,15 +119,20 @@ export class IndexWorkspace extends OwnedWorkspace {
       if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
     }
     const memory = this.config.memory;
+    let verificationError: unknown;
     const verified =
       memory &&
       (await verifyExecutable(memory.executable).then(
         () => true,
-        () => false,
+        (error: unknown) => {
+          verificationError = error;
+          return false;
+        },
       ));
     if (!verified) {
       const message = `Retained daemon state at ${runtime}. Stop the previous index service, verify its workspace daemon has exited, then remove only this runtime directory and retry cleanup.`;
-      if (!retainWorkspace) throw new Error(message);
+      if (!retainWorkspace)
+        throw new Error(message, { cause: verificationError });
       logger.warn({ workspaceId: this.id }, message);
       return;
     }
