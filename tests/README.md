@@ -83,9 +83,9 @@ needed. All temporary repositories and evaluation files are removed by fixtures.
 
 The release-script regressions run the real shell script with temporary Docker
 and Git recorders. They verify rejection of implicit publication tags before any
-Docker invocation, explicit CLI/environment tag selection and unchanged local
-load defaults. They neither build nor publish images. Run `pnpm run test:release`
-separately from provider and database integration suites.
+Docker invocation, explicit CLI/environment tag selection, local load defaults,
+and Dockerfile stage selection for source-only and standard builds.
+Run `pnpm run test:release` separately from provider and database integration suites.
 
 ## Audited revision evaluation
 
@@ -140,8 +140,10 @@ persistent workspace actually prepared. Broker tests exercise capability-based
 creation defaults and the review error for an unavailable required index. A
 database constraint forces the terminal write to fail, so the broker test
 can verify that pg-boss retries the job and the review subsequently finishes.
-Persistence checks verify that bundle recovery affects only the owner's eligible
-repositories and preserves unrelated setup errors and active preparations.
+The broker also retries an indexed review after a transient source-service
+failure and delivers it under a new attempt ID. Persistence checks compare
+the full repository list before and after an outage and recovery, including
+unrelated setup errors and active preparations.
 
 The fixture creates PostgreSQL migration and restricted runtime roles, including
 the pg-boss schema. Comment tests use local sockets and never contact a real forge
@@ -191,16 +193,24 @@ dispatch. Each barrier fails if its request ends early. Condition polling
 shares a deadline with the underlying HTTP fetch. A stalled predicate exercises
 that deadline. Capability checks cover missing and invalid bundles. Startup recovery
 tests exercise an invalid temporary mapping and empty or occupied daemon runtime
-directories. The fixtures remove their workspaces, sockets and databases.
+directories. Repeated cleanup scans check for a single warning and cancellation
+for a quarantined temporary checkout, followed by cleanup once its path is
+repaired. The fixtures remove their workspaces, sockets and databases.
 
-The indexed case simulates a transient read error on the pinned executable,
-then checks that health recovers and queued setup resumes with the same binary.
+The indexed case simulates a transient read error on the pinned executable.
+It verifies that health reports unknown graph capability, reviews can retry,
+and an interrupted on-demand index waits for another request. It also checks
+read and execute permission denials. Removing and restoring the fixture's
+bundle verifies the outage diagnostic and automatic recovery of queued setup.
 It also exercises fetching, refresh, pinned graph access,
-revocation, dirty checkouts, divergence recovery and cleanup. A connected client
-checks the current Git policy after a branch change. A PostgreSQL advisory lock
+revocation, dirty checkouts, divergence recovery and cleanup. The concurrent
+refresh check waits for the stored workspace state before querying the graph.
+A connected client checks the current Git policy after a branch change.
+A PostgreSQL advisory lock
 and trigger interrupt retirement at its durable state write so re-enabling can
 exercise the cleanup retry. A separate test holds a stale database snapshot
-while a repository is re-enabled, refreshes its retained workspace by ID, and
+while a repository is re-enabled, waits for retirement to settle before
+checking the retained handle, refreshes its workspace by ID, and
 checks that the graph daemon stops and the checkout survives when the registry
 is unavailable during shutdown. Another holds startup inside a database
 transaction to verify that the successor can acquire the storage lock only

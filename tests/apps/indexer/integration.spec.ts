@@ -13,11 +13,12 @@ import {
   access,
   readdir,
   symlink,
+  unlink,
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { setImmediate, setTimeout as delay } from "node:timers/promises";
+import { setImmediate } from "node:timers/promises";
 
 import {
   Client,
@@ -75,6 +76,10 @@ test(
     timeout: 240000,
   },
   async (t) => {
+    assert.ok(
+      executable && path.isAbsolute(executable),
+      "CBM_EXECUTABLE must be an absolute path",
+    );
     const root = await mkdtemp(path.join(os.tmpdir(), "razbor-index-test-"));
     const upstream = path.join(root, "upstream.git");
     const admin = randomBytes(32).toString("base64url");
@@ -84,6 +89,9 @@ test(
     const clients: Client[] = [];
     let service: IndexService | undefined;
     try {
+      const bundleDirectory = path.join(root, "bundle");
+      const bundle = path.join(bundleDirectory, path.basename(executable));
+      await symlink(path.dirname(executable), bundleDirectory);
       await fixtureUpstream(upstream);
       const files = {
         "math.ts":
@@ -105,7 +113,7 @@ test(
           data_root: path.join(root, "data"),
           management_token: { env: "UNUSED_FIXTURE_ADMIN" },
         },
-        memory: { executable, index_ms: 60000 },
+        memory: { executable: bundle, index_ms: 60000 },
         repositories: { fixture: repo, other: repo },
         tokens: [
           {
@@ -131,19 +139,24 @@ test(
             git: repo,
             indexing: { owner: "local-indexer", persistent: true },
           },
+          onDemand: {
+            git: repo,
+            indexing: { owner: "local-indexer", persistent: false },
+          },
         },
       });
       await applyRegistry(database, registry);
       const read = fs.createReadStream;
       let failedReads = 0;
+      let readError = "EIO";
       const unavailable = t.mock.method(
         fs,
         "createReadStream",
         (...[file, options]: Parameters<typeof read>) => {
-          if (file === executable) {
+          if (file === bundle) {
             failedReads++;
             throw Object.assign(new Error("fixture bundle read interrupted"), {
-              code: "EIO",
+              code: readError,
             });
           }
           return read(file, options);
@@ -215,7 +228,6 @@ test(
             await (await request("/health", "GET", admin)).json(),
             {
               status: "ready",
-              capabilities: { codebaseMemory: false },
             },
           );
         }),
@@ -227,26 +239,118 @@ test(
         recoveryId,
         "pending",
       );
-      await eventually(
-        async () =>
-          (await getRepository(database, recoveryId))?.setupError ===
-          codebaseMemoryUnavailableMessage,
+      const interrupted = await prepareReview(first, first, recoveryId);
+      const retryable = await request("/reviews", "POST", admin, {
+        ...interrupted,
+        repositoryId: recoveryId,
+        baseSha: first,
+        headSha: first,
+        ttlMs: 30000,
+      });
+      assert.equal(retryable.status, 503);
+      assert.equal(retryable.headers.get("x-razbor-error-code"), null);
+      assert.match((await retryable.json()).error, /temporarily unavailable/);
+      // A maintenance probe has retried the unreadable bundle. Keep the pending setup eligible.
+      await eventually(async () => failedReads >= 2);
+      assert.equal(
+        (await getRepository(database, recoveryId))?.setupState,
+        "pending",
       );
-      // Restore read access without changing the executable identity or restarting the service.
-      unavailable.mock.restore();
-      syncBuiltinESMExports();
+      // A read denied by policy is a confirmed outage even though the file is executable.
+      readError = "EACCES";
       await eventually(
         async (signal) =>
           (
             await (
               await request("/health", "GET", admin, undefined, signal)
             ).json()
-          ).capabilities.codebaseMemory,
+          ).capabilities?.codebaseMemory === false,
+      );
+      await unlink(bundleDirectory);
+      assert.deepEqual(await (await request("/health", "GET", admin)).json(), {
+        status: "ready",
+        capabilities: { codebaseMemory: false },
+      });
+      await eventually(
+        async () =>
+          (await getRepository(database, recoveryId))?.setupError ===
+          codebaseMemoryUnavailableMessage,
+      );
+      // Restore the same executable after a confirmed missing-bundle outage.
+      unavailable.mock.restore();
+      syncBuiltinESMExports();
+      await symlink(path.dirname(executable), bundleDirectory);
+      await eventually(
+        async (signal) =>
+          (
+            await (
+              await request("/health", "GET", admin, undefined, signal)
+            ).json()
+          ).capabilities?.codebaseMemory === true,
       );
       await eventually(
         async () =>
           (await getRepository(database, recoveryId))?.setupState === "ready",
         90000,
+      );
+      await t.test(
+        "effective execute permission and an interrupted on-demand preparation",
+        async (t) => {
+          const onDemandId = await resolveRepository(database, "onDemand");
+          assert.ok(onDemandId);
+          const checkAccess = fs.promises.access;
+          let denyExecute = true;
+          const permissions = t.mock.method(
+            fs.promises,
+            "access",
+            async (...args: Parameters<typeof checkAccess>) => {
+              if (args[0] === bundle && args[1] === fs.constants.X_OK) {
+                if (denyExecute)
+                  throw Object.assign(new Error("fixture execute denied"), {
+                    code: "EPERM",
+                  });
+                // Interrupt the in-flight check after the first admission has provisioned the workspace.
+                if (
+                  (await getRepository(database, onDemandId))?.setupState ===
+                  "indexing"
+                )
+                  throw Object.assign(new Error("fixture access interrupted"), {
+                    code: "EMFILE",
+                  });
+              }
+              return checkAccess(...args);
+            },
+          );
+          syncBuiltinESMExports();
+          t.after(() => {
+            permissions.mock.restore();
+            syncBuiltinESMExports();
+          });
+          /** Request the on-demand graph through its management entry point. */
+          const provision = () =>
+            request(`/repositories/${onDemandId}/index`, "POST", admin, {
+              prepare: true,
+            });
+          const denied = await provision();
+          assert.equal(denied.status, 503);
+          assert.equal(
+            denied.headers.get("x-razbor-error-code"),
+            codebaseMemoryUnavailableCode,
+          );
+          await denied.body?.cancel();
+          denyExecute = false;
+          const interrupted = await provision();
+          assert.equal(interrupted.status, 503);
+          assert.equal(interrupted.headers.get("x-razbor-error-code"), null);
+          assert.match(
+            (await interrupted.json()).error,
+            /temporarily unavailable/,
+          );
+          assert.equal(
+            (await getRepository(database, onDemandId))?.setupState,
+            "ready",
+          );
+        },
       );
       /** Connect an authenticated MCP client and track it for fixture cleanup. */
       const connect = async (token: string) => {
@@ -388,10 +492,20 @@ test(
         "POST",
         development,
       );
-      await delay(50);
-      const duringRefresh = devClient.callTool(
-        { name: "index_status", arguments: { format: "json" } },
-        { timeout: 90000 },
+      // Preparation owns the workspace queue before it publishes unready. A
+      // fast refresh may already have published the new head when we observe it.
+      const duringRefresh = eventually(async () => {
+        const [workspace] = await ownedWorkspaces(
+          database,
+          config.service.owner,
+          devWorkspace.id,
+        );
+        return workspace?.state === "unready" || workspace?.headSha === second;
+      }).then(() =>
+        devClient.callTool(
+          { name: "index_status", arguments: { format: "json" } },
+          { timeout: 90000 },
+        ),
       );
       const [firstRefresh, status] = await Promise.all([
         refreshing,

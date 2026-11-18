@@ -144,8 +144,13 @@ test("bundle recovery retries only affected persistent setup and preserves unrel
       )
     ).rows;
   const before = await snapshot();
+  const keys = before.map((row) => row.config_key);
   await reconcileIndexCapability(db, owner, false);
   const unavailable = await snapshot();
+  assert.deepEqual(
+    unavailable.map((row) => row.config_key),
+    keys,
+  );
   for (const [index, row] of unavailable.entries()) {
     if (["persistent", "onDemand"].includes(row.config_key))
       assert.deepEqual(
@@ -158,6 +163,10 @@ test("bundle recovery retries only affected persistent setup and preserves unrel
   assert.deepEqual(await snapshot(), unavailable);
   await reconcileIndexCapability(db, owner, true);
   const recovered = await snapshot();
+  assert.deepEqual(
+    recovered.map((row) => row.config_key),
+    keys,
+  );
   for (const [index, row] of recovered.entries()) {
     if (row.config_key === "persistent" || row.config_key === "onDemand")
       assert.deepEqual(
@@ -168,6 +177,29 @@ test("bundle recovery retries only affected persistent setup and preserves unrel
   }
   await reconcileIndexCapability(db, owner, true);
   assert.deepEqual(await snapshot(), recovered);
+
+  const repos = await listRepositories(db);
+  const persistent = repos.find((repo) => repo.configKey === "persistent");
+  const onDemand = repos.find((repo) => repo.configKey === "onDemand");
+  assert.ok(persistent && onDemand);
+  for (const repo of [persistent, onDemand]) {
+    await repositoryIndexSetup(db, owner, repo.id, "indexing");
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "interrupted"),
+      true,
+    );
+    assert.equal(
+      (await getRepository(db, repo.id))?.setupState,
+      repo.persistent ? "pending" : "ready",
+    );
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "interrupted"),
+      false,
+    );
+  }
+  assert.deepEqual(await pendingRepositoryIndexes(db, owner), [
+    { id: persistent.id },
+  ]);
 });
 
 test("repository settings fence index grants while preserving an active attempt's source and index policy", async (t) => {

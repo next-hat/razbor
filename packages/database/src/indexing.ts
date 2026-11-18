@@ -933,6 +933,8 @@ export async function recoverRepositoryIndexSetup(
     );
 }
 
+const setupAfterInterruption = sql`case when ${repositories.persistent} then 'pending' else 'ready' end`;
+
 /**
  * Mark queued setup while the bundle is missing. When it returns, retry persistent setup
  * and let on-demand repositories wait for their next request. Live jobs publish their own result.
@@ -945,9 +947,7 @@ export async function reconcileIndexCapability(
   await database.db
     .update(repositories)
     .set({
-      setupState: available
-        ? sql`case when ${repositories.persistent} then 'pending' else 'ready' end`
-        : "error",
+      setupState: available ? setupAfterInterruption : "error",
       setupError: available ? null : codebaseMemoryUnavailableMessage,
       updatedAt: new Date(),
     })
@@ -989,12 +989,13 @@ export async function pendingRepositoryIndexes(
 /**
  * Update owned repository setup while its Git policy still matches. A preparation
  * that completed across a preference change can publish its exact stored revision.
+ * A transient interruption returns only in-progress work to its configured setup mode.
  */
 export async function repositoryIndexSetup(
   database: Database,
   owner: string,
   repositoryId: string,
-  state: "pending" | "indexing" | "ready" | "error",
+  state: "pending" | "indexing" | "ready" | "error" | "interrupted",
   error?: string,
   policy?: GitPolicy,
   pinnedAttemptId?: string,
@@ -1029,7 +1030,7 @@ export async function repositoryIndexSetup(
   const updated = await database.db
     .update(repositories)
     .set({
-      setupState: state,
+      setupState: state === "interrupted" ? setupAfterInterruption : state,
       setupError:
         state === "error"
           ? (error?.slice(0, 256) ?? "Indexing failed; retry setup.")
@@ -1040,7 +1041,7 @@ export async function repositoryIndexSetup(
       and(
         binding,
         eq(repositories.codebaseMemoryEnabled, true),
-        state === "ready" || state === "error"
+        state === "ready" || state === "error" || state === "interrupted"
           ? (completedWorkspace ?? eq(repositories.setupState, "indexing"))
           : undefined,
       ),

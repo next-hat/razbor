@@ -27,8 +27,10 @@ import {
   submitReview,
 } from "@razbor/database";
 import { applyRegistry, registrySchema } from "@razbor/database/registry";
+import { logger } from "@razbor/harness/logger";
 import { indexerConfigSchema } from "@razbor/indexer/config";
 import { IndexService } from "@razbor/indexer/service";
+import { Tokens } from "@razbor/indexer/tokens";
 
 import { eventually } from "@tests/apps/indexer/fixtures.js";
 import { databaseFixture } from "@tests/packages/database/fixture.js";
@@ -140,6 +142,9 @@ test("source-only recovery quarantines invalid checkouts and preserves occupied 
       [oldRoot, invalid.id],
     );
 
+    const warnings = t.mock.method(logger, "warn");
+    const cancellations = t.mock.method(Tokens.prototype, "cancelWorkspace");
+    const polls = t.mock.method(Tokens.prototype, "poll");
     service = new IndexService(config, admin, database);
     const port = await service.listen();
     const health = await fetch(`http://127.0.0.1:${port}/health`, {
@@ -162,6 +167,23 @@ test("source-only recovery quarantines invalid checkouts and preserves occupied 
     assert.equal(await readFile(indexSentinel, "utf8"), "existing checkout");
     await access(socket);
     await assert.rejects(access(valid.root), { code: "ENOENT" });
+
+    // Three serial reaper starts guarantee at least two complete scans after startup.
+    await eventually(() => Promise.resolve(polls.mock.callCount() >= 3), 8000);
+    assert.equal(
+      warnings.mock.calls.filter(
+        (call) =>
+          call.arguments[1] ===
+          "workspace storage unavailable; verify its owned path before recovery",
+      ).length,
+      1,
+    );
+    assert.equal(
+      cancellations.mock.calls.filter(
+        (call) => call.arguments[0] === invalid.id,
+      ).length,
+      1,
+    );
 
     // Retiring a retained checkout can finish even with a populated IPC
     // namespace. Actual deletion must await proof the daemon is gone.

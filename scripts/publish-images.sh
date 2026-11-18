@@ -61,15 +61,14 @@ fi
 for service in "${services[@]}"; do
   image="ghcr.io/next-hat/razbor-$service:$tag"
   echo "Building $image ($output)"
-  dockerfile="$service"
-  target=()
   case "$service" in
-    source) dockerfile=indexer; target=(--target source) ;;
-    postgres-core) dockerfile=postgres; target=(--target core) ;;
+    source) build_file=(--file "$root/docker/indexer.Dockerfile" --target source) ;;
+    postgres-core) build_file=(--file "$root/docker/postgres.Dockerfile" --target core) ;;
+    *) build_file=(--file "$root/docker/$service.Dockerfile") ;;
   esac
   docker buildx build \
     --platform linux/amd64 \
-    --file "$root/docker/$dockerfile.Dockerfile" "${target[@]}" \
+    "${build_file[@]}" \
     --tag "$image" \
     --build-arg "VERSION=$tag" \
     --build-arg "REVISION=$revision" \

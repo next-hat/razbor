@@ -57,9 +57,24 @@ import { Embeddings } from "@indexer/src/embeddings.js";
 
 class CodebaseMemoryUnavailable extends Error {
   /** Carry a public diagnostic without exposing local paths or dependency errors. */
-  constructor() {
-    super(codebaseMemoryUnavailableMessage);
+  constructor(readonly retryable: boolean) {
+    super(
+      retryable
+        ? "Codebase Memory verification is temporarily unavailable. Retry shortly."
+        : codebaseMemoryUnavailableMessage,
+    );
   }
+}
+
+/** Identify a missing or permission-denied bundle from the filesystem operation itself. */
+function bundleAccessUnavailable(error: unknown) {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return (
+    code === "ENOENT" ||
+    code === "ENOTDIR" ||
+    code === "EACCES" ||
+    code === "EPERM"
+  );
 }
 
 const leaseSchema = reviewRequestSchema
@@ -147,7 +162,7 @@ export class IndexService {
   private indexResources?: Promise<Embeddings | undefined>;
   private binaryCheck?: {
     identity: string;
-    available: Promise<boolean>;
+    available: Promise<boolean | null>;
     retryAt: number;
   };
   private readonly preparations = new Map<
@@ -321,31 +336,36 @@ export class IndexService {
     try {
       await validateWorkspaceStorage(this.config.service.data_root, w);
     } catch (error) {
-      logger.warn(
-        {
-          workspaceId: w.id,
-          repositoryId: w.repositoryId,
-          temporary: w.temporary,
-          error: errorDetails(error),
-        },
-        "workspace storage unavailable; verify its owned path before recovery",
-      );
+      const firstFailure = !this.cleanupPending.has(w.id);
+      if (firstFailure)
+        logger.warn(
+          {
+            workspaceId: w.id,
+            repositoryId: w.repositoryId,
+            temporary: w.temporary,
+            error: errorDetails(error),
+          },
+          "workspace storage unavailable; verify its owned path before recovery",
+        );
       if (w.temporary) {
         // Revoke by durable ID. Keep the unsafe path out of filesystem cleanup
         // until an operator repairs the mapping and the reaper validates it.
         this.cleanupPending.add(w.id);
-        this.tokens.cancelWorkspace(w.id);
-        if (w.state !== "deleting")
+        if (firstFailure || w.state !== "deleting")
+          this.tokens.cancelWorkspace(w.id);
+        if (w.state !== "deleting") {
           await startWorkspaceDeletion(
             this.database,
             this.config.service.owner,
             w.id,
-          ).catch((cause: unknown) =>
-            logger.warn(
-              { workspaceId: w.id, error: errorDetails(cause) },
-              "workspace revocation will retry",
-            ),
-          );
+          ).catch((cause: unknown) => {
+            if (firstFailure)
+              logger.warn(
+                { workspaceId: w.id, error: errorDetails(cause) },
+                "workspace revocation will retry",
+              );
+          });
+        }
       }
       return;
     }
@@ -364,7 +384,8 @@ export class IndexService {
 
   /**
    * Check the configured bundle without starting a graph or contacting embeddings.
-   * Reuse a definitive verification for the same file and retry transient read failures.
+   * Return null for inconclusive I/O. Retry failed hash reads after a short cooldown
+   * and reuse completed digest checks while the file identity and change time match.
    */
   private async supportsCodebaseMemory() {
     const executable = this.config.memory?.executable;
@@ -384,18 +405,25 @@ export class IndexService {
           available: verifyExecutable(executable).then(
             () => true,
             (error: unknown) => {
-              if (!(error instanceof UnsupportedExecutable))
-                check.retryAt = performance.now() + 5000;
-              return false;
+              if (error instanceof UnsupportedExecutable) return false;
+              check.retryAt = performance.now() + 5000;
+              return bundleAccessUnavailable(error) ? false : null;
             },
           ),
         };
         this.binaryCheck = check;
       }
       return this.binaryCheck.available;
-    } catch {
-      return false;
+    } catch (error) {
+      return bundleAccessUnavailable(error) ? false : null;
     }
+  }
+
+  /** Distinguish a confirmed deployment mismatch from an inconclusive capability probe. */
+  private async codebaseMemoryFailure() {
+    const available = await this.supportsCodebaseMemory();
+    if (available !== true)
+      return new CodebaseMemoryUnavailable(available === null);
   }
 
   /** Load embedding storage and credentials only for an indexed preparation, retrying failures. */
@@ -419,8 +447,8 @@ export class IndexService {
     repositoryId: string,
     attemptId?: string,
   ): Promise<IndexWorkspace> {
-    if (!(await this.supportsCodebaseMemory()))
-      throw new CodebaseMemoryUnavailable();
+    const failure = await this.codebaseMemoryFailure();
+    if (failure) throw failure;
     await assertRepositoryActive(
       this.database,
       this.config.service.owner,
@@ -561,6 +589,7 @@ export class IndexService {
         );
     }
     const available = await this.supportsCodebaseMemory();
+    if (available === null) return;
     await reconcileIndexCapability(
       this.database,
       this.config.service.owner,
@@ -733,16 +762,19 @@ export class IndexService {
           const error =
             (phase === "graph_bootstrap" || phase === "graph_readiness") &&
             !(cause instanceof SynchronizationError) &&
-            !this.stop.signal.aborted &&
-            !(await this.supportsCodebaseMemory())
-              ? new CodebaseMemoryUnavailable()
+            !this.stop.signal.aborted
+              ? ((await this.codebaseMemoryFailure()) ?? cause)
               : cause;
           try {
             await repositoryIndexSetup(
               this.database,
               this.config.service.owner,
               repositoryId,
-              this.stop.signal.aborted ? "pending" : "error",
+              this.stop.signal.aborted
+                ? "pending"
+                : error instanceof CodebaseMemoryUnavailable && error.retryable
+                  ? "interrupted"
+                  : "error",
               error instanceof SynchronizationError ||
                 error instanceof CodebaseMemoryUnavailable
                 ? error.message
@@ -852,7 +884,7 @@ export class IndexService {
         "index request failed",
       );
       if (!response.headersSent && !response.destroyed) {
-        if (error instanceof CodebaseMemoryUnavailable)
+        if (error instanceof CodebaseMemoryUnavailable && !error.retryable)
           response.setHeader(
             "x-razbor-error-code",
             codebaseMemoryUnavailableCode,
@@ -1063,9 +1095,12 @@ export class IndexService {
   ) {
     if (request.method === "GET" && url.pathname === "/health") {
       await this.database.ready();
+      const codebaseMemory = await this.supportsCodebaseMemory();
       json(response, 200, {
         status: "ready",
-        capabilities: { codebaseMemory: await this.supportsCodebaseMemory() },
+        ...(codebaseMemory === null
+          ? {}
+          : { capabilities: { codebaseMemory } }),
       });
       return true;
     }
@@ -1198,8 +1233,10 @@ export class IndexService {
     const started = performance.now();
     let phase = "review_source";
     try {
-      if (saved.codebaseMemoryEnabled && !(await this.supportsCodebaseMemory()))
-        throw new CodebaseMemoryUnavailable();
+      if (saved.codebaseMemoryEnabled) {
+        const failure = await this.codebaseMemoryFailure();
+        if (failure) throw failure;
+      }
       await workspace.prepareReviewSource(signal, lease);
 
       /** Publish the verified checkout before issuing its attempt-scoped token. */

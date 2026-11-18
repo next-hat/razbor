@@ -45,6 +45,8 @@ to source-only. Existing repositories keep their preference. Disable indexing
 under **Settings → General** or install the supported bundle. Once the source
 service verifies the bundle, it automatically resumes setup for repositories
 whose setup failed because the bundle was unavailable.
+If the service temporarily cannot read the bundle, it reports graph capability
+as unknown. Affected indexed reviews can retry within their queue retry limit.
 For file-managed repositories, set `codebaseMemoryEnabled = false` under each
 repository table to choose source-only explicitly. Reapplying a registry with
 the setting omitted preserves the saved choice. For new registrations, point

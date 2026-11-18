@@ -68,6 +68,7 @@ test(
     const workspaceId = "idx_0123456789ABCDEF";
     let advertised: boolean | "legacy" | "offline" = false;
     let rejectIndex = false;
+    let interruptedBinding: { reviewId: string; attemptId: string } | undefined;
     // Exercise the production broker against the management protocol, substituting
     // only the source service. Git pack contents are covered by the source fixture.
     const server = createServer(async (request, response) => {
@@ -97,6 +98,14 @@ test(
         const chunks: Buffer[] = [];
         for await (const chunk of request) chunks.push(chunk);
         const binding = JSON.parse(Buffer.concat(chunks).toString());
+        if (binding.repositoryId === indexedRepository && !interruptedBinding) {
+          interruptedBinding = {
+            reviewId: binding.reviewId,
+            attemptId: binding.attemptId,
+          };
+          response.writeHead(503).end();
+          return;
+        }
         if (rejectIndex) {
           response
             .writeHead(503, {
@@ -249,6 +258,8 @@ test(
         (item) => item.job.repositoryId === indexedRepository,
       )!;
       assert.ok(plain && indexed);
+      assert.equal(indexed.job.reviewId, interruptedBinding?.reviewId);
+      assert.notEqual(indexed.attemptId, interruptedBinding?.attemptId);
       assert.equal(plain.index, undefined);
       assert.deepEqual(indexed.index, {
         project: workspaceId,

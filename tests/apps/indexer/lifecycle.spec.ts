@@ -1,14 +1,18 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, type ChildProcess } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
+import { channel } from "node:diagnostics_channel";
+import { once } from "node:events";
 import { access, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { pathToFileURL } from "node:url";
 
+import { codebaseMemoryUnavailableMessage } from "@razbor/contracts";
 import {
   ensureDevelopmentWorkspaces,
+  getRepository,
   issueToken,
   ownedWorkspaces,
   resolveRepository,
@@ -35,8 +39,6 @@ test(
   async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "razbor-retirement-"));
     t.after(() => rm(root, { recursive: true, force: true }));
-    const state = await databaseFixture();
-    const { administrator, database } = state;
     const admin = randomBytes(32).toString("base64url");
     const dataRoot = path.join(root, "data");
     const upstream = path.join(root, "upstream.git");
@@ -49,6 +51,9 @@ test(
       },
       memory: { executable },
     });
+    const state = await databaseFixture();
+    t.after(() => state.close());
+    const { administrator, database } = state;
     const owner = config.service.owner;
     const service = new IndexService(config, admin, database);
     let shutdownChecked = false;
@@ -103,12 +108,18 @@ test(
       create policy fixture_read on index_workspaces for select using (fixture_observe_scan());
       create policy fixture_write on index_workspaces for update using (true) with check (true);
     `);
-      /** Observe fixture evidence through the administrative connection outside the read gate. */
-      async function scanCount() {
-        const result = await administrator.query(
-          "select case when is_called then last_value else 0 end as count from fixture_workspace_scans",
+      /** Admit the current handle through the same reservation that serializes retirement. */
+      async function admit() {
+        const admitted = await fetch(
+          `http://127.0.0.1:${port}/repositories/${repository}/index`,
+          {
+            method: "POST",
+            headers: { Authorization: `Bearer ${admin}` },
+            body: JSON.stringify({ prepare: false }),
+            signal: AbortSignal.timeout(8000),
+          },
         );
-        return Number(result.rows[0].count);
+        assert.equal(admitted.status, 200, await admitted.text());
       }
       /** Read the durable retirement marker without affecting the observed scan count. */
       async function untouched() {
@@ -119,28 +130,39 @@ test(
           )
         ).rows[0].untouched;
       }
-      let admissions: number;
       try {
-        await eventually(async () => (await scanCount()) > 0, 5000);
-        await enable(true);
-        const admitted = await fetch(
-          `http://127.0.0.1:${port}/repositories/${repository}/index`,
-          {
-            method: "POST",
-            headers: { Authorization: `Bearer ${admin}` },
-            body: JSON.stringify({ prepare: false }),
-          },
+        await eventually(
+          async () =>
+            (
+              await administrator.query(
+                "select is_called from fixture_workspace_scans",
+              )
+            ).rows[0].is_called,
+          5000,
         );
-        assert.equal(admitted.status, 200, await admitted.text());
+        await enable(true);
+        await admit();
         await administrator.query(
           "update index_workspaces set updated_at='2000-01-01' where public_id=$1",
           [workspace.id],
         );
-        admissions = await scanCount();
+        // The same reaper pass reconciles this on-demand repository only after
+        // it has registered any retirement suggested by the held snapshot.
+        await administrator.query(
+          "update repositories set setup_state='error', setup_error=$1 where public_id=$2",
+          [codebaseMemoryUnavailableMessage, repository],
+        );
       } finally {
         await administrator.query("select pg_advisory_unlock(419272, 2)");
       }
-      await eventually(async () => (await scanCount()) >= admissions + 2, 8000);
+      await eventually(
+        async () =>
+          (await getRepository(database, repository))?.setupState === "ready",
+        8000,
+      );
+      // A scheduled retirement can still be running after reconciliation. This
+      // request must wait for it, including its durable workspace-state write.
+      await admit();
       assert.equal(
         await untouched(),
         true,
@@ -181,11 +203,7 @@ test(
         "true",
       ]);
     } finally {
-      try {
-        if (!shutdownChecked) await service.close();
-      } finally {
-        await state.close();
-      }
+      if (!shutdownChecked) await service.close();
     }
   },
 );
@@ -196,7 +214,6 @@ test(
   async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "razbor-startup-"));
     t.after(() => rm(root, { recursive: true, force: true }));
-    const state = await databaseFixture();
     const admin = randomBytes(32).toString("base64url");
     const config = indexerConfigSchema.parse({
       service: {
@@ -207,7 +224,17 @@ test(
       },
       memory: { executable: path.join(root, "missing") },
     });
+    const state = await databaseFixture();
+    t.after(() => state.close());
     const service = new IndexService(config, admin, state.database);
+    const lockPath = path.join(root, "service.lock");
+    const probeLock = [
+      "--nonblock",
+      "--conflict-exit-code",
+      "73",
+      lockPath,
+      "true",
+    ];
     try {
       await applyRegistry(
         state.database,
@@ -231,6 +258,13 @@ test(
       // Hold the ordinary provisioning transaction at its lock after this owner
       // acquires storage. The shutdown signal must wait for startup to relinquish it.
       await state.administrator.query("select pg_advisory_lock(748321, 3)");
+      const spawned: ChildProcess[] = [];
+      const children = channel("child_process");
+      /** Keep the fixture's real guard handle so an early EOF can be observed through process exit. */
+      function observeChild(message: unknown) {
+        spawned.push((message as { process: ChildProcess }).process);
+      }
+      children.subscribe(observeChild);
       const listening = service.listen();
       const interrupted = assert.rejects(listening, /abort/i);
       try {
@@ -243,7 +277,23 @@ test(
             ).rows[0].waiting,
           5000,
         );
+        const guard = spawned.find(
+          (child) =>
+            child.spawnfile === "flock" && child.spawnargs.includes(lockPath),
+        );
+        assert.ok(guard?.stdin, "fixture storage lock guard missing");
+        void service.close().catch(() => {}); // The shared shutdown promise is awaited in finally.
+        // If shutdown signalled EOF early, wait for the kernel lock to be
+        // released instead of racing the child's exit with the flock probe.
+        if (
+          guard.stdin.writableEnded &&
+          guard.exitCode === null &&
+          guard.signalCode === null
+        )
+          await once(guard, "exit", { signal: AbortSignal.timeout(5000) });
+        assert.throws(() => execFileSync("flock", probeLock), { status: 73 });
       } finally {
+        children.unsubscribe(observeChild);
         // At the exact point shutdown returns, startup must already have
         // committed the mapping it was provisioning under this storage lock.
         const closing = service.close().then(async () => {
@@ -261,17 +311,9 @@ test(
         await Promise.all([interrupted, closing]);
       }
       await service.close();
-      execFileSync("flock", [
-        "--nonblock",
-        path.join(root, "service.lock"),
-        "true",
-      ]);
+      execFileSync("flock", probeLock);
     } finally {
-      try {
-        await service.close();
-      } finally {
-        await state.close();
-      }
+      await service.close();
     }
   },
 );
