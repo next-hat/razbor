@@ -7,6 +7,7 @@ import {
   MAX_REVIEW_FINDINGS,
   validateFindingChecks,
   type ModelProvider,
+  type MergePolicySnapshot,
   type ReasoningEffort,
   type PreviousFinding,
   type ReviewConversation,
@@ -37,6 +38,7 @@ import type { PreparedDiff } from "@harness/src/tools/diff.js";
 import { inspectReviewEnvironment } from "@harness/src/environment.js";
 import { logger } from "@harness/src/logger.js";
 import { RepositoryTools, toolError } from "@harness/src/tools/repository.js";
+import { capabilityTruncationMarker } from "@harness/src/capabilities/files.js";
 import { ReviewCapabilities } from "@harness/src/capabilities/index.js";
 import {
   git,
@@ -87,6 +89,7 @@ export type ReviewConfig = {
   reviewId: string;
   capabilities?: PreparedCapabilities;
   verification?: VerificationOptions;
+  mergePolicy?: MergePolicySnapshot;
   previousFindings?: PreviousFinding[];
   conversation?: ReviewConversation;
   onProgress?: (event: ReviewProgress) => void;
@@ -334,6 +337,10 @@ function parseReview(
   if (tokenLimitReached) throw new Error("Incomplete review output");
   const review = reviewResultSchema.parse(JSON.parse(text));
   validateFindingChecks(review, config.previousFindings, !!config.conversation);
+  if (config.mergePolicy && !config.conversation && !review.mergeAssessment)
+    throw new Error(
+      "A merge readiness assessment is required for this review.",
+    );
   return review;
 }
 
@@ -430,6 +437,17 @@ export async function reviewRepository(
     await capabilities.start();
     for (const content of capabilities.instructions)
       input.push({ role: "system", content });
+    // Only the server-supplied review snapshot can supply privileged policy.
+    // Keep it in the immutable prompt for every model turn and compaction.
+    if (config.mergePolicy && !config.conversation)
+      input.push({
+        role: "system",
+        content: await renderPrompt("merge-assessment", {
+          version: config.mergePolicy.version,
+          markdown: config.mergePolicy.policy.policyMarkdown,
+          reviewers: config.mergePolicy.policy.humanReviewers,
+        }),
+      });
     const retained: ModelMessage[] = [
       ...input,
       {
@@ -579,6 +597,7 @@ export async function reviewRepository(
     let budgetNotice: ModelMessage | undefined;
     let finalizationReason: string | undefined;
     let boundedOutput = false;
+    const failedTools = new Set<string>();
     /** Replaces the transient budget note so repeated status never grows the transcript. */
     const updateBudgetNotice = (finalizing: boolean) => {
       if (budgetNotice) {
@@ -716,17 +735,37 @@ export async function reviewRepository(
           const output = await verification.call(call.name, call.arguments);
           result = JSON.stringify(output);
           failed = !output.ok;
+          if ("truncated" in output && output.truncated) boundedOutput = true;
+          if (
+            call.name === "exec" &&
+            "exitCode" in output &&
+            output.ok &&
+            !output.truncated
+          ) {
+            rtools.observeExec(output.stdout);
+            prepared.observeExec(
+              (call.arguments as { argv?: unknown }).argv,
+              output.stdout,
+            );
+          }
           if (call.name === "exec" && "exitCode" in output)
             execution = {
               exitCode: output.exitCode,
               timedOut: output.timedOut,
               cancelled: output.cancelled,
             };
-        } else if (call.name === "read_file")
+        } else if (call.name === "read_file") {
           result = await rtools.readFile(call.arguments);
-        else if (call.name === "read_diff")
+          const source = JSON.parse(result);
+          // A read of a nonexistent path is a useful negative observation; a refused blob read is a gap.
+          failed =
+            source.state === "unavailable" || source.state === "unsupported";
+        } else if (call.name === "read_diff")
           result = prepared.read(call.arguments);
-        else result = await capabilities.call(call.name, call.arguments);
+        else {
+          result = await capabilities.call(call.name, call.arguments);
+          if (result.endsWith(capabilityTruncationMarker)) boundedOutput = true;
+        }
       } catch (error) {
         failed = true;
         result = verification.has(call.name)
@@ -738,6 +777,7 @@ export async function reviewRepository(
           : toolError(error);
       }
       config.signal?.throwIfAborted();
+      if (failed) failedTools.add(toolName);
       const evidenceId = `tool-${toolNumber}`;
       /** Serializes one correlated observation so headroom includes JSON escaping. */
       const messageFor = (value: string) => ({
@@ -1066,6 +1106,40 @@ export async function reviewRepository(
       if (capabilities.limitations.length)
         review.summary +=
           "\n\nCapability limitations: " + capabilities.limitations.join(" ");
+      if (review.mergeAssessment && !config.conversation) {
+        const { binaryFiles, unsupportedFiles } = prepared.coverage();
+        const observed = [
+          ...verificationLimitations,
+          ...capabilities.limitations,
+          ...(prepared.unfinishedReads()
+            ? ["A requested diff was only partially inspected."]
+            : []),
+          ...(rtools.unfinishedSourceReads()
+            ? ["A requested source range was only partially inspected."]
+            : []),
+          ...(boundedOutput ? ["Tool evidence was truncated."] : []),
+          ...(finalizationReason ? [finalizationReason] : []),
+          ...[...failedTools]
+            .sort()
+            .map((name) => `The ${name} tool failed during investigation.`),
+          ...(binaryFiles || unsupportedFiles
+            ? [
+                `Unable to inspect ${binaryFiles} binary and ${unsupportedFiles} unsupported changes.`,
+              ]
+            : []),
+        ];
+        if (observed.length) {
+          // Harness-observed limitations take precedence over contradictory model claims.
+          review.mergeAssessment.reviewComplete = false;
+          review.mergeAssessment.requiresHumanReview = true;
+          review.mergeAssessment.verificationGaps = [
+            ...new Set([
+              ...observed,
+              ...review.mergeAssessment.verificationGaps,
+            ]),
+          ].slice(0, 12);
+        }
+      }
       reportContext();
       progress(
         "result",

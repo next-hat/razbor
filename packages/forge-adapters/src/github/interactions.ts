@@ -11,11 +11,13 @@ import {
 import {
   ForgeOperationError,
   ForgeWebhookError,
-  removeIfPresent,
+  removeTemporaryStatus,
   reviewRevision,
   verifyStatusComment,
   type Forge,
   type ForgeChange,
+  type ForgeMergeCheckpoint,
+  type ForgeMergeRequest,
   type ForgePullRequest,
   type ForgeReviewComment,
   type ForgeReviewPublication,
@@ -26,6 +28,12 @@ import {
   HttpForgeTransport,
   webhookEndpoint,
 } from "@forge-adapters/src/transport.js";
+import { resolveReviewer } from "@forge-adapters/src/merge.js";
+import {
+  inspectGithubMerge,
+  scheduleGithubMerge,
+  cancelGithubMerge,
+} from "@forge-adapters/src/github/merge.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
 
 const id = providerId.pipe(z.string().regex(/^\d+$/));
@@ -217,7 +225,10 @@ export class GithubForge implements Forge {
     "push",
   ] as const;
 
-  readonly capabilities = { resolveThreads: true };
+  readonly capabilities = {
+    resolveThreads: true,
+    guardedMerge: "conditional" as const,
+  };
 
   private readonly route: string;
 
@@ -273,6 +284,52 @@ export class GithubForge implements Forge {
       headers,
       budgetMs,
     );
+  }
+
+  /** Bind the guarded merge operations to this adapter's validated REST and GraphQL origins. */
+  private mergeApi() {
+    return {
+      route: this.route,
+      owner: this.owner,
+      name: this.repository,
+      app: this.connection.githubAppBot,
+      transport: this.transport,
+      graphql: this.graphql.bind(this),
+    };
+  }
+
+  /** Resolve one individual GitHub login, excluding apps and organizations. */
+  reviewerLogin(username: string) {
+    return resolveReviewer(username, async (name) => {
+      const user = z
+        .object({ login: z.string(), type: z.string() })
+        .parse(await this.transport.request(`users/${name}`));
+      return user.type === "User" ? user.login : undefined;
+    });
+  }
+
+  /** Read native branch protection, review and revocable eligibility evidence. */
+  async inspectMerge(request: ForgeMergeRequest) {
+    return (await inspectGithubMerge(this.mergeApi(), request)).decision;
+  }
+
+  /** Enable native auto-merge while the exact revision's check is pending. */
+  scheduleMerge(
+    request: ForgeMergeRequest,
+    resumeOnly = false,
+    checkpoint?: ForgeMergeCheckpoint,
+  ) {
+    return scheduleGithubMerge(
+      this.mergeApi(),
+      request,
+      resumeOnly,
+      checkpoint,
+    );
+  }
+
+  /** Revoke the saved review's App check without mutating a human's schedule. */
+  cancelMerge(request: ForgeMergeRequest) {
+    return cancelGithubMerge(this.mergeApi(), request);
   }
 
   /** Authenticate the raw delivery before extracting supported GitHub events. */
@@ -751,8 +808,9 @@ export class GithubForge implements Forge {
     botId: string,
     marker: string,
   ) {
-    await removeIfPresent(
+    await removeTemporaryStatus(
       commentId,
+      marker,
       async () => {
         await this.transport.request(
           await this.statusRoute(n, commentId, botId, marker),

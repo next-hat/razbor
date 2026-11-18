@@ -12,6 +12,7 @@ import { snapshotRepositoryAgent } from "@database/src/agents.js";
 import type { Database, Transaction } from "@database/src/connection.js";
 import { publicId } from "@database/src/ids.js";
 import { snapshotRepositoryMcpServers } from "@database/src/mcp.js";
+import { latestMergeReview } from "@database/src/merge-policy.js";
 import { rearmStalePublication } from "@database/src/rearm-publication.js";
 import {
   dispatchOutbox,
@@ -299,6 +300,7 @@ async function queueReview(
   forge: ForgeType,
   change: ForgeChange,
   observation: Observation,
+  target: typeof pullRequests.$inferSelect,
   generation: number,
 ) {
   const { event, previous, conversation } = observation;
@@ -307,32 +309,80 @@ async function queueReview(
   // fences runner reservation: only an unstarted review may receive a new revision.
   let queued: typeof reviews.$inferSelect | undefined;
   if (automatic) {
-    const existing = await latestRevisionReview(tx, repo.id, change, false);
-    if (existing) {
+    const [entry] = await latestMergeReview(tx, target.id);
+    const latest = entry?.review;
+    const sameDiff =
+      latest &&
+      latest.headSha === change.headSha &&
+      latest.baseSha === change.mergeBase &&
+      (entry.trigger?.baseSha ?? latest.source.pullRequest?.baseSha) ===
+        change.baseSha &&
+      (!entry.trigger ||
+        (entry.trigger.startSha ?? null) === (change.startSha ?? null));
+    if (
+      sameDiff &&
+      !latest.source.conversation &&
+      (latest.source.mergePolicy?.version ?? 1) === repo.mergePolicyVersion &&
+      (!repo.mergePolicy.enabled ||
+        latest.source.mergeRevision === target.mergeRevision) &&
+      ["queued", "running", "completed"].includes(latest.status)
+    ) {
       await supersedeQueuedAutomaticReviews(
         tx,
         repo.id,
         change.number,
-        existing.id,
+        latest.id,
       );
-      if (existing.status === "completed" && existing.origin)
-        await rearmStalePublication(tx, existing.id, generation);
+      if (latest.status === "completed" && entry.trigger)
+        await rearmStalePublication(tx, latest.id, generation);
       return undefined;
     }
-    const [pending] = await tx
-      .select({ review: reviews })
-      .from(reviews)
-      .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
-      .where(
-        and(
-          sameChange(repo.id, change.number),
-          eq(reviewTriggers.origin, "automatic"),
-          eq(reviews.status, "queued"),
-          eq(reviews.version, 0),
-        ),
-      )
-      .limit(1)
-      .for("update", { of: reviews });
+    // A restored revision can replay its saved stale result without inference
+    // when merge automation is disabled. A newer attempt on this same diff
+    // always takes precedence, including a failed manual re-review.
+    if (latest && !sameDiff && !repo.mergePolicy.enabled) {
+      const candidate = await latestRevisionReview(tx, repo.id, change, true);
+      const [replay] =
+        candidate?.status === "completed" && candidate.origin
+          ? await tx
+              .select({ id: reviews.id })
+              .from(reviews)
+              .innerJoin(
+                dispatchOutbox,
+                eq(dispatchOutbox.reviewId, reviews.id),
+              )
+              .where(
+                and(
+                  eq(reviews.id, candidate.id),
+                  eq(reviews.mergePullRequestId, target.id),
+                  sql`coalesce((${reviews.source}->'mergePolicy'->>'version')::int,1) = ${repo.mergePolicyVersion}`,
+                  sql`(${dispatchOutbox.publication}->>'state' = 'stale' or ${dispatchOutbox.publication}->>'rearmed' = 'true')`,
+                ),
+              )
+          : [];
+      if (replay) {
+        await supersedeQueuedAutomaticReviews(tx, repo.id, change.number);
+        await rearmStalePublication(tx, replay.id, generation);
+        return undefined;
+      }
+    }
+    const [pending] = latest
+      ? await tx
+          .select({ review: reviews })
+          .from(reviews)
+          .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
+          .where(
+            and(
+              sameChange(repo.id, change.number),
+              eq(reviewTriggers.origin, "automatic"),
+              eq(reviews.status, "queued"),
+              eq(reviews.version, 0),
+              eq(reviews.id, latest.id),
+            ),
+          )
+          .limit(1)
+          .for("update", { of: reviews })
+      : [];
     queued = pending?.review;
     // Retire a previous revision already waiting for a retry even when its old
     // model assignment can no longer get a runner. A live attempt stays pinned.
@@ -343,6 +393,8 @@ async function queueReview(
       queued?.id,
     );
   }
+  // Admission only queues work. The review insert/update wakes triage, which
+  // reconciles any older provider authority before this review can authorize a write.
   const git = structuredClone(repo.git);
   const remote = git.upstream.split("/")[2];
   const ref =
@@ -361,12 +413,30 @@ async function queueReview(
   const mcpServers = await snapshotRepositoryMcpServers(tx, repo.id);
   const values = {
     repositoryId: repo.id,
+    mergePullRequestId: conversation ? null : target.id,
     baseSha: change.mergeBase,
     headSha: change.headSha,
     source: {
       configKey: repo.configKey,
       git,
       indexOwner: repo.indexOwner,
+      ...(!conversation
+        ? {
+            mergePolicy: {
+              version: repo.mergePolicyVersion,
+              policy: repo.mergePolicy,
+            },
+            mergeRevision: target.mergeRevision,
+            baseBranch: target.baseBranch ?? undefined,
+            headBranch: target.headBranch ?? undefined,
+            pullRequest: {
+              number: change.number,
+              title: change.title,
+              url: change.url,
+              baseSha: change.baseSha,
+            },
+          }
+        : {}),
       ...(agent ? { agent } : {}),
       ...(guidance ? { guidance } : {}),
       ...(mcpServers.length ? { mcpServers } : {}),
@@ -619,6 +689,8 @@ export async function acceptReviewTrigger(
       }
     }
     const now = new Date();
+    const headBranch = change?.headBranch ?? session?.headBranch ?? null;
+    const baseBranch = change?.baseBranch ?? session?.baseBranch ?? null;
     // Equal-head deliveries can share an observation generation. Only changes
     // affecting eligibility or the diff invalidate another request's provider read.
     const changed =
@@ -629,6 +701,8 @@ export async function acceptReviewTrigger(
           session.baseSha !== change.baseSha ||
           session.mergeBase !== change.mergeBase ||
           session.startSha !== (change.startSha ?? null) ||
+          session.headBranch !== headBranch ||
+          session.baseBranch !== baseBranch ||
           session.draft !== (change.draft ?? null))) ||
       session.continuousReviewSince?.getTime() !== since?.getTime() ||
       session.reviewSessionResetAt?.getTime() !== reset?.getTime();
@@ -639,6 +713,7 @@ export async function acceptReviewTrigger(
       syncedAt: now,
       updatedAt: now,
     };
+    let target = session;
     if (change) {
       const values = {
         ...sessionValues,
@@ -652,10 +727,10 @@ export async function acceptReviewTrigger(
         author: change.author ?? null,
         headSha: change.headSha,
         baseSha: change.baseSha,
-        headBranch: change.headBranch ?? null,
-        baseBranch: change.baseBranch ?? null,
+        headBranch,
+        baseBranch,
       };
-      await tx
+      [target] = await tx
         .insert(pullRequests)
         .values({
           ...values,
@@ -665,7 +740,8 @@ export async function acceptReviewTrigger(
         .onConflictDoUpdate({
           target: [pullRequests.repositoryId, pullRequests.number],
           set: values,
-        });
+        })
+        .returning();
     } else if (session) {
       await tx
         .update(pullRequests)
@@ -714,6 +790,7 @@ export async function acceptReviewTrigger(
     // unchanged, already-ready snapshot is an ordinary rename.
     if (forge === "forgejo" && event.kind === "ready" && !changed)
       return { reviewId: undefined } as const;
+    if (!target) throw new Error("Missing persisted pull request for review");
     const reviewId = await queueReview(
       tx,
       active,
@@ -721,6 +798,7 @@ export async function acceptReviewTrigger(
       forge,
       change,
       observation,
+      target,
       sessionValues.triggerGeneration,
     );
     return { reviewId } as const;

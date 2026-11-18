@@ -9,6 +9,7 @@ import type { PullRequestDetail } from "@razbor/database";
 import { safeReviewUrl } from "@razbor/contracts/presentation";
 
 import { ConsoleHero } from "@web/components/console-hero.js";
+import { MergeDecisionPanel } from "@web/components/merge-decision.js";
 import { PullRequestRefresh } from "@web/components/pull-request-refresh.js";
 import { ReviewResult } from "@web/components/review-result.js";
 import { Status } from "@web/components/status.js";
@@ -88,7 +89,7 @@ export default function PullRequestPage({
     <main className="console-hero-page flex min-w-0 flex-col">
       <ConsoleHero
         id="pull-request-title"
-        eyebrow="Human review"
+        eyebrow="Review triage"
         title="Pull request"
         description="Inspect automated findings, the reviewed revision, and prior review runs."
         breadcrumbLabel={pr ? `#${pr.number}` : "Details"}
@@ -98,7 +99,7 @@ export default function PullRequestPage({
           <>
             <span className="console-hero-status">
               <GitPullRequest aria-hidden="true" className="size-4" />
-              {pr.state === "open" ? "Open · human review" : "Closed"}
+              {pr.state === "open" ? "Open" : "Closed"}
             </span>
             {pr.continuousReviewActive && (
               <span className="console-hero-status">
@@ -179,6 +180,7 @@ export default function PullRequestPage({
               className="flex min-w-0 flex-col gap-4"
               aria-labelledby="latest-findings"
             >
+              <MergeDecisionPanel merge={pr.merge} />
               <div className="console-card flex flex-col items-start gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
                 <div>
                   <h2 id="latest-findings" className="text-base font-semibold">
@@ -298,11 +300,6 @@ export default function PullRequestPage({
                     <dd className="mt-1 text-xs">{formatUtc(pr.syncedAt)}</dd>
                   </div>
                 </dl>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  {pr.state === "open"
-                    ? "This pull request is waiting for human review before merging."
-                    : "This pull request is no longer open. Its saved reviews remain available."}
-                </p>
               </section>
               <section
                 className="console-card flex flex-col gap-4"

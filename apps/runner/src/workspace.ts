@@ -384,6 +384,7 @@ export async function prepareWorkspace(
       compactionThresholdTokens: c.harness.compactionThresholdTokens,
       contextWindowTokens: c.harness.contextWindowTokens,
       supportsTools: c.model.supports_tools,
+      mergePolicy: job.mergePolicy,
       previousFindings: job.previousFindings,
       conversation: job.conversation,
       capabilities: await prepareCapabilities(c, w, job, signal),

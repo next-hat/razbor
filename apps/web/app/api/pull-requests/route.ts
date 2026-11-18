@@ -1,6 +1,6 @@
 import { listPullRequests } from "@razbor/database";
 
-import { canManageResource } from "@web/lib/auth.js";
+import { canManageResource, canAccessRepository } from "@web/lib/auth.js";
 import { authErrorResponse, requireApiUser } from "@web/lib/auth.js";
 import { reviewDatabase } from "@web/lib/review.js";
 import { visiblePullRequest } from "@web/lib/pull-requests.js";
@@ -14,9 +14,12 @@ export async function GET(request: Request) {
   try {
     const user = await requireApiUser(request);
     const isAdmin = canManageResource(user, "repository");
+    const repositoryId = new URL(request.url).searchParams.get("repositoryId");
+    if (repositoryId && !canAccessRepository(user, repositoryId))
+      return Response.json({ error: "Repository not found" }, { status: 404 });
     const prs = await listPullRequests(
       await reviewDatabase(),
-      user.repositoryIds,
+      repositoryId ? [repositoryId] : user.repositoryIds,
     );
     return Response.json(
       prs.map((pr) => visiblePullRequest(pr, isAdmin)),

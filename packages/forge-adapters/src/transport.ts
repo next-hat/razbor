@@ -5,6 +5,75 @@ import { approvedUrl } from "@forge-adapters/src/http.js";
 import { ForgeOperationError } from "@forge-adapters/src/interactions.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
 
+/** Read at most the given number of response bytes, retaining the ambiguity of a mutation. */
+async function responseText(
+  response: Response,
+  limit: number,
+  mutating: boolean,
+) {
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  if (response.body)
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > limit)
+        throw new ForgeOperationError("invalid-response", mutating);
+      chunks.push(chunk);
+    }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+/** Recognize GitHub's explicit HTTP rejection and bound reads of diagnostic response bodies. */
+async function githubRateLimitRetry(response: Response) {
+  if (response.status === 403) {
+    let payload;
+    try {
+      payload = z
+        .object({
+          message: z.string().optional(),
+          errors: z
+            .array(
+              z.object({
+                type: z.string().optional(),
+                message: z.string().optional(),
+              }),
+            )
+            .optional(),
+          data: z.null().optional(),
+        })
+        .safeParse(JSON.parse(await responseText(response, 16384, false)));
+    } catch {
+      return;
+    }
+    if (!payload.success) return;
+    const messages = [payload.data, ...(payload.data.errors ?? [])];
+    if (
+      !messages.some(({ message }) =>
+        /(?:exceeded (?:a |the )?(?:secondary |primary |api )?rate limit|api rate limit exceeded)/i.test(
+          message ?? "",
+        ),
+      ) &&
+      !payload.data.errors?.some((error) => error.type === "RATE_LIMITED")
+    )
+      return;
+  } else {
+    await response.body?.cancel();
+  }
+  const now = Date.now();
+  const after = response.headers.get("retry-after");
+  const reset =
+    response.headers.get("x-ratelimit-remaining") === "0"
+      ? response.headers.get("x-ratelimit-reset")
+      : null;
+  const times = [
+    after && /^\d+$/.test(after) ? now + Number(after) * 1000 : NaN,
+    reset && /^\d+$/.test(reset) ? Number(reset) * 1000 : NaN,
+  ].filter(
+    (time) => time >= now && Number.isSafeInteger(time) && time <= 8.64e15,
+  );
+  return times.length ? Math.max(...times) : now + 60000;
+}
+
 /** Bounded, lossless provider transport with no redirects or automatic write retries. */
 export class HttpForgeTransport {
   private readonly deadline: number;
@@ -52,7 +121,20 @@ export class HttpForgeTransport {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       if (!response.ok) {
-        await response.body?.cancel();
+        if (
+          mutating &&
+          this.connection.type === "github" &&
+          (response.status === 403 || response.status === 429)
+        ) {
+          const retryAt = await githubRateLimitRetry(response);
+          if (retryAt !== undefined)
+            throw new ForgeOperationError(
+              "unavailable",
+              false,
+              response.status,
+              retryAt,
+            );
+        } else await response.body?.cancel();
         const reason =
           response.status === 401 || response.status === 403
             ? "permission"
@@ -65,16 +147,7 @@ export class HttpForgeTransport {
           response.status,
         );
       }
-      const chunks: Uint8Array[] = [];
-      let size = 0;
-      if (response.body)
-        for await (const chunk of response.body) {
-          size += chunk.length;
-          if (size > 4 * 1048576)
-            throw new ForgeOperationError("invalid-response", mutating);
-          chunks.push(chunk);
-        }
-      const raw = Buffer.concat(chunks).toString("utf8");
+      const raw = await responseText(response, 4 * 1048576, mutating);
       return text ? raw : raw ? parse(raw) : null;
     } catch (error) {
       if (error instanceof ForgeOperationError) throw error;

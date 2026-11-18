@@ -3,7 +3,7 @@
 import Link from "next/link.js";
 import { ArrowUpRight } from "lucide-react";
 
-import type { ReviewJobView } from "@razbor/contracts";
+import type { MergePolicySnapshot, ReviewJobView } from "@razbor/contracts";
 import type { publicationView } from "@razbor/database";
 import {
   reviewDisplayName,
@@ -14,6 +14,7 @@ import { ReviewResult } from "@web/components/review-result.js";
 import { ConsoleHero } from "@web/components/console-hero.js";
 import { useReviewStream } from "@web/lib/use-review-stream.js";
 import { ReviewLog } from "@web/components/review-log.js";
+import { MergeDecisionPanel } from "@web/components/merge-decision.js";
 import { Status } from "@web/components/status.js";
 import { Alert, AlertDescription } from "@web/components/ui/alert.js";
 import { Button } from "@web/components/ui/button.js";
@@ -41,9 +42,11 @@ export default function ReviewPage({
   id,
   initialData,
   isAdmin = false,
+  policy,
 }: Readonly<{
   id: string;
   isAdmin?: boolean;
+  policy?: MergePolicySnapshot;
   initialData?: ReviewJobView & {
     interaction: Awaited<ReturnType<typeof publicationView>>;
   };
@@ -224,6 +227,11 @@ export default function ReviewPage({
                   </AlertDescription>
                 </Alert>
               )}
+              {(job.mergeDecision ||
+                job.review?.mergeAssessment ||
+                (job.mergePolicyVersion && job.status === "completed")) && (
+                <MergeDecisionPanel review={job} />
+              )}
               {isAdmin && job.guidance && (
                 <section className="console-card flex flex-col gap-2 text-sm">
                   <h2 className="font-medium">Instructions and skills</h2>
@@ -260,6 +268,32 @@ export default function ReviewPage({
                     in the execution log.
                   </p>
                 </section>
+              )}
+              {isAdmin && policy && (
+                <details className="console-card text-sm">
+                  <summary className="w-fit cursor-pointer font-medium">
+                    Captured Merge Policy · v{policy.version}
+                  </summary>
+                  <p className="mt-3 text-muted-foreground">
+                    {policy.policy.enabled ? "Enabled" : "Disabled"} ·{" "}
+                    {policy.policy.dryRun ? "Dry run" : "Live mode"} ·{" "}
+                    {policy.policy.mergeMethod} · threshold{" "}
+                    {policy.policy.minimumConfidence}/100
+                  </p>
+                  {policy.policy.policyMarkdown && (
+                    <pre className="mt-3 whitespace-pre-wrap break-words">
+                      {policy.policy.policyMarkdown}
+                    </pre>
+                  )}
+                  {policy.policy.humanReviewers.length > 0 && (
+                    <p className="mt-3">
+                      Reviewer allowlist ·{" "}
+                      {policy.policy.humanReviewers
+                        .map((r) => r.username)
+                        .join(", ")}
+                    </p>
+                  )}
+                </details>
               )}
               {isAdmin && (
                 <ReviewLog

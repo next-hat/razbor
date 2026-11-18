@@ -36,18 +36,19 @@ request your first review. For release images, use the
 
 ## Documentation
 
-| Guide                                             | Covers                                             |
-| ------------------------------------------------- | -------------------------------------------------- |
-| [Reviews and webhooks](docs/comment-reviews.md)   | Forge setup, commands, findings, and replies       |
-| [Runners](docs/runner.md)                         | Enrollment, isolation, capacity, and job limits    |
-| [Storage and administration](docs/persistence.md) | Accounts, credentials, backups, and recovery       |
-| [Indexing and search](docs/indexing.md)           | Codebase Memory, embeddings, and troubleshooting   |
-| [Instructions and skills](docs/skills.md)         | Project guidance and reusable review skills        |
-| [Review memory](docs/memory.md)                   | Notes shared by people and reviewers               |
-| [MCP servers](docs/mcp.md)                        | External tools and repository access               |
-| [Verification tools](docs/verification-tools.md)  | Command execution and web access                   |
-| [Metrics](docs/review-metrics.md)                 | Activity, token usage, and finding assessments     |
-| [Review evaluation](docs/review-evaluation.md)    | Compare recorded results against audited revisions |
+| Guide                                             | Covers                                                 |
+| ------------------------------------------------- | ------------------------------------------------------ |
+| [Reviews and webhooks](docs/comment-reviews.md)   | Forge setup, commands, findings, and replies           |
+| [Merge policy and triage](docs/merge-policy.md)   | Confidence, reviewer escalation and guarded auto-merge |
+| [Runners](docs/runner.md)                         | Enrollment, isolation, capacity, and job limits        |
+| [Storage and administration](docs/persistence.md) | Accounts, credentials, backups, and recovery           |
+| [Indexing and search](docs/indexing.md)           | Codebase Memory, embeddings, and troubleshooting       |
+| [Instructions and skills](docs/skills.md)         | Project guidance and reusable review skills            |
+| [Review memory](docs/memory.md)                   | Notes shared by people and reviewers                   |
+| [MCP servers](docs/mcp.md)                        | External tools and repository access                   |
+| [Verification tools](docs/verification-tools.md)  | Command execution and web access                       |
+| [Metrics](docs/review-metrics.md)                 | Activity, token usage, and finding assessments         |
+| [Review evaluation](docs/review-evaluation.md)    | Compare recorded results against audited revisions     |
 
 ## Development
 

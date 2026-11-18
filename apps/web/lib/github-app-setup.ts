@@ -149,7 +149,9 @@ export async function startGithubAppSetup(request: Request) {
       setup_url: `${origin}/repos/new?githubApp=${transaction.id}`,
       setup_on_update: true,
       default_permissions: {
-        contents: "read",
+        contents: "write",
+        administration: "read",
+        checks: "write",
         pull_requests: "write",
         issues: "write",
       },

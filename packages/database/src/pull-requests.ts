@@ -7,11 +7,15 @@ import {
   lt,
   lte,
   notInArray,
-  or,
   sql,
 } from "drizzle-orm";
 
-import { publicIdSchema, type ReviewJobView } from "@razbor/contracts";
+import {
+  publicIdSchema,
+  type MergeDecision,
+  type MergeAssessment,
+  type ReviewJobView,
+} from "@razbor/contracts";
 import {
   createForge,
   ForgeOperationError,
@@ -59,7 +63,16 @@ export type PullRequestView = {
   headBranch?: string;
   baseBranch?: string;
   updatedAt: string;
+  createdAt: string;
   syncedAt: string;
+  /** Current PR triage. Historical scores are available only on their review runs. */
+  merge?: {
+    decision: MergeDecision;
+    action?: ReviewJobView["mergeAction"];
+    confidence?: number;
+    riskLevel?: MergeAssessment["riskLevel"];
+    minimumConfidence?: number;
+  };
   latestReview?: PullRequestReviewView;
   reviewCount: number;
   continuousReviewActive: boolean;
@@ -86,21 +99,12 @@ function pullRequestReviewView(
   };
 }
 
-// Bind history to its captured repository and provider PR number. Conversations
-// are not code-review runs, including while they are still queued or running.
-const matchingCodeReviews = sql`
-  matched_review.repository_id = ${pullRequests.repositoryId}
-  and ((matched_trigger.repository_id = ${pullRequests.repositoryId} and matched_trigger.change->>'number' = ${pullRequests.number}::text)
-    or (matched_trigger.review_id is null and matched_review.source->'pullRequest'->>'number' = ${pullRequests.number}::text))
-  and matched_review.source->>'conversation' is null
-  and matched_review.result->>'mode' is distinct from 'conversation'
-`;
-
 const latestReviewId = sql<string>`(
   select matched_review.id
   from reviews matched_review
-  left join review_triggers matched_trigger on matched_trigger.review_id = matched_review.id
-  where ${matchingCodeReviews}
+  where matched_review.merge_pull_request_id = ${pullRequests.id}
+    and matched_review.repository_id = ${pullRequests.repositoryId}
+    and matched_review.result->>'mode' is distinct from 'conversation'
   order by matched_review.created_at desc, matched_review.public_id desc
   limit 1
 )`;
@@ -108,8 +112,9 @@ const latestReviewId = sql<string>`(
 const reviewCount = sql<number>`(
   select count(*)::integer
   from reviews matched_review
-  left join review_triggers matched_trigger on matched_trigger.review_id = matched_review.id
-  where ${matchingCodeReviews}
+  where matched_review.merge_pull_request_id = ${pullRequests.id}
+    and matched_review.repository_id = ${pullRequests.repositoryId}
+    and matched_review.result->>'mode' is distinct from 'conversation'
 )`;
 
 /** Read accessible saved PRs with only their latest code review and full run count. */
@@ -126,7 +131,28 @@ async function pullRequestRows(
     .select({
       pullRequest: pullRequests,
       repositoryId: repositories.publicId,
+      policyVersion: repositories.mergePolicyVersion,
+      reviewedBaseBranch: sql<
+        string | null
+      >`coalesce(${reviewTriggers.change}->>'baseBranch', ${reviews.source}->>'baseBranch')`,
+      reviewedHeadBranch: sql<
+        string | null
+      >`coalesce(${reviewTriggers.change}->>'headBranch', ${reviews.source}->>'headBranch')`,
+      reviewedDraft: sql<
+        boolean | null
+      >`(${reviewTriggers.change}->>'draft')::boolean`,
+      reviewedRevision: sql<
+        number | null
+      >`(${reviews.source}->>'mergeRevision')::integer`,
       repositoryName: sql<string>`coalesce(${repositories.observed}->>'fullPath', ${repositories.selector}, ${repositories.configKey})`,
+      olderUnresolvedAction: sql<"writing" | "scheduled" | "uncertain" | null>`(
+        select prior.merge_action from reviews prior
+        where prior.merge_pull_request_id = ${pullRequests.id}
+          and prior.repository_id = ${pullRequests.repositoryId}
+          and prior.id <> ${reviews.id}
+          and prior.merge_action in ('writing', 'scheduled', 'uncertain')
+        order by prior.created_at desc, prior.public_id desc limit 1
+      )`,
       latestReview: pullRequestReviewSelection,
       reviewCount,
     })
@@ -146,11 +172,152 @@ async function pullRequestRows(
     .orderBy(desc(pullRequests.updatedAt), pullRequests.publicId);
 }
 
+/** Project a current decision from the latest review, suppressing obsolete scores even when human ownership persists. */
+function currentMergeView(
+  row: Awaited<ReturnType<typeof pullRequestRows>>[number],
+  review?: PullRequestReviewView,
+): PullRequestView["merge"] {
+  const pr = row.pullRequest;
+  const decision = review?.mergeDecision;
+  const stale =
+    review?.mergePolicyVersion !== undefined &&
+    (review.mergePolicyVersion !== row.policyVersion ||
+      row.reviewedRevision !== pr.mergeRevision ||
+      review.headSha !== pr.headSha ||
+      review.targetBaseSha !== pr.baseSha ||
+      row.reviewedBaseBranch !== pr.baseBranch ||
+      row.reviewedHeadBranch !== pr.headBranch ||
+      (row.reviewedDraft !== null && row.reviewedDraft !== pr.draft) ||
+      (pr.state === "closed" && decision?.status !== "merged"));
+
+  // A change in review authority cannot cancel an already-issued provider request.
+  const action = review?.mergeAction;
+  const terminalProgress =
+    decision?.status === "review_in_progress" &&
+    review?.status !== "queued" &&
+    review?.status !== "running";
+  const unresolved =
+    row.olderUnresolvedAction ??
+    ((stale ||
+      terminalProgress ||
+      !decision ||
+      decision.status === "stale" ||
+      decision.status === "blocked" ||
+      pr.humanEscalated) &&
+    (action === "writing" || action === "scheduled" || action === "uncertain")
+      ? action
+      : null);
+  const human = pr.state === "open" && pr.humanEscalated;
+  if (
+    unresolved ||
+    (human && (stale || decision?.status !== "human_review_required"))
+  ) {
+    const reasons: MergeDecision["reasons"] = [];
+    if (unresolved) {
+      reasons.push({
+        code: "unresolved_provider_merge",
+        message:
+          "An outstanding native merge request requires reconciliation. Check its outcome in the provider.",
+      });
+      for (const entry of decision?.reasons ?? []) {
+        if (
+          entry.code === "write_uncertain" ||
+          entry.code === "prior_write_uncertain" ||
+          entry.code === "provider_unavailable"
+        )
+          reasons.push(entry);
+      }
+      if (stale)
+        reasons.push({
+          code: "obsolete_review",
+          message:
+            "The previous review no longer matches this pull request or its current policy.",
+        });
+    }
+    if (human)
+      reasons.push({
+        code: "previous_escalation",
+        message:
+          "This pull request was escalated. A human reviewer must complete the forge review and merge workflow.",
+      });
+    return {
+      decision: {
+        status: human ? "human_review_required" : "blocked",
+        reviewers: human && !stale ? (decision?.reviewers ?? []) : [],
+        reasons,
+      },
+      ...(unresolved ? { action: unresolved } : {}),
+    };
+  }
+  if (
+    pr.state === "closed" &&
+    decision?.status === "merged" &&
+    review?.headSha === pr.headSha
+  )
+    return { decision, action: "merged" };
+  if (stale)
+    return {
+      decision: {
+        status: "stale",
+        reviewers: [],
+        reasons: [
+          {
+            code: "obsolete_review",
+            message:
+              "The revision, pull request state or repository policy has changed since this review.",
+          },
+        ],
+      },
+    };
+  if (!review || !decision) return;
+  if (terminalProgress) return;
+  const assessment =
+    decision.status !== "stale" && review.mergePolicyVersion !== undefined
+      ? review.review?.mergeAssessment
+      : undefined;
+  return {
+    decision,
+    action: review.mergeAction,
+    ...(assessment
+      ? {
+          confidence: assessment.confidence,
+          riskLevel: assessment.riskLevel,
+          minimumConfidence: review.minimumConfidence,
+        }
+      : {}),
+  };
+}
+
 /** Map saved provider metadata to public IDs and UTC timestamps without internal UUIDs. */
 function pullRequestView(
   row: Awaited<ReturnType<typeof pullRequestRows>>[number],
 ): PullRequestView {
   const pr = row.pullRequest;
+  const review = row.latestReview.publicId
+    ? pullRequestReviewView(
+        row.latestReview as Parameters<typeof pullRequestReviewView>[0],
+      )
+    : undefined;
+  const merge = currentMergeView(row, review);
+  if (
+    merge &&
+    pr.state === "open" &&
+    pr.escalationComment?.creatingBody &&
+    pr.escalationComment.reservationRetryAt !== undefined &&
+    pr.escalationComment.reservationRetryAt <= Date.now()
+  ) {
+    merge.decision = {
+      ...merge.decision,
+      reasons: [
+        {
+          code: "escalation_delivery_unconfirmed",
+          message:
+            "Razbor could not confirm delivery of its earlier escalation comment. Check the provider request log before retrying the notification.",
+        },
+        ...merge.decision.reasons,
+      ],
+    };
+  }
   return {
     id: pr.publicId,
     repositoryId: row.repositoryId,
@@ -165,14 +332,10 @@ function pullRequestView(
     ...(pr.headBranch ? { headBranch: pr.headBranch } : {}),
     ...(pr.baseBranch ? { baseBranch: pr.baseBranch } : {}),
     updatedAt: pr.updatedAt.toISOString(),
+    createdAt: pr.createdAt.toISOString(),
     syncedAt: pr.syncedAt.toISOString(),
-    ...(row.latestReview.publicId
-      ? {
-          latestReview: pullRequestReviewView(
-            row.latestReview as Parameters<typeof pullRequestReviewView>[0],
-          ),
-        }
-      : {}),
+    ...(review ? { latestReview: review } : {}),
+    ...(merge ? { merge } : {}),
     reviewCount: row.reviewCount,
     continuousReviewActive:
       pr.state === "open" && pr.continuousReviewSince !== null,
@@ -204,17 +367,7 @@ export async function getPullRequest(
     .where(
       and(
         eq(reviews.repositoryId, row.pullRequest.repositoryId),
-        or(
-          and(
-            eq(reviewTriggers.repositoryId, row.pullRequest.repositoryId),
-            sql`${reviewTriggers.change}->>'number' = ${row.pullRequest.number}::text`,
-          ),
-          and(
-            sql`${reviewTriggers.reviewId} is null`,
-            sql`${reviews.source}->'pullRequest'->>'number' = ${row.pullRequest.number}::text`,
-          ),
-        ),
-        sql`${reviews.source}->>'conversation' is null`,
+        eq(reviews.mergePullRequestId, row.pullRequest.id),
         sql`${reviews.result}->>'mode' is distinct from 'conversation'`,
       ),
     )
@@ -245,7 +398,7 @@ function validateListing(changes: ForgePullRequest[]) {
 type RefreshChange = ForgePullRequest &
   Partial<Pick<ForgeChange, "mergeBase" | "startSha">>;
 
-/** Read the exact revision of a tracked PR, keeping listing readiness only for the same revision and title. */
+/** Fill omitted detail fields from a matching listing. Readiness also depends on the observed title. */
 async function readTrackedChange(
   api: Forge,
   summary: ForgePullRequest,
@@ -255,11 +408,24 @@ async function readTrackedChange(
     const sameRevision =
       detail.headSha === summary.headSha &&
       detail.baseSha === summary.baseSha &&
-      detail.title === summary.title;
+      (!detail.headBranch ||
+        !summary.headBranch ||
+        detail.headBranch === summary.headBranch) &&
+      (!detail.baseBranch ||
+        !summary.baseBranch ||
+        detail.baseBranch === summary.baseBranch);
     return {
       ...summary,
       ...detail,
-      draft: detail.draft ?? (sameRevision ? summary.draft : undefined),
+      headBranch:
+        detail.headBranch ?? (sameRevision ? summary.headBranch : undefined),
+      baseBranch:
+        detail.baseBranch ?? (sameRevision ? summary.baseBranch : undefined),
+      draft:
+        detail.draft ??
+        (sameRevision && detail.title === summary.title
+          ? summary.draft
+          : undefined),
     };
   } catch (error) {
     if (error instanceof ForgeOperationError) {
@@ -295,6 +461,7 @@ async function readOpenPullRequests(
           rowVersion: sql<string>`xmin::text`,
           tracked: sql<boolean>`${pullRequests.mergeBase} is not null
             or ${pullRequests.continuousReviewSince} is not null
+            or exists (select 1 from reviews r where r.merge_pull_request_id = pull_requests.id)
             or exists (select 1 from review_triggers t
               where t.repository_id = pull_requests.repository_id
               and t.change->>'number' = pull_requests.number::text)`,
@@ -531,6 +698,18 @@ export async function syncPullRequests(
               before,
               listingStartedAt,
             } of changes.values()) {
+              const headBranch = sql`coalesce(excluded.head_branch, ${pullRequests.headBranch})`;
+              const baseBranch = sql`coalesce(excluded.base_branch, ${pullRequests.baseBranch})`;
+              const revised = sql`row(${pullRequests.state}, ${pullRequests.headSha}, ${pullRequests.baseSha},
+                ${pullRequests.headBranch}, ${pullRequests.baseBranch}) is distinct from
+                row(excluded.state, excluded.head_sha, excluded.base_sha, ${headBranch}, ${baseBranch})`;
+              // A partial listing may omit readiness on an unchanged PR. A tracked
+              // detail read, including a pending GitLab diff, supersedes the old snapshot.
+              const draft = before?.tracked
+                ? sql`excluded.draft`
+                : sql`case when excluded.draft is null and not (${revised}) then ${pullRequests.draft} else excluded.draft end`;
+              const changed = sql`(${revised} or row(${pullRequests.draft}, ${pullRequests.mergeBase}, ${pullRequests.startSha})
+                is distinct from row(${draft}, excluded.merge_base, excluded.start_sha))`;
               const values = {
                 title: change.title,
                 url: change.url,
@@ -577,11 +756,10 @@ export async function syncPullRequests(
                   target: [pullRequests.repositoryId, pullRequests.number],
                   set: {
                     ...values,
-                    // A webhook that read the previous revision must refresh before admission.
-                    triggerGeneration: sql`${pullRequests.triggerGeneration} + case
-                      when (${pullRequests.state}, ${pullRequests.headSha}, ${pullRequests.baseSha}, ${pullRequests.draft}, ${pullRequests.mergeBase}, ${pullRequests.startSha})
-                        is distinct from (excluded.state, excluded.head_sha, excluded.base_sha, excluded.draft, excluded.merge_base, excluded.start_sha)
-                      then 1 else 0 end`,
+                    headBranch,
+                    baseBranch,
+                    draft,
+                    triggerGeneration: sql`${pullRequests.triggerGeneration} + (${changed})::integer`,
                   },
                   // A webhook may have updated the row during the listing or the detail read.
                   setWhere: before

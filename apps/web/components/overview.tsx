@@ -141,7 +141,7 @@ export default function Overview({
             <EmptyDescription>
               {pullRequests.warning
                 ? "The saved snapshot has no open pull requests. Refresh to check the current provider state."
-                : "Open pull requests from your connected repositories appear here after a successful refresh."}
+                : "Choose Refresh to check connected repositories for open pull requests."}
             </EmptyDescription>
           </EmptyHeader>
         </Empty>

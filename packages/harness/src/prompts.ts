@@ -12,6 +12,7 @@ const prompts = new Liquid({
 /** Renders an approved prompt template with strict variable and filter validation. */
 export function renderPrompt(
   name:
+    | "merge-assessment"
     | "review"
     | "review-stage"
     | "review-final"

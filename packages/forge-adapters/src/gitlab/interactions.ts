@@ -9,10 +9,13 @@ import {
   ForgeOperationError,
   ForgeWebhookError,
   removeIfPresent,
+  removeTemporaryStatus,
   reviewRevision,
   verifyStatusComment,
   type Forge,
   type ForgeChange,
+  type ForgeMergeCheckpoint,
+  type ForgeMergeRequest,
   type ForgePullRequest,
   type ForgePublicationProgress,
   type ForgeReview,
@@ -25,6 +28,11 @@ import {
   HttpForgeTransport,
   webhookEndpoint,
 } from "@forge-adapters/src/transport.js";
+import { resolveReviewer } from "@forge-adapters/src/merge.js";
+import {
+  inspectGitlabMerge,
+  scheduleGitlabMerge,
+} from "@forge-adapters/src/gitlab/merge.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
 
 const id = providerId.pipe(z.string().regex(/^\d+$/));
@@ -307,7 +315,10 @@ export class GitlabForge implements Forge {
 
   readonly hookEvents = ["merge_requests_events", "note_events", "push_events"];
 
-  readonly capabilities = { resolveThreads: true };
+  readonly capabilities = {
+    resolveThreads: true,
+    guardedMerge: "conditional" as const,
+  };
 
   private readonly route: string;
 
@@ -330,6 +341,61 @@ export class GitlabForge implements Forge {
       { "PRIVATE-TOKEN": connection.token ?? "" },
       budgetMs,
     );
+  }
+
+  /** Resolve an exact active user account rather than a group with a similar path. */
+  reviewerLogin(username: string) {
+    return resolveReviewer(username, async (name) => {
+      const users = z
+        .array(
+          z.object({
+            username: z.string(),
+            state: z.string(),
+            bot: z.boolean().optional(),
+          }),
+        )
+        .parse(
+          await this.transport.request(
+            `users?username=${name}&humans=true&active=true`,
+          ),
+        );
+      return users.length === 1 && users[0].state === "active" && !users[0].bot
+        ? users[0].username
+        : undefined;
+    });
+  }
+
+  /** Inspect the protected target and merge request checks using this project's credential. */
+  inspectMerge(request: ForgeMergeRequest) {
+    return inspectGitlabMerge(this.transport, this.route, request);
+  }
+
+  /** Submit the native SHA-guarded merge-when-checks-pass request. */
+  async scheduleMerge(
+    request: ForgeMergeRequest,
+    resumeOnly = false,
+    checkpoint?: ForgeMergeCheckpoint,
+  ) {
+    if (resumeOnly) throw new ForgeOperationError("unsupported");
+    return scheduleGitlabMerge(this.transport, this.route, request, checkpoint);
+  }
+
+  /** GitLab exposes no atomic compare-and-cancel against the scheduler or its captured SHA. */
+  async cancelMerge(
+    request: ForgeMergeRequest,
+  ): Promise<"absent" | "unsupported"> {
+    const mr = z
+      .object({
+        project_id: id,
+        iid: integer,
+        merge_when_pipeline_succeeds: z.boolean(),
+      })
+      .parse(await this.transport.request(this.changeRoute(request.number)));
+    return mr.project_id === request.externalRepositoryId &&
+      mr.iid === request.number &&
+      !mr.merge_when_pipeline_succeeds
+      ? "absent"
+      : "unsupported";
   }
 
   /** Validate delivery identity before normalizing MR lifecycle events, comments and pushes. */
@@ -457,6 +523,12 @@ export class GitlabForge implements Forge {
         );
       if (pulls.length === 0) return result;
       for (const pull of pulls) {
+        if (
+          pull.draft !== undefined &&
+          pull.work_in_progress !== undefined &&
+          pull.draft !== pull.work_in_progress
+        )
+          throw new ForgeOperationError("invalid-response");
         const url = approvedUrl(pull.web_url, this.connection.allowHttp);
         if (seen.has(pull.iid) || url.origin !== expected.origin)
           throw new ForgeOperationError("invalid-response");
@@ -785,8 +857,9 @@ export class GitlabForge implements Forge {
     botId: string,
     marker: string,
   ) {
-    await removeIfPresent(
+    await removeTemporaryStatus(
       commentId,
+      marker,
       async () => {
         await this.transport.request(
           await this.statusRoute(n, commentId, botId, marker),

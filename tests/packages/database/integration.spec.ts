@@ -14,6 +14,7 @@ import {
 import {
   connectDatabase,
   listRepositories,
+  listPullRequests,
   getRepository,
   submitReview,
   getReview,
@@ -832,7 +833,7 @@ test(
       }>(
         "select table_name,data_type from information_schema.columns where table_schema='public' and column_name='id'",
       );
-      assert.equal(pk.rows.length, 23);
+      assert.equal(pk.rows.length, 25);
       assert.ok(pk.rows.every((r) => r.data_type === "uuid"));
       const fk = await fixture.administrator.query<{ typname: string }>(
         "select t.typname from pg_constraint c join pg_attribute a on a.attrelid=c.conrelid and a.attnum=any(c.conkey) join pg_type t on a.atttypid=t.oid where c.contype='f' and c.connamespace='public'::regnamespace",
@@ -863,3 +864,226 @@ test(
     }
   },
 );
+
+test("PR views scope decision evidence to the grant, current observation and captured policy version", async (t) => {
+  const fixture = await databaseFixture();
+  t.after(() => fixture.close());
+  const db = fixture.database;
+  const admin = fixture.administrator;
+  const repository = {
+    git: {
+      branch: "main",
+      upstream: "refs/remotes/origin/main",
+      remotes: { origin: "https://example.invalid/project.git" },
+    },
+    indexing: { owner: "source" },
+    mergePolicy: {
+      enabled: true,
+      policyMarkdown: "Escalate changes to ownership.",
+    },
+  };
+  const config = registrySchema.parse({
+    registry: { key: "file" },
+    repositories: { first: repository, second: repository },
+  });
+  await applyRegistry(db, config);
+  const [first, second] = await listRepositories(db);
+  const prId = "pr_1234567890abcdef";
+  const revision = { baseSha: "a".repeat(40), headSha: "b".repeat(40) };
+  await admin.query(
+    `INSERT INTO pull_requests (public_id,repository_id,number,title,url,state,head_sha,base_sha,head_branch,base_branch,draft)
+    SELECT $1,id,1,'Patch','https://example.invalid/pr/1','open',$2,$3,'patch','main',false FROM repositories WHERE public_id=$4`,
+    [prId, revision.headSha, revision.baseSha, first.id],
+  );
+  const result = {
+    summary: "Reviewed",
+    findings: [],
+    mergeAssessment: {
+      confidence: 94,
+      riskLevel: "low",
+      reviewComplete: true,
+      requiresHumanReview: false,
+      reasons: ["Source and tests reviewed."],
+      criticalAreas: [],
+      verificationGaps: [],
+      suggestedReviewers: [],
+    },
+  };
+  /** Create a new captured review and install its deterministic completed decision for reading. */
+  async function recordEligible() {
+    const run = await submitReview(
+      db,
+      { repositoryId: first.id, ...revision },
+      undefined,
+      undefined,
+      prId,
+    );
+    await admin.query(
+      "UPDATE reviews SET status='completed',result=$1,merge_decision=$2,merge_action='dry_run' WHERE public_id=$3",
+      [
+        JSON.stringify(result),
+        JSON.stringify({
+          status: "auto_merge_eligible",
+          reviewers: [],
+          reasons: [],
+        }),
+        run.id,
+      ],
+    );
+    return run;
+  }
+  const firstRun = await recordEligible();
+  assert.deepEqual(await listPullRequests(db, [second.id]), []);
+  assert.equal(
+    (await listPullRequests(db, [first.id]))[0].merge?.confidence,
+    94,
+  );
+  const pendingDecision = {
+    status: "review_in_progress",
+    reviewers: [],
+    reasons: [
+      {
+        code: "review_pending",
+        message: "The current review has not finished.",
+      },
+    ],
+  };
+  for (const status of ["failed", "completed"]) {
+    await admin.query(
+      "UPDATE reviews SET status=$1,merge_decision=$2,merge_action=null,result=$4 WHERE public_id=$3",
+      [
+        status,
+        pendingDecision,
+        firstRun.id,
+        status === "failed" ? null : result,
+      ],
+    );
+    const pr = (await listPullRequests(db, [first.id]))[0];
+    assert.equal(pr.latestReview?.status, status);
+    assert.equal(pr.merge, undefined);
+  }
+  await admin.query(
+    "UPDATE reviews SET merge_action='writing' WHERE public_id=$1",
+    [firstRun.id],
+  );
+  const unfinishedWrite = (await listPullRequests(db, [first.id]))[0].merge;
+  assert.equal(unfinishedWrite?.action, "writing");
+  assert.equal(unfinishedWrite?.decision.status, "blocked");
+  assert.equal(unfinishedWrite?.confidence, undefined);
+  await admin.query("UPDATE reviews SET merge_action=null WHERE public_id=$1", [
+    firstRun.id,
+  ]);
+  await recordEligible();
+  // Detailed GitLab observations can confirm both comparison refs after a list import.
+  await admin.query(
+    "UPDATE pull_requests SET merge_base=base_sha, start_sha=base_sha, merge_after=null WHERE public_id=$1",
+    [prId],
+  );
+  assert.equal(
+    (await listPullRequests(db, [first.id]))[0].merge?.confidence,
+    94,
+  );
+  assert.ok(
+    (
+      await admin.query(
+        "SELECT merge_after FROM pull_requests WHERE public_id=$1",
+        [prId],
+      )
+    ).rows[0].merge_after,
+  );
+  await admin.query(
+    "UPDATE pull_requests SET merge_base=null, start_sha=null WHERE public_id=$1",
+    [prId],
+  );
+  assert.equal(
+    (await listPullRequests(db, [first.id]))[0].merge?.decision.status,
+    "stale",
+  );
+  for (const column of ["merge_base", "start_sha"]) {
+    await recordEligible();
+    await admin.query(
+      `UPDATE pull_requests SET ${column}=$1 WHERE public_id=$2`,
+      ["d".repeat(40), prId],
+    );
+    assert.equal(
+      (await listPullRequests(db, [first.id]))[0].merge?.decision.status,
+      "stale",
+    );
+    await admin.query(
+      `UPDATE pull_requests SET ${column}=null WHERE public_id=$1`,
+      [prId],
+    );
+  }
+  const beforeHeadChange = await recordEligible();
+  await admin.query("UPDATE pull_requests SET head_sha=$1 WHERE public_id=$2", [
+    "c".repeat(40),
+    prId,
+  ]);
+  await admin.query("UPDATE pull_requests SET head_sha=$1 WHERE public_id=$2", [
+    revision.headSha,
+    prId,
+  ]);
+  const stale = (await listPullRequests(db, [first.id]))[0];
+  assert.equal(stale.merge?.decision.status, "stale");
+  assert.equal(stale.merge?.confidence, undefined);
+  for (const action of ["writing", "scheduled", "uncertain"]) {
+    await admin.query("UPDATE reviews SET merge_action=$1 WHERE public_id=$2", [
+      action,
+      beforeHeadChange.id,
+    ]);
+    const unresolved = (await listPullRequests(db, [first.id]))[0].merge;
+    assert.equal(unresolved?.decision.status, "blocked");
+    assert.equal(unresolved?.action, action);
+    assert.equal(
+      unresolved?.decision.reasons[0].code,
+      "unresolved_provider_merge",
+    );
+    assert.equal(unresolved?.confidence, undefined);
+  }
+  await admin.query("UPDATE reviews SET merge_action=null WHERE public_id=$1", [
+    beforeHeadChange.id,
+  ]);
+  await recordEligible();
+  await admin.query(
+    "UPDATE reviews SET merge_action='uncertain' WHERE public_id=$1",
+    [beforeHeadChange.id],
+  );
+  const prior = (await listPullRequests(db, [first.id]))[0].merge;
+  assert.equal(prior?.action, "uncertain");
+  assert.equal(prior?.decision.status, "blocked");
+  assert.equal(prior?.confidence, undefined);
+  await admin.query("UPDATE reviews SET merge_action=null WHERE public_id=$1", [
+    beforeHeadChange.id,
+  ]);
+  config.repositories.first.mergePolicy!.minimumConfidence = 80;
+  await applyRegistry(db, config);
+  assert.equal(
+    (await listPullRequests(db, [first.id]))[0].merge?.confidence,
+    undefined,
+  );
+  assert.equal(
+    (await getReview(db, firstRun.id, true))?.policySnapshot?.policy
+      .minimumConfidence,
+    90,
+  );
+  assert.equal((await getReview(db, firstRun.id))?.policySnapshot, undefined);
+  await admin.query(
+    "UPDATE pull_requests SET human_escalated=true WHERE public_id=$1",
+    [prId],
+  );
+  const human = (await listPullRequests(db, [first.id]))[0];
+  assert.equal(human.merge?.decision.status, "human_review_required");
+  assert.equal(human.merge?.confidence, undefined);
+  await admin.query(
+    "UPDATE reviews SET merge_action='uncertain' WHERE public_id=$1",
+    [beforeHeadChange.id],
+  );
+  const escalatedWithPendingWrite = (await listPullRequests(db, [first.id]))[0]
+    .merge;
+  assert.equal(
+    escalatedWithPendingWrite?.decision.status,
+    "human_review_required",
+  );
+  assert.equal(escalatedWithPendingWrite?.action, "uncertain");
+  assert.equal(escalatedWithPendingWrite?.confidence, undefined);
+});

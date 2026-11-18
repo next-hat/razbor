@@ -20,7 +20,7 @@ export type ForgeChange = {
 
 export type ForgePullRequest = {
   number: number;
-  /** Readiness reported by the listing, when the provider includes it. */
+  /** Explicit readiness from the provider listing, when exposed by this forge version. */
   draft?: boolean;
   title: string;
   url: string;
@@ -31,6 +31,47 @@ export type ForgePullRequest = {
   baseBranch?: string;
   updatedAt: string;
   state: "open";
+};
+
+/** Last durable boundary before a provider mutation, or its positive acknowledgement. */
+export type ForgeMergeWriteStage =
+  | "prepared"
+  | "creating_check"
+  | "submitting"
+  | "armed"
+  | "releasing"
+  | "acknowledged";
+
+/** Commit before sending the next mutation, independently of the worker's enclosing transaction. */
+export type ForgeMergeCheckpoint = (
+  stage: ForgeMergeWriteStage,
+) => Promise<void>;
+
+/** Trusted review authorization passed to a repository-bound adapter by the decision outbox. */
+export type ForgeMergeRequest = {
+  externalRepositoryId: string;
+  number: number;
+  headSha: string;
+  baseSha: string;
+  baseBranch: string;
+  method: "merge" | "squash" | "rebase";
+  requirePassingChecks: boolean;
+  reviewId: string;
+  writeStage?: ForgeMergeWriteStage;
+};
+
+export type ForgeMergeState = {
+  state:
+    "ready" | "awaiting_checks" | "blocked" | "stale" | "scheduled" | "merged";
+  reason: string;
+  /** An acknowledged, owned schedule can resume publication of its missing revision check. */
+  resume?: boolean;
+  /** An exact pending App check and this App's active native request were both observed. */
+  nativeArmed?: boolean;
+  /** One pending App check for this exact PR and base belongs to this earlier review ID. */
+  pendingCheckReviewId?: string;
+  /** The provider permanently merged this PR with another revision or destination. */
+  terminal?: boolean;
 };
 
 export type InlineComment = {
@@ -136,6 +177,8 @@ export class ForgeOperationError extends Error {
       | "change-closed",
     readonly uncertain = false,
     readonly status?: number,
+    /** Earliest retry time (epoch milliseconds) after a confirmed provider rate-limit refusal. */
+    readonly retryAt?: number,
   ) {
     super(`Forge operation: ${reason}`);
   }
@@ -180,6 +223,28 @@ export async function reviewRevision(
   }
 }
 
+const temporaryStatusMarker = /^<!-- razbor:rev_[A-Za-z0-9]{16}:status -->$/;
+
+const escalationReservationMarker =
+  /^<!-- razbor:pr_[A-Za-z0-9]{16}:escalation-pending -->$/;
+
+const escalationMarker = /^<!-- razbor:pr_[A-Za-z0-9]{16}:escalation -->$/;
+
+/** Remove only a temporary review status or an unused escalation reservation, confirming a masked or repeated 404 by a complete change-scoped read. */
+export async function removeTemporaryStatus(
+  commentId: string,
+  marker: string,
+  remove: () => Promise<void>,
+  list: () => Promise<{ id: string }[]>,
+) {
+  if (
+    !temporaryStatusMarker.test(marker) &&
+    !escalationReservationMarker.test(marker)
+  )
+    throw new ForgeOperationError("permission");
+  await removeIfPresent(commentId, remove, list);
+}
+
 /** Confirm a masked or repeated DELETE's 404 against a successful complete, change-scoped read. */
 export async function removeIfPresent(
   commentId: string,
@@ -205,7 +270,9 @@ export function verifyStatusComment(
   if (
     comment.id !== commentId ||
     comment.user.id !== botId ||
-    !/^<!-- razbor:rev_[A-Za-z0-9]{16}:status -->$/.test(marker) ||
+    (!temporaryStatusMarker.test(marker) &&
+      !escalationReservationMarker.test(marker) &&
+      !escalationMarker.test(marker)) ||
     !comment.body.endsWith(`\n${marker}`)
   )
     throw new ForgeOperationError("permission");
@@ -216,7 +283,24 @@ export interface Forge {
   readonly type: ForgeType;
   readonly label: string;
   readonly hookEvents: readonly string[];
-  readonly capabilities: { resolveThreads: boolean };
+  readonly capabilities: {
+    resolveThreads: boolean;
+    guardedMerge: "conditional" | "unsupported";
+  };
+  /** Read authoritative revisions, native restrictions, and the existing schedule without writing. */
+  inspectMerge(request: ForgeMergeRequest): Promise<ForgeMergeState>;
+  /** Revalidate immediately and schedule only a guarded, non-bypassing native operation. */
+  scheduleMerge(
+    request: ForgeMergeRequest,
+    resumeOnly?: boolean,
+    checkpoint?: ForgeMergeCheckpoint,
+  ): Promise<"scheduled" | "merged">;
+  /** Retire an owned authorization only where the provider offers a race-safe cancellation. */
+  cancelMerge(
+    request: ForgeMergeRequest,
+  ): Promise<"cancelled" | "absent" | "unsupported">;
+  /** Resolve a configured username to an individual provider account before mentioning it. */
+  reviewerLogin(username: string): Promise<string | null>;
   /** Authenticate raw delivery bytes and normalize supported events; ignore unrelated events. */
   webhook(
     raw: Uint8Array,

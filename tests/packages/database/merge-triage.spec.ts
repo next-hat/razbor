@@ -1,0 +1,1321 @@
+import assert from "node:assert/strict";
+import { readdir, readFile } from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { test } from "node:test";
+
+import { mergePolicySchema, type MergeAssessment } from "@razbor/contracts";
+import {
+  beginAttempt,
+  connectDatabase,
+  finishAttempt,
+  getRepository,
+  listRepositories,
+  listPullRequests,
+  processMergeTriage,
+  findingKey,
+  submitReview,
+  updateRepositoryMergePolicy,
+} from "@razbor/database";
+import { migrate } from "@razbor/database/migrate";
+import { applyRegistry, registrySchema } from "@razbor/database/registry";
+import {
+  ForgejoInteractions,
+  ForgeOperationError,
+  type ForgeMergeState,
+  type ForgeMergeCheckpoint,
+  type ForgeMergeRequest,
+} from "@razbor/forge-adapters";
+
+import { databaseFixture } from "@tests/packages/database/fixture.js";
+
+/** Release the blocked provider observation only after the competing operation has completed. */
+function barrier() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  return { resolve, promise };
+}
+
+const baseSha = "a".repeat(40);
+
+const headSha = "b".repeat(40);
+
+const assessment: MergeAssessment = {
+  confidence: 90,
+  riskLevel: "low",
+  reviewComplete: true,
+  requiresHumanReview: false,
+  reasons: ["Inspected the corrected guide and checked its links."],
+  criticalAreas: [],
+  verificationGaps: [],
+  suggestedReviewers: ["alice", "unknown"],
+};
+
+test("Phase 2 data upgrades without authorizing a historical result", async (t) => {
+  const fixture = await databaseFixture();
+  const url = new URL(fixture.migrationUrl);
+  url.pathname = "/upgrade_test";
+  const upgrade = connectDatabase(url.href);
+  t.after(async () => {
+    await upgrade.close();
+    await fixture.close();
+  });
+  await fixture.administrator.query(
+    "create database upgrade_test owner razbor_migrator",
+  );
+  const dir = path.dirname(
+    fileURLToPath(import.meta.resolve("@razbor/database/migrate")),
+  );
+  const migrations = path.resolve(dir, "../migrations");
+  const phase2 = (await readdir(migrations))
+    .filter((f) => /^\d{4}_.*\.sql$/.test(f) && f < "0032_")
+    .sort();
+  assert.equal(phase2.length, 32);
+  assert.equal(phase2.at(-1), "0031_deferred_open_deliveries.sql");
+  for (const file of phase2)
+    await upgrade.pool.query(
+      await readFile(path.join(migrations, file), "utf8"),
+    );
+
+  // Copy the journal entries that the fresh fixture actually installed through PR #5.
+  await upgrade.pool.query(`create schema drizzle;
+    create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)`);
+  const ledger =
+    "select hash,created_at from drizzle.__drizzle_migrations order by created_at";
+  const current = (await fixture.administrator.query(ledger)).rows;
+  assert.equal(current[31].created_at, "1790000000031");
+  await upgrade.pool.query(
+    "insert into drizzle.__drizzle_migrations (hash,created_at) select hash,created_at from json_to_recordset($1) as entry(hash text,created_at bigint)",
+    [JSON.stringify(current.slice(0, phase2.length))],
+  );
+  const repo = (
+    await upgrade.pool.query(
+      "insert into repositories(public_id,config_key,managed_by,git,index_owner,persistent) values ('repo_0123456789abcdef','before','file','{}','local',false) returning id",
+    )
+  ).rows[0].id;
+  const pr = (
+    await upgrade.pool.query(
+      "insert into pull_requests(public_id,repository_id,number,title,url,state,head_sha,base_sha) values('pr_0123456789abcdef',$1,7,'before','https://forge.invalid/pr/7','open',$2,$3) returning id",
+      [repo, headSha, baseSha],
+    )
+  ).rows[0].id;
+  await upgrade.pool.query(
+    "insert into reviews(public_id,repository_id,head_sha,base_sha,source,status,result) values('rev_0123456789abcdef',$1,$2,$3,$4,'completed',$5)",
+    [
+      repo,
+      headSha,
+      baseSha,
+      { pullRequest: { number: 7, baseSha } },
+      { summary: "Legacy", findings: [] },
+    ],
+  );
+  // Drizzle must still enter the lineage check at the old development high-water mark.
+  await upgrade.pool.query(
+    `update drizzle.__drizzle_migrations set created_at=1790000000033 where created_at=1790000000031`,
+  );
+  await assert.rejects(
+    migrate(url.href),
+    (error: Error) =>
+      error.cause instanceof Error &&
+      error.cause.message.includes("Unrecognized migration history at 0031"),
+  );
+  await upgrade.pool.query(
+    `update drizzle.__drizzle_migrations set created_at=1790000000031 where created_at=1790000000033`,
+  );
+  await migrate(url.href);
+  await migrate(url.href);
+  assert.deepEqual((await upgrade.pool.query(ledger)).rows, current);
+  await upgrade.pool.query(
+    "select pending_open, open_retry_after from webhook_deliveries limit 0",
+  );
+  const [row] = (
+    await upgrade.pool.query(
+      "select r.merge_policy, r.merge_policy_version, v.merge_pull_request_id, v.source,v.result,v.merge_action,v.merge_write_stage from repositories r join reviews v on v.repository_id=r.id",
+    )
+  ).rows;
+  assert.deepEqual(row.merge_policy, mergePolicySchema.parse({}));
+  assert.equal(row.merge_policy_version, 1);
+  assert.equal(row.merge_pull_request_id, pr);
+  assert.equal(row.source.mergePolicy, undefined);
+  assert.equal(row.result.summary, "Legacy");
+  assert.equal(row.merge_action, null);
+  assert.equal(row.merge_write_stage, null);
+
+  // Restore the published preview's policy schema and ledger. Policy records
+  // already in use must survive while 0032 installs the missing PR #5 columns.
+  const previewHash =
+    "7708f6b258ac9c27160054b61e554311e97110557368b43f2475f208d96d7dbd";
+  await upgrade.pool.query(
+    `alter table webhook_deliveries drop column pending_open, drop column open_retry_after;
+     alter table reviews drop column merge_write_stage;
+     delete from drizzle.__drizzle_migrations where created_at > 1790000000031;
+     update repositories set merge_policy_version=8, merge_policy=jsonb_set(merge_policy,'{policyMarkdown}','"Preview policy"')`,
+  );
+  await upgrade.pool.query(
+    "update drizzle.__drizzle_migrations set hash=$1 where created_at=1790000000031",
+    [previewHash],
+  );
+  await migrate(url.href);
+  await migrate(url.href);
+  const previewLedger = (await upgrade.pool.query(ledger)).rows;
+  assert.deepEqual(previewLedger.slice(32), current.slice(32));
+  assert.equal(previewLedger[31].hash, previewHash);
+  const preview = (
+    await upgrade.pool.query(
+      "select r.merge_policy_version,r.merge_policy->>'policyMarkdown' as guidance,v.merge_pull_request_id,v.merge_write_stage from repositories r join reviews v on v.repository_id=r.id",
+    )
+  ).rows[0];
+  assert.equal(preview.merge_policy_version, 8);
+  assert.equal(preview.guidance, "Preview policy");
+  assert.equal(preview.merge_pull_request_id, pr);
+  assert.equal(preview.merge_write_stage, null);
+  await upgrade.pool.query(
+    "select pending_open,open_retry_after from webhook_deliveries limit 0",
+  );
+  assert.equal(
+    (
+      await upgrade.pool.query(
+        "select to_regclass('delivery_due_open') as name",
+      )
+    ).rows[0].name,
+    "delivery_due_open",
+  );
+});
+
+test(
+  "PR triage persists policy snapshots, owned notifications and write fences across concurrent workers and restarts",
+  { timeout: 120000 },
+  async (t) => {
+    const fixture = await databaseFixture();
+    const db = fixture.database;
+    // The second pool opens its first connection on recovery after the simulated crash.
+    const restart = connectDatabase(fixture.url);
+    t.after(async () => {
+      await restart.close();
+      await fixture.close();
+    });
+    const origin = "https://forge.invalid";
+    const git = {
+      branch: "main",
+      upstream: "refs/remotes/origin/main",
+      remotes: { origin: origin + "/team/repo.git" },
+    };
+    const policy = mergePolicySchema.parse({
+      enabled: true,
+      policyMarkdown: "Use human review for migrations.",
+      humanReviewers: [
+        "missing1",
+        "missing2",
+        "missing3",
+        "alice",
+        "extra1",
+        "extra2",
+        "excess",
+        "fallback",
+      ].map((username) => ({
+        username,
+        responsibilities: "Data",
+        riskCategories: username === "fallback" ? [] : ["low"],
+      })),
+    });
+    const config = registrySchema.parse({
+      registry: { key: "test" },
+      forges: {
+        test: { type: "forgejo", api_url: origin + "/api/v1", web_url: origin },
+      },
+      repositories: {
+        project: {
+          forge: "test",
+          selector: "team/repo",
+          git,
+          indexing: { owner: "fixture" },
+          mergePolicy: policy,
+        },
+        other: { git, indexing: { owner: "fixture" } },
+      },
+    });
+    await applyRegistry(db, config);
+    const repos = await listRepositories(db);
+    const repo = repos.find((r) => r.configKey === "project")!;
+    assert.equal(
+      (await getRepository(db, repos.find((r) => r.configKey === "other")!.id))
+        ?.mergePolicy.enabled,
+      false,
+    );
+    assert.equal(
+      (await getRepository(db, repo.id))?.mergePolicy.minimumConfidence,
+      90,
+    );
+    const meta = {
+      id: 2,
+      full_name: "team/repo",
+      html_url: origin + "/team/repo",
+      default_branch: "main",
+      private: true,
+      archived: false,
+    };
+    await db.pool.query(
+      "update repositories set observed=$1, external_repository_id='2', verified_at=now() where public_id=$2",
+      [
+        {
+          fullPath: meta.full_name,
+          defaultBranch: "main",
+          externalRepositoryId: "2",
+        },
+        repo.id,
+      ],
+    );
+    const remoteComments = new Map<string, string>();
+    const closingComments = new Map<string, string>();
+    const patchBodies: string[] = [];
+    const priorFinding = {
+      path: "guide.md",
+      severity: "medium" as const,
+      lineStart: 1,
+      lineEnd: 1,
+      title: "Broken link",
+      body: "The guide links to the removed path.",
+      failureScenario: "Opening the guide link returns 404.",
+      suggestion: "Use the renamed route.",
+    };
+    let priorReviewId = "";
+    let posts = 0;
+    let delayedReservation = "";
+    let closedReservation = "";
+    let delayedMention = "";
+    let rejectedMention = false;
+    t.mock.method(
+      globalThis,
+      "fetch",
+      async (input: URL, init?: RequestInit) => {
+        const url = new URL(String(input));
+        assert.equal(url.origin, origin);
+        const route = url.pathname.replace("/api/v1/", "");
+        const bot = { id: 1, login: "razbor" };
+        if (route === "repos/team/repo") return Response.json(meta);
+        if (route === "user") return Response.json(bot);
+        if (route === "repos/team/repo/pulls/2/reviews")
+          return Response.json([
+            {
+              id: 23,
+              body: `<!-- razbor:${priorReviewId}:result -->`,
+              commit_id: headSha,
+              state: "COMMENT",
+              user: bot,
+            },
+          ]);
+        if (route === "repos/team/repo/pulls/2/reviews/23/comments")
+          return Response.json([
+            {
+              id: 24,
+              path: priorFinding.path,
+              body: `Published prose\n<!-- razbor:${priorReviewId}:${findingKey(priorFinding)} -->`,
+              user: bot,
+              resolver: bot,
+            },
+          ]);
+        if (route === "users/alice")
+          return Response.json({
+            id: 10,
+            login: "alice",
+            is_admin: false,
+            active: true,
+          });
+        const pullRoute = /^repos\/team\/repo\/pulls\/(1|4)$/.exec(route);
+        if (pullRoute)
+          return Response.json({
+            number: Number(pullRoute[1]),
+            state: "open",
+            merged: false,
+            draft: false,
+            title: "One",
+            user: bot,
+            html_url: origin + "/team/repo/pulls/" + pullRoute[1],
+            base: { sha: baseSha, ref: "main" },
+            head: { sha: headSha, ref: "docs" },
+            merge_base: baseSha,
+          });
+        const collection = /^repos\/team\/repo\/issues\/(1|4)\/comments$/.exec(
+          route,
+        );
+        const stored =
+          collection?.[1] === "4" ? closingComments : remoteComments;
+        if (collection && init?.method === "POST") {
+          posts++;
+          const body = JSON.parse(String(init.body)).body;
+          if (collection[1] === "4") {
+            closedReservation = body;
+            throw new Error("reservation POST delayed past closure");
+          }
+          if (posts === 1) {
+            delayedReservation = body;
+            throw new Error("lost acknowledgement");
+          }
+          const id = 76 + posts;
+          stored.set(String(id), body);
+          return Response.json({ id });
+        }
+        if (collection)
+          return Response.json(
+            url.searchParams.get("page") === "1"
+              ? [...stored].map(([id, body]) => ({
+                  id: Number(id),
+                  body,
+                  user: bot,
+                  pull_request_url:
+                    origin + "/team/repo/pulls/" + collection[1],
+                  issue_url: "",
+                }))
+              : [],
+          );
+        if (route.startsWith("repos/team/repo/issues/comments/")) {
+          const id = route.split("/").at(-1)!;
+          const onClosedPr = closingComments.has(id);
+          const comments = onClosedPr ? closingComments : remoteComments;
+          if (!comments.has(id)) return new Response(null, { status: 404 });
+          if (init?.method === "DELETE") {
+            comments.delete(id);
+            return new Response(null, { status: 204 });
+          }
+          if (init?.method === "PATCH") {
+            const body = JSON.parse(String(init.body)).body;
+            if (!rejectedMention && body.includes("@alice")) {
+              rejectedMention = true;
+              return new Response(null, { status: 403 });
+            }
+            patchBodies.push(body);
+            if (!delayedMention && body.includes("@alice")) {
+              delayedMention = body;
+              throw new Error("mention PATCH delayed");
+            }
+            comments.set(id, body);
+          }
+          return Response.json({
+            id: Number(id),
+            body: comments.get(id),
+            user: bot,
+            pull_request_url:
+              origin + "/team/repo/pulls/" + (onClosedPr ? 4 : 1),
+            issue_url: "",
+          });
+        }
+        throw new Error("Unexpected fixture route " + route);
+      },
+    );
+    let checks: ForgeMergeState = {
+      state: "ready",
+      reason: "all fixture requirements satisfied",
+    };
+    let pauseInspection:
+      ((request: ForgeMergeRequest) => Promise<void>) | undefined;
+    let writes = 0;
+    let nextRateLimit: number | undefined;
+    let denyNextSubmission = false;
+    t.mock.method(
+      ForgejoInteractions.prototype,
+      "inspectMerge",
+      async (request: ForgeMergeRequest) => {
+        if (pauseInspection) await pauseInspection(request);
+        return checks;
+      },
+    );
+    t.mock.method(
+      ForgejoInteractions.prototype,
+      "scheduleMerge",
+      async (
+        _request: ForgeMergeRequest,
+        _resumeOnly: boolean,
+        checkpoint: ForgeMergeCheckpoint,
+      ) => {
+        if (nextRateLimit !== undefined) {
+          const retryAt = nextRateLimit;
+          nextRateLimit = undefined;
+          await checkpoint("creating_check");
+          await checkpoint("submitting");
+          await checkpoint("creating_check");
+          throw new ForgeOperationError("unavailable", false, 403, retryAt);
+        }
+        if (denyNextSubmission) {
+          denyNextSubmission = false;
+          await checkpoint("creating_check");
+          await checkpoint("submitting");
+          throw new ForgeOperationError("permission", false, 403);
+        }
+        await checkpoint("submitting");
+        writes++;
+        throw new ForgeOperationError("unavailable", true);
+      },
+    );
+    let fallbackOnly = false;
+    t.mock.method(
+      ForgejoInteractions.prototype,
+      "reviewerLogin",
+      async (login: string) => {
+        if (fallbackOnly) return login === "fallback" ? login : null;
+        assert.notEqual(
+          login,
+          "excess",
+          "provider lookups stop after three verified accounts",
+        );
+        return ["alice", "extra1", "extra2"].includes(login) ? login : null;
+      },
+    );
+    /** Insert the stored PR that the console's review endpoint pins and authorizes. */
+    async function pull(number: number) {
+      const id = "pr_" + String(number).padStart(16, "0");
+      await db.pool.query(
+        "insert into pull_requests(public_id,repository_id,number,title,url,state,draft,head_branch,base_branch,head_sha,base_sha) select $1,id,$2,'Docs',$3,'open',false,'docs','main',$4,$5 from repositories where public_id=$6",
+        [
+          id,
+          number,
+          origin + "/team/repo/pulls/" + number,
+          headSha,
+          baseSha,
+          repo.id,
+        ],
+      );
+      return id;
+    }
+    /** Submit through normal review admission and complete the real durable lease with a local assessment. */
+    async function complete(pr: string, score: number) {
+      const review = await submitReview(
+        db,
+        { repositoryId: repo.id, baseSha, headSha },
+        undefined,
+        undefined,
+        pr,
+      );
+      const attempt = await beginAttempt(db, review.id, "test", 30000);
+      assert.equal(attempt.kind, "started");
+      assert.equal(
+        attempt.job.mergePolicy?.policy.policyMarkdown,
+        policy.policyMarkdown,
+      );
+      await finishAttempt(db, review.id, attempt.attemptId, "test", {
+        summary: "Read the guide",
+        findings: [],
+        mergeAssessment: { ...assessment, confidence: score },
+      });
+      return review.id;
+    }
+    /** Read the latest persisted decision and native-write state without contacting the fixture provider. */
+    async function decision(id: string) {
+      return (
+        await db.pool.query(
+          "select merge_decision->>'status' as status,merge_action as action from reviews where public_id=$1",
+          [id],
+        )
+      ).rows[0];
+    }
+    /** Advance the retry clock of this specific test PR without timing-dependent sleeps. */
+    async function due(pr: string) {
+      await db.pool.query(
+        "update pull_requests set merge_after=now() where public_id=$1",
+        [pr],
+      );
+    }
+    const first = await pull(1);
+    const second = await pull(2);
+    const human = await complete(first, 72);
+    priorReviewId = await complete(second, 90);
+    await db.pool.query(
+      "update reviews set result=jsonb_set(result,'{findings}',$1::jsonb) where public_id=$2",
+      [JSON.stringify([priorFinding]), priorReviewId],
+    );
+    await db.pool.query(
+      "with hook as (insert into repository_webhooks(public_id,repository_id,managed_by,enabled,callback_base,secret,senders) select 'hook_0000000000000002',id,'fixture',true,'https://hooks.invalid','{}','[]' from repositories where public_id=$1 returning id,repository_id) insert into review_triggers(webhook_id,repository_id,review_id,origin,change) select hook.id,hook.repository_id,reviews.id,'automatic',$3 from hook,reviews where reviews.public_id=$2",
+      [
+        repo.id,
+        priorReviewId,
+        { number: 2, headSha, baseSha, mergeBase: baseSha },
+      ],
+    );
+    await db.pool.query(
+      "update dispatch_outbox set publication=$1 where review_id=(select id from reviews where public_id=$2)",
+      [
+        {
+          state: "published",
+          mode: "review",
+          remoteId: "23",
+          limitations: [
+            "guide.md:1-1: replacement range was not validated; published prose advice only",
+          ],
+        },
+        priorReviewId,
+      ],
+    );
+    const clean = await complete(second, 90);
+    // The publication-time recap can predate a maintainer resolving a thread.
+    // Only the current audit can determine whether historical findings still block.
+    await db.pool.query(
+      "update dispatch_outbox set publication=$1 where review_id=(select id from reviews where public_id=$2)",
+      [{ state: "published", outstandingFindings: 1 }, clean],
+    );
+    await processMergeTriage(db);
+    assert.deepEqual(await decision(clean), {
+      status: "auto_merge_eligible",
+      action: "dry_run",
+    });
+    assert.equal(writes, 0);
+    assert.equal((await decision(human)).status, "human_review_required");
+    assert.equal(posts, 1);
+    assert.doesNotMatch(delayedReservation, /@alice/);
+    assert.equal(remoteComments.size, 0);
+    // A modified reservation is never adopted, even when it still has an owned marker.
+    remoteComments.set(
+      "88",
+      "Edited note\n" + delayedReservation.split("\n").at(-1),
+    );
+    await due(first);
+    await processMergeTriage(restart);
+    assert.ok(
+      (
+        await db.pool.query(
+          "select escalation_comment->>'reservationRetryAt' as retry from pull_requests where public_id=$1",
+          [first],
+        )
+      ).rows[0].retry,
+    );
+    assert.equal(posts, 1);
+    remoteComments.delete("88");
+    await due(first);
+    await processMergeTriage(restart);
+    assert.equal(posts, 1);
+    await db.pool.query(
+      "update pull_requests set merge_after=now(), escalation_comment=jsonb_set(escalation_comment,'{reservationRetryAt}','0') where public_id=$1",
+      [first],
+    );
+    await Promise.all([processMergeTriage(db), processMergeTriage(restart)]);
+    assert.equal(posts, 2);
+    assert.equal(rejectedMention, true);
+    assert.equal(delayedMention, "");
+    const rejected = (
+      await db.pool.query(
+        "select escalation_comment from pull_requests where public_id=$1",
+        [first],
+      )
+    ).rows[0].escalation_comment;
+    assert.ok(!rejected.mentioned && !rejected.uncertainEdit);
+    await due(first);
+    await processMergeTriage(restart);
+    assert.match(delayedMention, /@alice @extra1 @extra2/);
+    assert.equal(remoteComments.get("78"), delayedReservation);
+    // The provider has accepted the mention-bearing edit but it is still invisible.
+    await due(first);
+    await processMergeTriage(restart);
+    assert.match(remoteComments.get("78")!, /Human review required/);
+    assert.doesNotMatch(remoteComments.get("78")!, /@alice/);
+    // The first POST appears late. Only the committed ID ever contains the escalation.
+    remoteComments.set("77", delayedReservation);
+    await due(first);
+    await processMergeTriage(restart);
+    assert.deepEqual([...remoteComments.keys()], ["78"]);
+    assert.equal(patchBodies.length, 2);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select count(*)::int n from merge_escalation_history",
+        )
+      ).rows[0].n,
+      1,
+    );
+    // Deliver the first PATCH after a newer decision has already replaced it.
+    await complete(first, 73);
+    await processMergeTriage(db);
+    const updatedBody = remoteComments.get("78")!;
+    assert.match(updatedBody, /73\/100/);
+    remoteComments.set("78", delayedMention);
+    await due(first);
+    await processMergeTriage(restart);
+    assert.equal(remoteComments.get("78"), updatedBody);
+    // A successful newer PATCH cannot prove that the timed-out PATCH is finished.
+    await db.pool.query(
+      "update pull_requests set state='closed' where public_id=$1",
+      [first],
+    );
+    await processMergeTriage(db);
+    const resolvedBody = remoteComments.get("78");
+    assert.ok(resolvedBody && resolvedBody !== updatedBody);
+    const afterClose = (
+      await db.pool.query(
+        "select merge_after > now() as due, escalation_comment from pull_requests where public_id=$1",
+        [first],
+      )
+    ).rows[0];
+    assert.equal(afterClose.escalation_comment.pendingReservations, 0);
+    assert.equal(afterClose.escalation_comment.uncertainEdit, true);
+    assert.equal(afterClose.due, true);
+    remoteComments.set("78", delayedMention);
+    await due(first);
+    await processMergeTriage(restart);
+    assert.equal(remoteComments.get("78"), resolvedBody);
+    await db.pool.query(
+      "update pull_requests set state='open' where public_id=$1",
+      [first],
+    );
+    await complete(first, 73);
+    remoteComments.delete("78");
+    await due(first);
+    await processMergeTriage(db);
+    assert.equal(posts, 3);
+    assert.match(remoteComments.get("79")!, /Human review required/);
+    assert.doesNotMatch(remoteComments.get("79")!, /@/);
+    fallbackOnly = true;
+    const repeat = await complete(first, 100);
+    await processMergeTriage(db);
+    assert.equal((await decision(repeat)).status, "human_review_required");
+    assert.equal(
+      patchBodies.filter((body) => body.includes("@alice")).length,
+      1,
+    );
+    assert.doesNotMatch(remoteComments.get("79")!, /@/);
+    assert.match(remoteComments.get("79")!, /previously|human-controlled/);
+    assert.match(remoteComments.get("79")!, /Suggested reviewers: `fallback`/);
+    fallbackOnly = false;
+    // A direct notification attempted by an older installation has no harmless
+    // retry. Surface it after the bounded wait, then adopt it if it arrives.
+    const legacyBody = remoteComments.get("79")!;
+    remoteComments.delete("79");
+    await db.pool.query(
+      "update pull_requests set merge_after=now(), escalation_comment=$2 where public_id=$1",
+      [
+        first,
+        {
+          botId: "1",
+          creatingBody: legacyBody,
+          mentioned: true,
+          reservationRetryAt: Date.now() - 1,
+        },
+      ],
+    );
+    await processMergeTriage(restart);
+    const listed = (await listPullRequests(db, [repo.id])).find(
+      (entry) => entry.id === first,
+    );
+    assert.equal(
+      listed?.merge?.decision.reasons[0].code,
+      "escalation_delivery_unconfirmed",
+    );
+    assert.equal(posts, 3);
+    remoteComments.set("79", legacyBody);
+    await due(first);
+    await processMergeTriage(db);
+    assert.equal(posts, 3);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select escalation_comment->>'remoteId' id from pull_requests where public_id=$1",
+          [first],
+        )
+      ).rows[0].id,
+      "79",
+    );
+
+    const closing = await pull(4);
+    await complete(closing, 72);
+    await processMergeTriage(db);
+    assert.match(closedReservation, /escalation-pending/);
+    assert.doesNotMatch(closedReservation, /@/);
+    const postsAtClose = posts;
+    const editsAtClose = patchBodies.length;
+    await db.pool.query(
+      "update pull_requests set state='closed' where public_id=$1",
+      [closing],
+    );
+    await processMergeTriage(restart);
+    const closed = await db.pool.query(
+      "select merge_after > now() as cleanup_pending from pull_requests where public_id=$1",
+      [closing],
+    );
+    assert.equal(closed.rows[0].cleanup_pending, true);
+    closingComments.set("92", closedReservation);
+    await due(closing);
+    await processMergeTriage(db);
+    assert.equal(closingComments.size, 0);
+    assert.equal(posts, postsAtClose);
+    assert.equal(patchBodies.length, editsAtClose);
+
+    config.repositories.project.mergePolicy = {
+      ...policy,
+      dryRun: false,
+      minimumConfidence: 80,
+    };
+    await applyRegistry(db, config);
+    await processMergeTriage(db);
+    assert.equal((await decision(clean)).status, "stale");
+    assert.equal(writes, 0);
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 2);
+    assert.equal(
+      (await getRepository(db, repos.find((r) => r.configKey === "other")!.id))
+        ?.mergePolicyVersion,
+      1,
+    );
+    await assert.rejects(
+      updateRepositoryMergePolicy(db, repo.id, { version: 2, policy }),
+      /registry file/,
+    );
+    const live = await complete(second, 95);
+    // Restart after the durable intent, before any provider mutation was attempted.
+    await db.pool.query(
+      "update reviews set merge_action='writing',merge_write_stage='prepared' where public_id=$1",
+      [live],
+    );
+
+    /** Always release the inspecting worker, including when it fails before reaching the barrier. */
+    async function whileInspectionPaused(
+      compete: () => Promise<void>,
+      reviewId?: string,
+    ) {
+      const entered = barrier();
+      const release = barrier();
+      pauseInspection = async (request) => {
+        if (reviewId && reviewId !== request.reviewId) return;
+        entered.resolve();
+        await release.promise;
+      };
+      const worker = processMergeTriage(db);
+      try {
+        await Promise.race([
+          entered.promise,
+          worker.then(() => {
+            throw new Error("Worker finished before inspection");
+          }),
+        ]);
+        await compete();
+      } finally {
+        release.resolve();
+        pauseInspection = undefined;
+        await worker;
+      }
+    }
+    await whileInspectionPaused(() => processMergeTriage(restart));
+    assert.equal(writes, 1);
+    assert.deepEqual(await decision(live), {
+      status: "blocked",
+      action: "uncertain",
+    });
+    await due(second);
+    await processMergeTriage(restart);
+    assert.equal(writes, 1);
+    checks = { state: "merged", reason: "verified" };
+    await due(second);
+    await processMergeTriage(restart);
+    assert.deepEqual(await decision(live), {
+      status: "merged",
+      action: "merged",
+    });
+    assert.equal(writes, 1);
+    const third = await pull(3);
+    const superseded = await complete(third, 95);
+    checks = { state: "ready", reason: "verified" };
+    await whileInspectionPaused(async () => {
+      await db.pool.query(
+        "update pull_requests set head_sha=$1 where public_id=$2",
+        ["c".repeat(40), third],
+      );
+      await db.pool.query(
+        "update pull_requests set head_sha=$1 where public_id=$2",
+        [headSha, third],
+      );
+    });
+    await processMergeTriage(db);
+    assert.equal((await decision(superseded)).status, "stale");
+    assert.equal(writes, 1);
+
+    const previewPr = await pull(5);
+    const oldCheck = await complete(previewPr, 95);
+    const oldDecision = {
+      status: "stale",
+      reviewers: [],
+      reasons: [
+        {
+          code: "operator_resolved",
+          message: "Operator resolved the incident.",
+        },
+      ],
+    };
+    await db.pool.query(
+      "update reviews set merge_action='refused',merge_write_stage='creating_check',merge_decision=$2 where public_id=$1",
+      [oldCheck, oldDecision],
+    );
+    const replacement = await complete(previewPr, 95);
+    checks = {
+      state: "blocked",
+      reason: "conflicting_eligibility_check",
+      pendingCheckReviewId: oldCheck,
+    };
+    let expectedCheckOwner = oldCheck;
+    const cancelPreview = t.mock.method(
+      ForgejoInteractions.prototype,
+      "cancelMerge",
+      async (request: ForgeMergeRequest) => {
+        assert.equal(request.reviewId, expectedCheckOwner);
+        assert.equal(request.writeStage, "creating_check");
+        checks = { state: "awaiting_checks", reason: "required_check_pending" };
+        return "cancelled";
+      },
+    );
+    await processMergeTriage(restart);
+    assert.equal(cancelPreview.mock.callCount(), 0);
+    assert.equal((await decision(replacement)).status, "blocked");
+    oldDecision.reasons = [
+      {
+        code: "schedule_invalidated",
+        message: "The previous merge authorization was retired.",
+      },
+    ];
+    await db.pool.query(
+      "update reviews set merge_decision=$2 where public_id=$1",
+      [oldCheck, oldDecision],
+    );
+    await due(previewPr);
+    let newest = "";
+    await whileInspectionPaused(async () => {
+      newest = await complete(previewPr, 95);
+    }, replacement);
+    assert.equal(cancelPreview.mock.callCount(), 0);
+    await due(previewPr);
+    await processMergeTriage(restart);
+    assert.equal(cancelPreview.mock.callCount(), 1);
+    assert.equal((await decision(newest)).status, "awaiting_checks");
+    assert.equal(writes, 1);
+    checks = { state: "ready", reason: "provider_ready" };
+    await due(previewPr);
+    await processMergeTriage(restart);
+    assert.equal(writes, 2);
+
+    const limitedPr = await pull(6);
+    const limited = await complete(limitedPr, 95);
+    const retryAt = Date.now() + 180000;
+    nextRateLimit = retryAt;
+    await processMergeTriage(db);
+    const limitedRow = (
+      await db.pool.query(
+        "select merge_action,merge_write_stage,merge_decision,p.merge_after from reviews r join pull_requests p on p.id=r.merge_pull_request_id where r.public_id=$1",
+        [limited],
+      )
+    ).rows[0];
+    assert.equal(limitedRow.merge_write_stage, "creating_check");
+    assert.equal(limitedRow.merge_action, "writing");
+    assert.equal(
+      limitedRow.merge_decision.reasons[0].code,
+      "provider_rate_limited",
+    );
+    assert.equal(limitedRow.merge_after.getTime(), retryAt);
+    await processMergeTriage(restart);
+    assert.equal(writes, 2);
+    // Make the next observation explicitly report that an uncertain create is still unseen.
+    checks = { state: "blocked", reason: "eligibility_check_unconfirmed" };
+    await due(limitedPr);
+    await processMergeTriage(restart);
+    const missing = (
+      await db.pool.query(
+        "select merge_decision,merge_action from reviews where public_id=$1",
+        [limited],
+      )
+    ).rows[0];
+    assert.equal(missing.merge_action, "uncertain");
+    assert.equal(
+      missing.merge_decision.reasons[0].code,
+      "eligibility_check_unconfirmed",
+    );
+    assert.match(
+      missing.merge_decision.reasons[0].message,
+      /operator recovery/,
+    );
+    assert.equal(writes, 2);
+
+    const deniedPr = await pull(7);
+    const denied = await complete(deniedPr, 95);
+    checks = { state: "ready", reason: "provider_ready" };
+    denyNextSubmission = true;
+    await processMergeTriage(db);
+    const refusal = (
+      await db.pool.query(
+        "select merge_action,merge_write_stage,merge_decision from reviews where public_id=$1",
+        [denied],
+      )
+    ).rows[0];
+    assert.equal(refusal.merge_action, "refused");
+    assert.equal(refusal.merge_write_stage, "creating_check");
+    assert.equal(
+      refusal.merge_decision.reasons[0].code,
+      "native_submission_refused",
+    );
+    await due(deniedPr);
+    await processMergeTriage(restart);
+    assert.equal(writes, 2);
+    const afterDenial = await complete(deniedPr, 95);
+    expectedCheckOwner = denied;
+    checks = {
+      state: "blocked",
+      reason: "conflicting_eligibility_check",
+      pendingCheckReviewId: denied,
+    };
+    await processMergeTriage(restart);
+    assert.equal(cancelPreview.mock.callCount(), 2);
+    assert.equal((await decision(afterDenial)).status, "awaiting_checks");
+    assert.equal(writes, 2);
+
+    // Ten older PRs share a busy repository. The unrelated repository must get
+    // a dispatch slot in this same batch, even if its own review queue is empty.
+    const free = repos.find((r) => r.configKey === "other")!;
+    await db.pool.query(
+      `insert into pull_requests (public_id,repository_id,number,title,url,state,head_sha,base_sha,merge_after)
+      select 'pr_' || lpad(n::text,16,'0'), r.id,n,'Queued','https://forge.invalid/pr/'||n,'open',$3,$4,
+        case when n=30 then now() else now()-interval '1 hour' end
+      from generate_series(20,30) n join repositories r on r.public_id=case when n=30 then $2 else $1 end`,
+      [repo.id, free.id, headSha, baseSha],
+    );
+    const holder = await db.pool.connect();
+    const lock = "repository:" + repo.id;
+    try {
+      await holder.query("select pg_advisory_lock(748322,hashtext($1))", [
+        lock,
+      ]);
+      await processMergeTriage(restart);
+      const freeRow = await db.pool.query(
+        "select merge_after from pull_requests where number=30",
+      );
+      assert.equal(freeRow.rows[0].merge_after, null);
+    } finally {
+      try {
+        await holder.query("select pg_advisory_unlock(748322,hashtext($1))", [
+          lock,
+        ]);
+      } finally {
+        holder.release();
+      }
+    }
+  },
+);
+
+test(
+  "policy replacement waits for acknowledged native authority and preserves a lost write fence",
+  { timeout: 60000 },
+  async (t) => {
+    const fixture = await databaseFixture();
+    t.after(() => fixture.close());
+    const db = fixture.database;
+    const origin = "https://forge.invalid";
+    const metadata = {
+      id: 2,
+      full_name: "team/repo",
+      html_url: origin + "/team/repo",
+      default_branch: "main",
+      private: true,
+      archived: false,
+    };
+    t.mock.method(globalThis, "fetch", async (input: URL) => {
+      const url = new URL(String(input));
+      assert.equal(url.origin, origin);
+      if (url.pathname === "/api/v1/repos/team/repo")
+        return Response.json(metadata);
+      if (url.pathname === "/api/v1/user")
+        return Response.json({ id: 7, login: "bot" });
+      throw new Error("Unexpected fixture provider read");
+    });
+    const original = mergePolicySchema.parse({ enabled: true, dryRun: false });
+    const config = registrySchema.parse({
+      registry: { key: "fixture" },
+      forges: {
+        forge: {
+          type: "forgejo",
+          api_url: origin + "/api/v1",
+          web_url: origin,
+        },
+      },
+      repositories: {
+        repo: {
+          forge: "forge",
+          selector: "team/repo",
+          git: {
+            branch: "main",
+            upstream: "refs/remotes/origin/main",
+            remotes: { origin: origin + "/team/repo.git" },
+          },
+          indexing: { owner: "fixture" },
+          mergePolicy: original,
+        },
+      },
+    });
+    await applyRegistry(db, config);
+    const [repo] = await listRepositories(db);
+    await db.pool.query(
+      "update repositories set verified_at=now(),external_repository_id='2',observed=$1 where public_id=$2",
+      [
+        {
+          externalRepositoryId: "2",
+          fullPath: "team/repo",
+          defaultBranch: "main",
+        },
+        repo.id,
+      ],
+    );
+    const pr = "pr_0000000000000001";
+    await db.pool.query(
+      "insert into pull_requests(public_id,repository_id,number,title,url,state,draft,head_branch,base_branch,head_sha,base_sha) select $1,id,1,'Docs',$2,'open',false,'docs','main',$3,$4 from repositories where public_id=$5",
+      [pr, origin + "/team/repo/pulls/1", headSha, baseSha, repo.id],
+    );
+    const review = await submitReview(
+      db,
+      { repositoryId: repo.id, headSha, baseSha },
+      undefined,
+      undefined,
+      pr,
+    );
+    await db.pool.query(
+      "update reviews set merge_action='uncertain' where public_id=$1",
+      [review.id],
+    );
+    const remote = t.mock.method(
+      ForgejoInteractions.prototype,
+      "inspectMerge",
+      async () => ({ state: "ready", reason: "fixture" }),
+    );
+    const entered = barrier();
+    const released = barrier();
+    const cancel = t.mock.method(
+      ForgejoInteractions.prototype,
+      "cancelMerge",
+      async () => {
+        entered.resolve();
+        await released.promise;
+        return "absent";
+      },
+    );
+    const changed = { ...original, minimumConfidence: 100 };
+    config.repositories.repo.mergePolicy = changed;
+    await assert.rejects(applyRegistry(db, config), { status: 409 });
+    config.forges.forge.credential = {
+      env: "RAZBOR_TRIAGE_FIXTURE_CREDENTIAL",
+    };
+    await assert.rejects(
+      applyRegistry(db, config),
+      /empty \[repositories\] table/,
+    );
+    await applyRegistry(db, { ...config, repositories: {} });
+    assert.deepEqual(
+      (
+        await db.pool.query(
+          "select credential from forge_instances where config_key='forge'",
+        )
+      ).rows[0].credential,
+      config.forges.forge.credential,
+    );
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 1);
+    // The rest of this fixture uses an anonymous controlled adapter.
+    delete config.forges.forge.credential;
+    await applyRegistry(db, { ...config, repositories: {} });
+
+    assert.equal(cancel.mock.callCount(), 0);
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 1);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_action from reviews where public_id=$1",
+          [review.id],
+        )
+      ).rows[0].merge_action,
+      "uncertain",
+    );
+
+    // Persist an observed acknowledgement before attempting cancellation. If the
+    // provider/operator removes it during an interruption, absence is now actionable.
+    let observed = true;
+    remote.mock.mockImplementation(async () => ({
+      state: observed ? "scheduled" : "ready",
+      reason: "fixture",
+    }));
+    cancel.mock.mockImplementationOnce(async () => {
+      observed = false;
+      throw new ForgeOperationError("unavailable", true);
+    });
+    await assert.rejects(applyRegistry(db, config), { status: 409 });
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_action from reviews where public_id=$1",
+          [review.id],
+        )
+      ).rows[0].merge_action,
+      "scheduled",
+    );
+    const save = applyRegistry(db, config);
+    try {
+      await Promise.race([
+        entered.promise,
+        save.then(() => {
+          throw new Error("Saved before cancellation readback");
+        }),
+      ]);
+      assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 1);
+    } finally {
+      released.resolve();
+      await save;
+    }
+    assert.equal(cancel.mock.callCount(), 2);
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 2);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_action from reviews where public_id=$1",
+          [review.id],
+        )
+      ).rows[0].merge_action,
+      "refused",
+    );
+
+    await db.pool.query(
+      "update repositories set managed_by='ui',config_key='ui-'||public_id where public_id=$1",
+      [repo.id],
+    );
+    await db.pool.query(
+      "update reviews set merge_action='writing' where public_id=$1",
+      [review.id],
+    );
+    await assert.rejects(
+      updateRepositoryMergePolicy(db, repo.id, {
+        version: 2,
+        policy: original,
+      }),
+      { status: 409 },
+    );
+    remote.mock.mockImplementation(async () => ({
+      state: "merged",
+      reason: "fixture",
+    }));
+    await updateRepositoryMergePolicy(db, repo.id, {
+      version: 2,
+      policy: original,
+    });
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 3);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_action from reviews where public_id=$1",
+          [review.id],
+        )
+      ).rows[0].merge_action,
+      "merged",
+    );
+
+    // A delayed check creation needs its own positive cancellation receipt.
+    await db.pool.query(
+      "update reviews set merge_action='writing',merge_write_stage='creating_check' where public_id=$1",
+      [review.id],
+    );
+    remote.mock.mockImplementation(async () => ({
+      state: "ready",
+      reason: "fixture",
+    }));
+    cancel.mock.mockImplementationOnce(async () => "absent");
+    await assert.rejects(
+      updateRepositoryMergePolicy(db, repo.id, { version: 3, policy: changed }),
+      { status: 409 },
+    );
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_action from reviews where public_id=$1",
+          [review.id],
+        )
+      ).rows[0].merge_action,
+      "writing",
+    );
+    cancel.mock.mockImplementationOnce(async () => "cancelled");
+    await updateRepositoryMergePolicy(db, repo.id, {
+      version: 3,
+      policy: changed,
+    });
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_action from reviews where public_id=$1",
+          [review.id],
+        )
+      ).rows[0].merge_action,
+      "refused",
+    );
+
+    // Run the operator's published maintenance transaction against a legacy ambiguous
+    // action. Only an exact review and SHA can wake this PR and append its audit entry.
+    await db.pool.query(
+      "update reviews set merge_action='uncertain',merge_write_stage=null where public_id=$1",
+      [review.id],
+    );
+    const guide = await readFile(
+      new URL("../../../docs/merge-providers.md", import.meta.url),
+      "utf8",
+    );
+    const statements = guide
+      .split("```sql\n")[1]
+      .split("\n```")[0]
+      .split(";")
+      .filter((statement) => statement.trim());
+    const dueBefore = (
+      await db.pool.query(
+        "select merge_after from pull_requests where public_id=$1",
+        [pr],
+      )
+    ).rows[0].merge_after;
+    for (const sha of ["c".repeat(40), headSha]) {
+      const inputs: Record<string, string> = {
+        review_id: review.id,
+        head_sha: sha,
+        incident: "IR-23",
+      };
+      let returned: { public_id: string }[] = [];
+      try {
+        for (const statement of statements) {
+          const values: string[] = [];
+          const query = statement.replace(
+            /:'(\w+)'/g,
+            (_match, key: string) => {
+              assert.ok(Object.hasOwn(inputs, key));
+              values.push(inputs[key]);
+              return `$${values.length}`;
+            },
+          );
+          returned = (
+            await fixture.administrator.query<{ public_id: string }>(
+              query,
+              values,
+            )
+          ).rows;
+        }
+        if (sha === headSha) {
+          assert.deepEqual(returned, [{ public_id: pr }]);
+          await fixture.administrator.query("commit");
+        } else {
+          assert.deepEqual(returned, []);
+          await fixture.administrator.query("rollback");
+          const remaining = (
+            await db.pool.query(
+              "select p.merge_after, r.merge_action from pull_requests p join reviews r on r.merge_pull_request_id=p.id where r.public_id=$1",
+              [review.id],
+            )
+          ).rows[0];
+          assert.deepEqual(remaining, {
+            merge_after: dueBefore,
+            merge_action: "uncertain",
+          });
+        }
+      } catch (error) {
+        await fixture.administrator.query("rollback");
+        throw error;
+      }
+    }
+    const audit = (
+      await db.pool.query(
+        "select decision,action from merge_decision_history where review_id=(select id from reviews where public_id=$1) and decision->'reasons'->0->>'code'='operator_resolved'",
+        [review.id],
+      )
+    ).rows;
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].action, "refused");
+    assert.match(audit[0].decision.reasons[0].message, /postgres.*IR-23/);
+  },
+);

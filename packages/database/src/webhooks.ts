@@ -135,14 +135,16 @@ async function context(database: Database, repositoryId: string) {
  */
 async function openAdapter(
   database: Database,
-  row: Awaited<ReturnType<typeof context>>,
+  row: Pick<Awaited<ReturnType<typeof context>>, "repo" | "forge"> & {
+    hook: { mode: string } | null;
+  },
   budgetMs = 20000,
   verifyBinding = false,
 ) {
   const f = row.forge;
   const credential = row.repo.apiCredential ?? f.credential;
   const app = await getRepositoryGithubApp(database, row.repo.id);
-  if (row.hook.mode === "github-app" && !app)
+  if (row.hook?.mode === "github-app" && !app)
     throw new Error("GitHub App connection unavailable");
   // Deletion revokes ordinary execution tokens. Cleanup can use only the
   // exact saved App installation and repository, then verifies the provider ID.
@@ -182,11 +184,35 @@ async function openAdapter(
 /** Open a provider client for an interaction that does not need the repository metadata. */
 async function adapter(
   database: Database,
-  row: Awaited<ReturnType<typeof context>>,
+  row: Parameters<typeof openAdapter>[1],
   budgetMs = 20000,
   verifyBinding = false,
 ) {
   return (await openAdapter(database, row, budgetMs, verifyBinding)).api;
+}
+
+/** Resolve credentials from the saved repository, and authenticate both repository and bot before triage writes. */
+export async function triageForge(database: Database, repositoryId: string) {
+  const [row] = await database.db
+    .select({
+      repo: repositories,
+      forge: forgeInstances,
+      hook: repositoryWebhooks,
+    })
+    .from(repositories)
+    .innerJoin(forgeInstances, eq(repositories.forgeId, forgeInstances.id))
+    .leftJoin(
+      repositoryWebhooks,
+      eq(repositoryWebhooks.repositoryId, repositories.id),
+    )
+    .where(eq(repositories.id, repositoryId));
+  if (!row?.repo.verifiedAt || row.repo.status !== "active")
+    throw new ForgeOperationError("permission");
+  const api = await adapter(database, row, 30000, true);
+  const bot = await api.identity();
+  if (row.hook?.botId && row.hook.botId !== bot.id)
+    throw new ForgeOperationError("permission");
+  return { api, bot };
 }
 
 /**
@@ -261,6 +287,29 @@ async function publishedReview(
   return found;
 }
 
+type MergeFindingAudit = {
+  missing: Set<string>;
+  assessed: Map<string, "resolved" | "open" | "uncertain">;
+};
+
+/** Record only assessments of exact prior finding identities captured by trusted review admission. */
+function recordMergeFindingChecks(
+  audit: MergeFindingAudit,
+  review: Pick<typeof reviews.$inferSelect, "result" | "source">,
+) {
+  const snapshot = new Map(
+    review.source.previousFindings?.map((old) => [old.id, old]),
+  );
+  for (const check of review.result?.findingChecks ?? []) {
+    const old = snapshot.get(check.id);
+    if (old)
+      audit.assessed.set(
+        `${old.reviewId}:${findingKey(old.finding)}`,
+        check.status,
+      );
+  }
+}
+
 /**
  * Reconcile saved results with bot-owned published reviews, collecting
  * unresolved inline threads and published finding keys for reassessment and
@@ -275,6 +324,7 @@ async function previousFindings(
   bot: string,
   api: Forge,
   excludeReviewId?: string,
+  mergeAudit?: MergeFindingAudit,
 ) {
   const history = await database.db
     .select({ review: reviews, publication: dispatchOutbox.publication })
@@ -288,7 +338,7 @@ async function previousFindings(
         eq(reviews.status, "completed"),
       ),
     )
-    .orderBy(reviews.createdAt);
+    .orderBy(reviews.createdAt, reviews.publicId);
   const previous: PreviousFinding[] = [];
   const recapFindings = new Map<string, PreviousFinding>();
   const targets = new Map<
@@ -299,8 +349,35 @@ async function previousFindings(
     }
   >();
   const publishedKeys = new Set<string>();
+  const openOwners = new Map<string, string | null>();
+  const historicalFindings = new Set<string>();
   let recapReviewId: string | undefined;
   let remoteReviews: Awaited<ReturnType<Forge["reviews"]>> | undefined;
+
+  /** Only one exact open finding can represent a duplicate in a later frozen payload. */
+  function rememberOpenOwner(key: string, reviewId: string) {
+    const owner = openOwners.get(key);
+    openOwners.set(
+      key,
+      owner === undefined || owner === reviewId ? reviewId : null,
+    );
+  }
+
+  /** Give each confirmed threadless occurrence a distinct identity that a later review can reassess. */
+  function recordRecapFinding(
+    review: (typeof history)[number]["review"],
+    finding: PreviousFinding["finding"],
+  ) {
+    const key = findingKey(finding);
+    mergeAudit?.missing.delete(`${review.publicId}:${key}`);
+    const id = `recap:${review.publicId}:${key}`;
+    recapFindings.set(id, {
+      id,
+      reviewId: review.publicId,
+      finding,
+      originalHead: review.headSha,
+    });
+  }
 
   /** Retire threadless findings only when the resolving run assessed their saved identity. */
   function resolveRecapFindings(review: (typeof history)[number]["review"]) {
@@ -323,6 +400,25 @@ async function previousFindings(
   for (const { review, publication } of history) {
     if (review.publicId === excludeReviewId || review.source.conversation)
       continue;
+    // Publication may ignore an unseen remote comment. Merge authorization requires
+    // a positive accounting for each persisted finding even if the actor or marker disappeared.
+    if (mergeAudit)
+      for (const finding of review.result?.findings ?? []) {
+        const key = findingKey(finding);
+        const identity = `${review.publicId}:${key}`;
+        const owner = publication?.openFindingOwners?.[key];
+        // The original identity is audited in its own right. Without a frozen
+        // link to an earlier result, the absent marker still needs explicit proof.
+        if (
+          !owner ||
+          publication?.state !== "published" ||
+          publication.stale ||
+          publication.rearmed ||
+          !historicalFindings.has(`${owner}:${key}`)
+        )
+          mergeAudit.missing.add(identity);
+        historicalFindings.add(identity);
+      }
     // Include writes that reached the provider before their outbox update completed.
     remoteReviews ??= await api.reviews(number);
     // Recap-only findings have no native thread. Retain new findings for explicit
@@ -340,6 +436,8 @@ async function previousFindings(
       )
     ) {
       resolveRecapFindings(review);
+      if (mergeAudit && !publication.rearmed)
+        recordMergeFindingChecks(mergeAudit, review);
       const snapshotKeys = new Set(
         (review.source.previousFindings ?? []).map((old) =>
           findingKey(old.finding),
@@ -347,17 +445,12 @@ async function previousFindings(
       );
       for (const finding of review.result?.findings ?? []) {
         const key = findingKey(finding);
-        const newlyPublished =
-          !publishedKeys.has(key) && !snapshotKeys.has(key);
+        const independent = publication.openFindingOwners
+          ? !publication.openFindingOwners[key]
+          : publication.suppressedFindings?.[key] ||
+            (!publishedKeys.has(key) && !snapshotKeys.has(key));
         publishedKeys.add(key);
-        if (!newlyPublished) continue;
-        const id = `recap:${review.publicId}:${key}`;
-        recapFindings.set(id, {
-          id,
-          reviewId: review.publicId,
-          finding,
-          originalHead: review.headSha,
-        });
+        if (independent) recordRecapFinding(review, finding);
       }
       continue;
     }
@@ -378,8 +471,27 @@ async function previousFindings(
       publication?.state === "published" &&
       !publication.stale &&
       !publication.rearmed
-    )
+    ) {
       resolveRecapFindings(review);
+      if (mergeAudit) recordMergeFindingChecks(mergeAudit, review);
+      for (const finding of review.result?.findings ?? []) {
+        const key = findingKey(finding);
+        if (
+          publication.suppressedFindings?.[key] ||
+          (publication.openFindingOwners &&
+            !publication.openFindingOwners[key] &&
+            publication.reviewPayload &&
+            !publication.reviewPayload.comments.some(
+              (comment) =>
+                comment.path === finding.path &&
+                comment.body.endsWith(
+                  `\n<!-- razbor:${review.publicId}:${key} -->`,
+                ),
+            ))
+        )
+          recordRecapFinding(review, finding);
+      }
+    }
     // The first native result is the main comment, even when it starts as a
     // short clean-review message. Follow-ups targeting that comment publish
     // only inline findings and must not become another main comment.
@@ -397,30 +509,56 @@ async function previousFindings(
       for (const finding of review.result.findings)
         publishedKeys.add(findingKey(finding));
     const comments = await api.reviewComments(number, remote.id);
+    // A GitLab draft carries another marker after its finding marker. Only an
+    // exact frozen root on the reviewed head can identify a submitted draft,
+    // especially when GitLab has not confirmed the verdict.
+    const evidence = new Map<(typeof comments)[number], string>();
     for (const comment of comments) {
       if (comment.user?.id !== bot) continue;
-      // An unconfirmed verdict proves nothing about the rest of the report.
-      // Count only its bot-owned inline root with the exact frozen anchor and draft marker.
-      if (
-        !confirmed &&
-        (comment.commit_id !== review.headSha ||
-          comments.find((item) => item.threadId === comment.threadId)?.id !==
-            comment.id ||
-          !publication?.reviewPayload?.comments.some(
-            (saved, index) =>
-              saved.path === comment.path &&
-              saved.lineStart === comment.lineStart &&
-              saved.lineEnd === comment.lineEnd &&
-              comment.body ===
-                `${saved.body}\n\n<!-- razbor-gitlab-draft:${review.publicId}:${index}:${review.headSha} -->`,
-          ))
-      )
-        continue;
-      const finding = review.result.findings.find((f) =>
-        comment.body.includes(
-          `<!-- razbor:${review.publicId}:${findingKey(f)} -->`,
-        ),
+      const draft =
+        api.type === "gitlab" &&
+        comment.commit_id === review.headSha &&
+        comments.find((item) => item.threadId === comment.threadId)?.id ===
+          comment.id &&
+        publication?.reviewPayload?.comments.find(
+          (saved, index) =>
+            saved.path === comment.path &&
+            saved.lineStart === comment.lineStart &&
+            saved.lineEnd === comment.lineEnd &&
+            comment.body ===
+              `${saved.body}\n\n<!-- razbor-gitlab-draft:${review.publicId}:${index}:${review.headSha} -->`,
+        );
+      if (draft) evidence.set(comment, draft.body);
+      else if (confirmed) evidence.set(comment, comment.body);
+    }
+    const identified = new Map<
+      (typeof comments)[number],
+      PreviousFinding["finding"]
+    >();
+    for (const finding of review.result.findings) {
+      const key = findingKey(finding);
+      const identity = `${review.publicId}:${key}`;
+      const matches = [...evidence].filter(
+        ([comment, body]) =>
+          comment.path === finding.path &&
+          body.endsWith(`\n<!-- razbor:${identity} -->`),
       );
+      if (matches.length === 1) {
+        const [[comment]] = matches;
+        if (comment.resolved === false) rememberOpenOwner(key, review.publicId);
+        identified.set(comment, finding);
+        mergeAudit?.missing.delete(identity);
+      }
+    }
+    for (const [comment, body] of evidence) {
+      const finding =
+        mergeAudit || !confirmed
+          ? identified.get(comment)
+          : review.result.findings.find((f) =>
+              body.includes(
+                `<!-- razbor:${review.publicId}:${findingKey(f)} -->`,
+              ),
+            );
       if (finding) {
         if (!confirmed) publishedKeys.add(findingKey(finding));
         if (comment.resolved) continue;
@@ -448,6 +586,8 @@ async function previousFindings(
       }
     }
   }
+  for (const old of recapFindings.values())
+    rememberOpenOwner(findingKey(old.finding), old.reviewId);
   // Do not silently omit old findings and then congratulate an incomplete review.
   return {
     findings: previousFindingsSchema.parse([
@@ -455,9 +595,73 @@ async function previousFindings(
       ...recapFindings.values(),
     ]),
     targets,
-    publishedKeys,
+    openOwners,
     recapReviewId,
   };
+}
+
+/**
+ * Require proof for each historical finding in addition to Phase 2's live outstanding
+ * threads and recaps. A missing remote finding or bot identity is inconclusive; only
+ * a later, identity-bound resolved assessment can discharge that missing evidence.
+ */
+export async function triageOutstanding(
+  database: Database,
+  repoId: string,
+  number: number,
+  botId: string,
+  api: Forge,
+  review: Pick<typeof reviews.$inferSelect, "publicId" | "result" | "source">,
+) {
+  const audit: MergeFindingAudit = {
+    missing: new Set(
+      review.source.previousFindings?.map(
+        (old) => `${old.reviewId}:${findingKey(old.finding)}`,
+      ),
+    ),
+    assessed: new Map(),
+  };
+  const { findings } = await previousFindings(
+    database,
+    repoId,
+    number,
+    botId,
+    api,
+    review.publicId,
+    audit,
+  );
+  recordMergeFindingChecks(audit, review);
+  const unresolved = new Set(
+    [...audit.missing].filter((key) => audit.assessed.get(key) !== "resolved"),
+  );
+  const currentChecks = new Map(
+    review.result?.findingChecks?.map((check) => [check.id, check.status]),
+  );
+  for (const finding of findings) {
+    const key = findingKey(finding.finding);
+    // A native thread in this live list is open, including when a maintainer
+    // reopened it after the model's assessment. Recap-only findings lack that signal.
+    if (
+      finding.threadId ||
+      currentChecks.get(finding.id) !== "resolved" ||
+      !review.source.previousFindings?.some(
+        (old) =>
+          old.id === finding.id &&
+          old.reviewId === finding.reviewId &&
+          findingKey(old.finding) === key,
+      )
+    )
+      unresolved.add(`${finding.reviewId}:${key}`);
+  }
+  // Historical or incomplete results may predate validation at completion.
+  // Unbound or missing assessments cannot be cleared by a provider read.
+  try {
+    if (review.result)
+      validateFindingChecks(review.result, review.source.previousFindings);
+  } catch {
+    return Math.max(unresolved.size, 1);
+  }
+  return unresolved.size;
 }
 
 /**
@@ -2460,7 +2664,7 @@ export async function processInteraction(database: Database, reviewId: string) {
         );
         const {
           findings: currentPrevious,
-          publishedKeys,
+          openOwners,
           recapReviewId,
         } = await previousFindings(
           database,
@@ -2470,29 +2674,19 @@ export async function processInteraction(database: Database, reviewId: string) {
           api,
           review.publicId,
         );
-        // A prior run may have published after this one was queued. Suppress
-        // already-published findings using both the snapshot and fresh history.
-        const previousKeys = new Set(
-          [...previous, ...currentPrevious].map((p) => findingKey(p.finding)),
-        );
-        // A previously published finding without an assessment entry remains
-        // outstanding if this run reports it again, without reposting it.
-        const repeatedFindings = new Map(
-          review
-            .result!.findings.filter(
-              (f) =>
-                publishedKeys.has(findingKey(f)) &&
-                !previousKeys.has(findingKey(f)),
-            )
-            .map((f) => [findingKey(f), f]),
-        );
+        // A resolved original cannot represent a recurrence. Publish that
+        // finding under this review's own revision and identity.
+        const openFindingOwners: Record<string, string> = {};
+        for (const finding of review.result!.findings) {
+          const key = findingKey(finding);
+          const owner = openOwners.get(key);
+          if (owner) openFindingOwners[key] = owner;
+        }
         const prepared = preparePublication(
           {
             ...review.result!,
             findings: review.result!.findings.filter(
-              (f) =>
-                !previousKeys.has(findingKey(f)) &&
-                !publishedKeys.has(findingKey(f)),
+              (f) => !openFindingOwners[findingKey(f)],
             ),
           },
           await api.diff(trigger.change.number),
@@ -2523,15 +2717,6 @@ export async function processInteraction(database: Database, reviewId: string) {
                 },
               ];
         });
-        outstanding.push(
-          ...[...repeatedFindings.values()].map((f) => ({
-            title: f.title,
-            severity: f.severity,
-            finding: f,
-            originalHead: review.headSha,
-            status: "open" as const,
-          })),
-        );
         const needsChanges = !!(prepared.findings.length || outstanding.length);
         // A replay may follow intervening reviews and human replies. Publish a
         // new revision-bound summary without editing their recaps or resolving threads.
@@ -2570,6 +2755,8 @@ export async function processInteraction(database: Database, reviewId: string) {
               ? "recap"
               : "review",
           limitations: prepared.limitations,
+          outstandingFindings: outstanding.length,
+          openFindingOwners,
         };
       }
       const latest = await api.change(trigger.change.number);

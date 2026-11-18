@@ -4,6 +4,11 @@ import { test } from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { mergePolicySchema, type MergeDecisionStatus } from "@razbor/contracts";
+import type { PullRequestView } from "@razbor/database";
+import { TriageQueue } from "@razbor/web/triage-queue";
+import { RepositoryMergePolicy } from "@razbor/web/repository-merge-policy";
+import { triageQueue, initialQueueFilters } from "@razbor/web/merge-triage";
 import { IndexPanel, type IndexData } from "@razbor/web/index-panel";
 import { ReviewMarkdown } from "@razbor/web/review-markdown";
 import { ReviewResult } from "@razbor/web/review-result";
@@ -253,4 +258,151 @@ test("attempt log uses the latest cumulative usage snapshot even without a turn 
   ])
     assert.ok(html.includes(text), text);
   assert.match(html, /estimated cost · incomplete usage/);
+});
+
+/** Build saved PR display data with deliberately inverted dates to distinguish priority order from recency. */
+function triagePr(
+  number: number,
+  status: MergeDecisionStatus,
+  confidence?: number,
+): PullRequestView {
+  const stamp = new Date(Date.UTC(2026, 0, number)).toISOString();
+  return {
+    id: `pr_${number}`,
+    repositoryId: number % 2 ? "repo_first" : "repo_second",
+    repositoryName: number % 2 ? "org/first" : "org/second",
+    number,
+    title: `Change title ${number}`,
+    url: `https://example.com/pr/${number}`,
+    state: "open",
+    headSha: "a".repeat(40),
+    baseSha: "b".repeat(40),
+    createdAt: stamp,
+    updatedAt: stamp,
+    syncedAt: stamp,
+    reviewCount: 1,
+    continuousReviewActive: false,
+    merge: {
+      decision: { status, reviewers: [], reasons: [] },
+      ...(confidence === undefined ? {} : { confidence, riskLevel: "medium" }),
+    },
+  };
+}
+
+test("both queue surfaces put human escalation before intervention, verification, running reviews and eligibility", () => {
+  const rows = [
+    triagePr(5, "auto_merge_eligible", 99),
+    triagePr(4, "review_in_progress"),
+    triagePr(3, "awaiting_checks"),
+    triagePr(2, "blocked", 88),
+    triagePr(1, "human_review_required", 60),
+  ];
+  for (const global of [true, false]) {
+    const html = renderToStaticMarkup(
+      createElement(TriageQueue, { pullRequests: rows, global }),
+    );
+    const order = rows.map((pr) => html.indexOf(pr.title));
+    assert.ok(
+      order.every(
+        (position, index) =>
+          position !== -1 && (index === 0 || position < order[index - 1]),
+      ),
+    );
+    assert.match(html, /Needs human review/);
+  }
+  const unresolved = triagePr(6, "blocked");
+  unresolved.merge!.action = "scheduled";
+  unresolved.merge!.decision.reasons = [
+    {
+      code: "unresolved_provider_merge",
+      message: "Check the outstanding request in the provider.",
+    },
+  ];
+  for (const global of [true, false]) {
+    const html = renderToStaticMarkup(
+      createElement(TriageQueue, {
+        pullRequests: [rows[2], unresolved],
+        global,
+      }),
+    );
+    assert.match(html, /Merge reconciliation required/);
+    assert.ok(html.indexOf(unresolved.title) < html.indexOf(rows[2].title));
+    assert.doesNotMatch(
+      html,
+      /Confidence \d+\/100|Earlier decision<\/span>|Merge scheduled<\/span>/,
+    );
+  }
+  const pending = triagePr(6, "stale");
+  const filtered = triageQueue([...rows, pending], {
+    ...initialQueueFilters,
+    repository: "repo_first",
+    confidence: "95",
+    risk: "medium",
+  });
+  assert.deepEqual(
+    filtered.map((pr) => pr.number),
+    [1],
+  );
+  assert.deepEqual(
+    triageQueue(rows, { ...initialQueueFilters, order: "updated" }).map(
+      (pr) => pr.number,
+    ),
+    [5, 4, 3, 2, 1],
+  );
+  assert.deepEqual(
+    triageQueue(rows, {
+      ...initialQueueFilters,
+      decision: "auto_merge_eligible",
+    }).map((pr) => pr.number),
+    [5],
+  );
+});
+
+test("file-managed Merge Policy shows its version and guidance with no editable controls", () => {
+  const html = renderToStaticMarkup(
+    createElement(RepositoryMergePolicy, {
+      repositoryId: "repo_fixture",
+      editable: false,
+      initial: {
+        version: 4,
+        policy: mergePolicySchema.parse({
+          policyMarkdown: "## Review migrations",
+          humanReviewers: [
+            { username: "alice", responsibilities: "Authentication" },
+          ],
+        }),
+      },
+    }),
+  );
+  assert.match(
+    html,
+    /Only pull requests targeting the default branch can be auto-merged/,
+  );
+  assert.doesNotMatch(html, /Restrict the destination to the default branch/);
+  assert.match(html, /Version 4/);
+  assert.match(html, /Managed in the repository registry file/);
+  assert.match(html, /Review migrations/);
+  assert.match(html, /Authentication/);
+  assert.doesNotMatch(html, /Save merge policy|Remove reviewer/);
+  assert.match(html, /<textarea[^>]*disabled/);
+});
+
+test("managed settings explain the fixed destination while allowing edits to supported merge controls", () => {
+  const html = renderToStaticMarkup(
+    createElement(RepositoryMergePolicy, {
+      repositoryId: "repo_fixture",
+      editable: true,
+      initial: {
+        version: 1,
+        policy: mergePolicySchema.parse({ defaultBranchOnly: false }),
+      },
+    }),
+  );
+  assert.match(html, /Enable merge automation/);
+  assert.match(html, /Save merge policy/);
+  assert.match(
+    html,
+    /Only pull requests targeting the default branch can be auto-merged/,
+  );
+  assert.doesNotMatch(html, /Restrict the destination|defaultBranchOnly/);
 });

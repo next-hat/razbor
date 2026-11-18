@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -26,7 +27,45 @@ export const readFileArguments = z
   })
   .strict();
 
+type LineRange = { start: number; end: number };
+
+type SourceReads = { supplied: LineRange[]; clipped: LineRange[] };
+
+/** Check whether the returned pages cover a requested interval, including out-of-order reads. */
+function coversLines(pages: LineRange[], range: LineRange) {
+  let next = range.start;
+  for (const page of pages) {
+    if (page.start > next) break;
+    next = Math.max(next, page.end + 1);
+    if (next > range.end) return true;
+  }
+  return false;
+}
+
 export class RepositoryTools {
+  private readonly sourceReads = new Map<string, SourceReads>();
+  private readonly completeExecSources = new Set<string>();
+
+  /** Match a complete command result against immutable file contents, independent of path aliases. */
+  observeExec(stdout: string) {
+    this.completeExecSources.add(
+      createHash("sha256").update(stdout).digest("hex"),
+    );
+  }
+
+  /** Count immutable files with a requested interval still missing from the delivered evidence. */
+  unfinishedSourceReads() {
+    let count = 0;
+    for (const [digest, reads] of this.sourceReads) {
+      if (!reads.clipped.length || this.completeExecSources.has(digest))
+        continue;
+      reads.supplied.sort((a, b) => a.start - b.start);
+      if (reads.clipped.some((range) => !coversLines(reads.supplied, range)))
+        count++;
+    }
+    return count;
+  }
+
   private revisions?: { head: string; baseline: string };
 
   /**
@@ -178,7 +217,20 @@ export class RepositoryTools {
         state: "unsupported",
         reason: "binary source",
       });
-    return sourcePage(content, metadata, endLine);
+    const page = sourcePage(content, metadata, endLine);
+    if (page.state === "available") {
+      const digest = createHash("sha256").update(content).digest("hex");
+      const reads = this.sourceReads.get(digest) ?? {
+        supplied: [],
+        clipped: [],
+      };
+      reads.supplied.push({ start: startLine, end: page.endLine });
+      const requestedEnd = Math.min(page.totalLines, endLine);
+      if (page.endLine < requestedEnd)
+        reads.clipped.push({ start: page.endLine + 1, end: requestedEnd });
+      this.sourceReads.set(digest, reads);
+    }
+    return JSON.stringify(page);
   }
 
   /**
@@ -216,7 +268,7 @@ export function toolError(e: unknown) {
 }
 
 /**
- * Serializes a numbered source page within line and byte limits, including a
+ * Builds a numbered source page within serialized line and byte limits, including a
  * continuation line or an explicit oversized-line state.
  */
 function sourcePage(
@@ -236,7 +288,7 @@ function sourcePage(
    */
   const result = () => ({
     ...metadata,
-    state: "available",
+    state: "available" as const,
     endLine: next - 1,
     totalLines: lines.length,
     source: source.join("\n"),
@@ -254,10 +306,10 @@ function sourcePage(
     }
   }
   if (!source.length && next <= last)
-    return JSON.stringify({
+    return {
       ...metadata,
-      state: "unavailable",
+      state: "unavailable" as const,
       reason: "source line exceeds response limit",
-    });
-  return JSON.stringify(result());
+    };
+  return result();
 }

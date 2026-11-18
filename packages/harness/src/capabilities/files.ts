@@ -60,6 +60,9 @@ export async function confinedFile(root: string, resource: string) {
   return resolved;
 }
 
+export const capabilityTruncationMarker =
+  "\n[TRUNCATED: narrow the query or use pagination]";
+
 /**
  * Caps UTF-8 output by bytes and reserves space for an explicit truncation marker
  * directing callers to narrower queries or pagination.
@@ -67,10 +70,12 @@ export async function confinedFile(root: string, resource: string) {
 export function boundedOutput(text: string, maxBytes: number) {
   const bytes = Buffer.from(text);
   if (bytes.length <= maxBytes) return text;
-  const marker = "\n[TRUNCATED: narrow the query or use pagination]";
   return (
     new TextDecoder().decode(
-      bytes.subarray(0, maxBytes - Buffer.byteLength(marker) - 3),
-    ) + marker
+      bytes.subarray(
+        0,
+        maxBytes - Buffer.byteLength(capabilityTruncationMarker) - 3,
+      ),
+    ) + capabilityTruncationMarker
   );
 }

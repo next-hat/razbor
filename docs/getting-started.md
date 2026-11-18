@@ -193,8 +193,8 @@ the result does not appear.
 
 **Overview** shows open pull requests waiting for human review. **Pull requests**
 lets you search open and closed requests, inspect findings, and open earlier review
-runs. Opening either page or choosing **Refresh** checks the forge for current
-requests. An automated review does not remove a request from the human queue.
+runs. Both pages open the saved snapshot. Choose **Refresh** to check the
+forge for current requests, including changes missed by webhooks. An automated review does not remove a request from the human queue.
 
 ## Stop and restart
 

@@ -81,6 +81,12 @@ configured origins and rejects mismatched repositories, PRs, and origins.
 The GitLab provider fixture checks status-comment cleanup on a 1,000-note MR.
 These checks do not need model credentials.
 
+## Merge policy and triage
+
+`pnpm test` includes the pure policy engine, assessment validation, thresholds, reviewer selection and safe comment rendering. `pnpm run test:review` exercises both review modes with deterministic model responses. `pnpm run test:presentation` checks console priority, filtering, aging decisions and file-managed settings. The scoped PostgreSQL PR projection is covered by `pnpm run test:persistence`, including initial comparison refs, revision changes and outstanding native merges. The harness fixtures exercise pinned lazy-diff inspection through `exec`, requested diff continuations, and source ranges clipped by a tool page. Completing the missing pages or supplying the matching pinned contents restores the evidence. Unrelated commands, failed verification, truncated output, and binary files cannot satisfy a pending read. The contract suite checks the conversation size limit, malformed assessment decisions and exclusion of private policy evidence from member views and forge comments. The dispatcher fixture verifies that unavailable accounts do not consume the three available reviewer mentions.
+
+`pnpm run test:merge-providers` exercises provider request and response fixtures, including guarded refusals, an acknowledged GitLab schedule with an unnamed owner, GitHub cancellation readback, interrupted check release, delayed check creation and retirement of the exact pending check before a replacement review on the same head, native conversation-resolution enforcement and confirmed rate-limit retries. The triage fixtures also cover retirement of a pending check left by a definitive native refusal. These checks do not exercise live installations. `pnpm run test:triage` requires Docker, the local `postgres:17-alpine` image and Node 24. It upgrades a populated Phase 2 schema through the production migrator, starting at `0031_deferred_open_deliveries`, and checks that a second migration run leaves the journal unchanged. The published PR #6 preview upgrades from its original `0031_merge_policy` journal hash while preserving policy data and gaining the deferred-delivery columns. Unknown entries at the colliding timestamp stop the migration before schema changes. The suite verifies default isolation and frozen Markdown, and exercises actual PostgreSQL locks, confirmed/uncertain writes, durable native dispatch stages, interrupted cancellation, restart recovery and revision races. Its two-client barriers exercise fair dispatch under a busy repository lock. Delayed reservations and deleted comments verify that recovery delivers one escalation and preserves mention history. A credential-only registry import exercises the recovery path for credential rotation. The dispatcher test substitutes a guarded forge capability to test generic scheduling independently of each provider's support. All provider I/O in these tests is controlled locally. The fixture removes its databases, container, volumes and network when the test finishes.
+
 ## Autonomous review harness
 
 Run the focused agent-loop, budget, context, relay and evaluation regressions:
@@ -160,10 +166,10 @@ pnpm run test:comments
 pnpm run test:broker
 ```
 
-| Command                     | Coverage                                                                                                                          |
-| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion                   |
-| `pnpm run test:comments`    | Signed events, PR opt-in and reset, revision coalescing, same-revision re-review, status-comment recovery and Forgejo publication |
+| Command                     | Coverage                                                                                                                                                                                                       |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion                                                                                                |
+| `pnpm run test:comments`    | Signed events, PR opt-in and reset, revision coalescing, same-revision re-review, status-comment recovery, Forgejo publication, exact finding identities, open and resolved threads, and duplicate suppression |
 
 The broker suite uses pg-boss and enrolled runner sessions, with a controlled
 loopback source service. It checks indexed and source-only assignments across a

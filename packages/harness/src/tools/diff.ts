@@ -174,6 +174,14 @@ function hunkPosition(patch: string, offset: number) {
   };
 }
 
+/** Identify a file's full change even when Git uses a different number of context lines. */
+function patchIdentity(patch: string) {
+  const changes = patch
+    .split("\n")
+    .filter((line) => !line.startsWith(" ") && !line.startsWith("@@"));
+  return createHash("sha256").update(changes.join("\n")).digest("hex");
+}
+
 export class PreparedDiff {
   private readonly nonce = randomUUID();
   private readonly cursors = new Map<
@@ -181,6 +189,8 @@ export class PreparedDiff {
     { selection: number[]; position: Position }
   >();
   private readonly supplied = new Map<number, number>();
+  private readonly requested = new Set<number>();
+  private readonly completeExecPatches = new Set<string>();
   readCalls = 0;
   returnedBytes = 0;
   readonly manifest: string;
@@ -258,6 +268,35 @@ export class PreparedDiff {
       outputBytes,
       signal,
     );
+  }
+
+  /** Keep exact file changes received through successful, untruncated exec output. */
+  observeExec(argv: unknown, stdout: string) {
+    if (
+      !Array.isArray(argv) ||
+      argv[0] !== "git" ||
+      argv[1] !== "diff" ||
+      argv[2] !== this.baselineSha ||
+      argv[3] !== this.headSha ||
+      (argv.length > 4 && argv[4] !== "--") ||
+      !stdout.startsWith("diff --git ")
+    )
+      return;
+    for (const patch of stdout.split(/(?=^diff --git )/m))
+      this.completeExecPatches.add(patchIdentity(patch));
+  }
+
+  /** Count requested text patches whose complete contents have yet to reach the reviewer. */
+  unfinishedReads() {
+    return [...this.requested].filter((index) => {
+      const patch = this.patches[index];
+      return (
+        (this.files[index].content === "text" ||
+          this.files[index].content === "metadata") &&
+        (this.supplied.get(index) ?? 0) < patch.length &&
+        !this.completeExecPatches.has(patchIdentity(patch))
+      );
+    }).length;
   }
 
   /** Validates a new-side finding against one immutable changed hunk ending on an added line. */
@@ -562,6 +601,7 @@ export class PreparedDiff {
     }
     const result = JSON.stringify(envelope(cursor));
     this.signal?.throwIfAborted();
+    for (const index of selection) this.requested.add(index);
     for (const [index, end] of updates) this.markSupplied(index, end);
     this.recordRead(Buffer.byteLength(result));
     return result;

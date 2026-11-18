@@ -7,7 +7,7 @@ import { ArrowRight, GitPullRequest, Search } from "lucide-react";
 import type { PullRequestView } from "@razbor/database";
 
 import { PullRequestRefresh } from "@web/components/pull-request-refresh.js";
-import { PullRequestTable } from "@web/components/pull-request-table.js";
+import { TriageQueue } from "@web/components/triage-queue.js";
 import { Alert, AlertDescription } from "@web/components/ui/alert.js";
 import { Button, buttonVariants } from "@web/components/ui/button.js";
 import {
@@ -33,7 +33,7 @@ export function RepositoryPullRequests({
   summaryOnly?: boolean;
 }>) {
   const snapshot = usePullRequests<PullRequestView[]>(
-    "/api/pull-requests",
+    `/api/pull-requests?repositoryId=${encodeURIComponent(id)}`,
     initialData,
   );
   const [state, setState] = useState<"open" | "closed" | "all">("open");
@@ -68,7 +68,7 @@ export function RepositoryPullRequests({
           </h2>
           <p className="mt-1 text-sm text-muted-foreground">
             {summaryOnly
-              ? "Changes waiting for human review."
+              ? "Escalations and blocked changes appear first."
               : "Saved changes from this repository, including their latest automated review."}
           </p>
         </div>
@@ -142,10 +142,7 @@ export function RepositoryPullRequests({
       {!pullRequests ? (
         !snapshot.error && <Skeleton className="h-40 w-full" />
       ) : visible?.length ? (
-        <PullRequestTable
-          pullRequests={summaryOnly ? visible.slice(0, 5) : visible}
-          showState={!summaryOnly}
-        />
+        <TriageQueue pullRequests={visible} preview={summaryOnly} />
       ) : (
         <Empty className="rounded-lg border bg-card">
           <EmptyHeader>
@@ -166,7 +163,7 @@ export function RepositoryPullRequests({
                 ? "Try another title or pull request number."
                 : snapshot.warning
                   ? "This saved snapshot may be out of date. Refresh to check the current forge state."
-                  : "Pull requests appear here after a successful refresh from your forge."}
+                  : "Choose Refresh to load pull requests from this repository’s forge."}
             </EmptyDescription>
           </EmptyHeader>
         </Empty>

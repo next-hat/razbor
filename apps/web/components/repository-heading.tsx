@@ -58,6 +58,11 @@ export function RepositoryHeading({
           description:
             "Choose repository instructions and installed skills for reviews.",
         },
+        "merge-policy": {
+          title: "Merge Policy",
+          description:
+            "Configure merge eligibility and the reviewers Razbor can contact.",
+        },
         mcp: {
           title: "MCP access",
           description: "Choose the MCP servers available to this repository.",

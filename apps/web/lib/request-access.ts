@@ -1,4 +1,9 @@
-import { publicIdSchema, type ReviewJobView } from "@razbor/contracts";
+import {
+  publicMergeAssessment,
+  publicMergeDecision,
+  publicIdSchema,
+  type ReviewJobView,
+} from "@razbor/contracts";
 import {
   getRepository,
   getReview,
@@ -102,17 +107,32 @@ export async function apiAccessResponse(
   }
 }
 
-/** Removes reviewer connection details and administrative setup errors from a member's view. */
+/** Removes privileged policy guidance, reviewer connections and setup errors from a member's view. */
 export function sanitizeRepositoryView(
   repository: Awaited<ReturnType<typeof listRepositories>>[number],
 ) {
-  return { ...repository, agent: null, agentId: null, setupError: null };
+  const visible = {
+    ...repository,
+    agent: null,
+    agentId: null,
+    setupError: null,
+  };
+  if ("mergePolicy" in visible) Reflect.deleteProperty(visible, "mergePolicy");
+  return visible;
 }
 
-/** Omits captured reviewer connection and guidance configuration from a member's review view. */
+/** Keep private policy evidence, reviewer connections and guidance out of member responses. */
 export function sanitizeReviewView<T extends ReviewJobView>(review: T) {
   const visible = { ...review };
   delete visible.agent;
   delete visible.guidance;
+  if ("policySnapshot" in visible) delete visible.policySnapshot;
+  if (visible.mergeDecision)
+    visible.mergeDecision = publicMergeDecision(visible.mergeDecision);
+  if (visible.review?.mergeAssessment)
+    visible.review = {
+      ...visible.review,
+      mergeAssessment: publicMergeAssessment(visible.review.mergeAssessment),
+    };
   return visible;
 }

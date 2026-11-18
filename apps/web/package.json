@@ -40,6 +40,9 @@
     "./review-markdown": "./components/review-markdown.tsx",
     "./review-result": "./components/review-result.tsx",
     "./highlight": "./lib/highlight.ts",
-    "./review-log": "./components/review-log.tsx"
+    "./review-log": "./components/review-log.tsx",
+    "./triage-queue": "./components/triage-queue.tsx",
+    "./merge-triage": "./lib/merge-triage.ts",
+    "./repository-merge-policy": "./components/repository-merge-policy.tsx"
   }
 }
