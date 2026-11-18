@@ -5,15 +5,25 @@ import { test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
 import {
+  getReview,
+  reviewLogs,
   consumeRunnerEnrollment,
   createRunner,
   listRepositories,
   submitReview,
 } from "@razbor/database";
+import {
+  codebaseMemoryUnavailableCode,
+  codebaseMemoryUnavailableMessage,
+} from "@razbor/contracts";
 import { applyRegistry, registrySchema } from "@razbor/database/registry";
 import { createQueue } from "@razbor/queue";
 import { runnerConfigSchema } from "@razbor/runner/config";
 import { RunnerBroker } from "@razbor/web/runner-broker";
+import {
+  deployedCodebaseMemory,
+  withRegistrationIndexDefault,
+} from "@razbor/web/indexer";
 
 import { databaseFixture } from "@tests/packages/database/fixture.js";
 
@@ -56,10 +66,29 @@ test(
     const headSha = "b".repeat(40);
     const baseSha = "a".repeat(40);
     const workspaceId = "idx_0123456789ABCDEF";
+    let advertised: boolean | "legacy" | "offline" = false;
+    let rejectIndex = false;
     // Exercise the production broker against the management protocol, substituting
     // only the source service. Git pack contents are covered by the source fixture.
     const server = createServer(async (request, response) => {
       const auth = request.headers.authorization;
+      if (
+        request.method === "GET" &&
+        request.url === "/health" &&
+        auth === `Bearer ${management}`
+      ) {
+        if (advertised === "offline") response.writeHead(503).end();
+        else
+          response.end(
+            JSON.stringify({
+              status: "ready",
+              ...(advertised === "legacy"
+                ? {}
+                : { capabilities: { codebaseMemory: advertised } }),
+            }),
+          );
+        return;
+      }
       if (
         request.url === "/reviews" &&
         request.method === "POST" &&
@@ -68,6 +97,14 @@ test(
         const chunks: Buffer[] = [];
         for await (const chunk of request) chunks.push(chunk);
         const binding = JSON.parse(Buffer.concat(chunks).toString());
+        if (rejectIndex) {
+          response
+            .writeHead(503, {
+              "x-razbor-error-code": codebaseMemoryUnavailableCode,
+            })
+            .end();
+          return;
+        }
         const token = randomBytes(32).toString("hex");
         grants.set(binding.attemptId, token);
         response.end(
@@ -138,6 +175,29 @@ test(
     assert.ok(address && typeof address === "object");
     process.env.RAZBOR_INDEX_ENDPOINT = `http://127.0.0.1:${address.port}`;
     process.env.RAZBOR_INDEX_MANAGEMENT_TOKEN = management;
+    assert.equal(await deployedCodebaseMemory(), false);
+    assert.deepEqual(await withRegistrationIndexDefault({}), {
+      codebaseMemoryEnabled: false,
+    });
+    assert.deepEqual(
+      await withRegistrationIndexDefault({ codebaseMemoryEnabled: true }),
+      { codebaseMemoryEnabled: true },
+    );
+    advertised = true;
+    assert.deepEqual(await withRegistrationIndexDefault({}), {
+      codebaseMemoryEnabled: true,
+    });
+    assert.deepEqual(
+      await withRegistrationIndexDefault({ codebaseMemoryEnabled: false }),
+      { codebaseMemoryEnabled: false },
+    );
+    for (const state of ["legacy", "offline"] as const) {
+      advertised = state;
+      assert.equal(await deployedCodebaseMemory(), null);
+      assert.deepEqual(await withRegistrationIndexDefault({}), {
+        codebaseMemoryEnabled: true,
+      });
+    }
     await applyRegistry(db, config);
     const repositories = await listRepositories(db);
     const indexedRepository = repositories.find(
@@ -251,6 +311,25 @@ test(
           { status: 401 },
         );
       }
+      rejectIndex = true;
+      const review = await submitReview(db, {
+        repositoryId: plain.job.repositoryId,
+        baseSha,
+        headSha,
+      });
+      const end = Date.now() + 15000;
+      while (
+        (await getReview(db, review.id))?.status !== "failed" &&
+        Date.now() < end
+      )
+        await delay(100);
+      assert.equal((await getReview(db, review.id))?.status, "failed");
+      const log = await reviewLogs(db, review.id, 0);
+      assert.ok(
+        log.logs.some(
+          (line) => line.event.message === codebaseMemoryUnavailableMessage,
+        ),
+      );
     } finally {
       await broker.close();
     }

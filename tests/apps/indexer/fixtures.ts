@@ -1,10 +1,24 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdir } from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { gitEnvironment } from "@razbor/harness/git";
 
 const exec = promisify(execFile);
+
+/** Poll an observable service condition until it succeeds or the fixture deadline expires. */
+export async function eventually(
+  check: () => Promise<boolean>,
+  timeout = 30000,
+) {
+  const end = Date.now() + timeout;
+  while (!(await check())) {
+    if (Date.now() >= end)
+      throw new Error("fixture condition deadline exceeded");
+    await delay(100);
+  }
+}
 
 // Only temporary test repositories use these plumbing operations. No working-tree
 // index is staged and the razbor checkout is never committed or reconfigured.

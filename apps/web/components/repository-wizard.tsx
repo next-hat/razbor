@@ -118,7 +118,11 @@ export function RepositoryWizard({
   const [callbackBase, setCallbackBase] = useState("");
   const [senders, setSenders] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
-  const [codebaseMemoryEnabled, setCodebaseMemoryEnabled] = useState(true);
+  const [memoryChoice, setMemoryChoice] = useState<boolean>();
+  const [codebaseMemoryAvailable, setCodebaseMemoryAvailable] = useState<
+    boolean | null
+  >(null);
+  const codebaseMemoryEnabled = memoryChoice ?? codebaseMemoryAvailable ?? true;
   const [verified, setVerified] = useState<VerifiedRepository>();
   const [created, setCreated] = useState<{
     id: string;
@@ -149,8 +153,13 @@ export function RepositoryWizard({
     })
       .then(async (response) => {
         if (!response.ok) return;
-        const defaults = (await response.json()) as { callbackBase?: string };
-        if (!controller.signal.aborted && defaults.callbackBase) {
+        const defaults = (await response.json()) as {
+          callbackBase?: string;
+          codebaseMemoryAvailable?: boolean | null;
+        };
+        if (controller.signal.aborted) return;
+        setCodebaseMemoryAvailable(defaults.codebaseMemoryAvailable ?? null);
+        if (defaults.callbackBase) {
           setCallbackBase((current) => current || defaults.callbackBase || "");
         }
       })
@@ -250,7 +259,9 @@ export function RepositoryWizard({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...connectionInput(),
-            codebaseMemoryEnabled,
+            ...(memoryChoice !== undefined || codebaseMemoryAvailable !== null
+              ? { codebaseMemoryEnabled }
+              : {}),
             ...(agentId ? { agentId } : {}),
             callbackBase: selectedCallback.trim(),
             ...(forgeType === "github" && !usesGithubApp
@@ -612,7 +623,7 @@ export function RepositoryWizard({
                       type="checkbox"
                       checked={codebaseMemoryEnabled}
                       onChange={(event) =>
-                        setCodebaseMemoryEnabled(event.target.checked)
+                        setMemoryChoice(event.target.checked)
                       }
                       aria-describedby="repository-codebase-memory-description"
                       className="size-4 accent-primary"
@@ -622,8 +633,9 @@ export function RepositoryWizard({
                     </FieldLabel>
                   </Field>
                   <FieldDescription id="repository-codebase-memory-description">
-                    Index this repository for graph navigation and semantic
-                    search. Reviews always receive the full checkout.
+                    {codebaseMemoryAvailable === false
+                      ? "The source service has no usable Codebase Memory bundle. Leave this off for source-only reviews, or configure the service with the supported bundle before running indexed reviews."
+                      : "Index this repository for graph navigation and semantic search. Reviews always receive the full checkout."}
                   </FieldDescription>
                 </Field>
                 <Field>
@@ -729,8 +741,10 @@ export function RepositoryWizard({
                       : forgeType === "github"
                         ? "Connecting saves the bot token. Next, copy the webhook URL and generated secret into GitHub."
                         : "Connecting saves the bot token and configures the webhook. You can then copy the generated webhook secret."}{" "}
-                    {codebaseMemoryEnabled &&
-                      "Indexing starts in the background. "}
+                    {codebaseMemoryEnabled && codebaseMemoryAvailable === false
+                      ? "Indexed reviews require a source service configured with the supported Codebase Memory bundle. "
+                      : codebaseMemoryEnabled &&
+                        "Indexing starts in the background. "}
                     {canManageRunners
                       ? "You can set up a runner after connecting."
                       : "A super admin manages runner assignments."}

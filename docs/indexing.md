@@ -5,11 +5,16 @@ The private Git source service runs under the existing `indexer` service name.
 With **Codebase Memory** enabled it also maintains a searchable branch index.
 Turn the setting on or off when connecting a repository or under **Repository
 Settings → General**. A file-managed repository reads `codebaseMemoryEnabled`
-from its registry table when you reapply the registry. The default is true.
+from its registry table when you reapply the registry. For new UI registrations
+the wizard checks the source service's graph capability. Existing registrations
+keep their saved choice. See [file-managed registration](persistence.md#optional-file-managed-registration)
+for the defaults used by the management CLI.
 
 Disabling the setting stops new index work and hides index tools for subsequent
-attempts. Existing indexed attempts retain their leased revision, and stored
-indexes can be reused when indexing is enabled again. The separate
+attempts. An active indexed attempt keeps its access grant for the recorded
+index revision. If a refresh advances the shared index, its graph tools become
+unavailable. The review can still inspect Git at its original base and head.
+Stored indexes can be reused when indexing is enabled again. The separate
 `indexing.persistent` flag still controls advance provisioning versus on-demand
 indexing for enabled file-managed repositories. See [source-only deployment](deployment.md#deploy-without-codebase-memory)
 for the service configuration.
@@ -102,6 +107,15 @@ alone, has no Git index, and matches the configured branch, upstream, and remote
 policy. Working-tree entries, top-level Git metadata locks, or unfinished Git
 operations block this recovery. The indexer's checkout is a remote cache, so keep
 unpublished work elsewhere.
+
+After an unclean shutdown, the service can remove an empty daemon runtime
+directory without the graph bundle. If the log reports **Retained daemon
+state**, the source service keeps the checkout and leaves deletion pending.
+Stop the previous index service and verify in its process namespace that the
+workspace's daemon has exited. Only then remove the exact runtime directory
+named in the diagnostic. The service retries pending deletions. If ownership
+or daemon exit is uncertain, leave the files in place; unrelated source
+reviews can continue.
 
 Index large repositories before requesting reviews. Reviews reuse a ready branch
 index but keep source pinned to the PR commit. If refresh advances the shared

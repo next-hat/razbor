@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
+import { EventEmitter, once } from "node:events";
 import {
   mkdtemp,
   mkdir,
@@ -14,14 +15,18 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { setTimeout as delay } from "node:timers/promises";
+import { setImmediate, setTimeout as delay } from "node:timers/promises";
 
 import {
   Client,
   StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 
-import { agentJobSchema } from "@razbor/contracts";
+import {
+  agentJobSchema,
+  codebaseMemoryUnavailableCode,
+  codebaseMemoryUnavailableMessage,
+} from "@razbor/contracts";
 import {
   applyRegistry,
   registrySchema,
@@ -31,6 +36,8 @@ import {
   ownedWorkspaces,
   ensureDevelopmentWorkspaces,
   issueToken,
+  revokeToken,
+  getRepository,
   requestRepositoryDeletion,
   submitReview,
   beginAttempt,
@@ -38,7 +45,7 @@ import {
 import { resultText } from "@razbor/harness/mcp";
 import { indexerConfigSchema } from "@razbor/indexer/config";
 import { IndexService } from "@razbor/indexer/service";
-import { tokenHash } from "@razbor/indexer/tokens";
+import { Tokens, tokenHash } from "@razbor/indexer/tokens";
 import { runnerConfigSchema } from "@razbor/runner/config";
 import {
   createWorkspace,
@@ -48,21 +55,13 @@ import {
 
 import { databaseFixture } from "@tests/packages/database/fixture.js";
 import {
+  eventually,
   fixtureUpstream,
   fixtureCommit,
   fixtureGit,
 } from "@tests/apps/indexer/fixtures.js";
 
 const executable = process.env.CBM_EXECUTABLE;
-
-/** Poll an asynchronous condition until it succeeds or the cleanup deadline expires. */
-async function eventually(check: () => Promise<boolean>, timeout = 30000) {
-  const end = Date.now() + timeout;
-  while (!(await check())) {
-    if (Date.now() >= end) throw new Error("cleanup deadline exceeded");
-    await delay(100);
-  }
-}
 
 test(
   "pull-only service: refresh, revision confinement, tokens and workspace cleanup with actual MCP",
@@ -182,6 +181,10 @@ test(
           body: body === undefined ? undefined : JSON.stringify(body),
           signal,
         });
+      assert.deepEqual(await (await request("/health", "GET", admin)).json(), {
+        status: "ready",
+        capabilities: { codebaseMemory: true },
+      });
       /** Connect an authenticated MCP client and track it for fixture cleanup. */
       const connect = async (token: string) => {
         const client = new Client({
@@ -257,6 +260,18 @@ test(
         await query(devClient, "search_graph", { name_pattern: "^add$" }),
         /add/,
       );
+      // Keep the client connected while an operator changes the registered branch.
+      // A cached graph cannot serve its previous policy even before the next refresh.
+      registry.repositories.fixture.git.branch = "next-branch";
+      await applyRegistry(database, registry);
+      await assert.rejects(devClient.listTools());
+      assert.equal(
+        (await devClient.callTool({ name: "index_status", arguments: {} }))
+          .isError,
+        true,
+      );
+      registry.repositories.fixture.git.branch = repo.branch;
+      await applyRegistry(database, registry);
       const reviewHead = await fixtureCommit(
         upstream,
         {
@@ -512,11 +527,65 @@ test(
         ).status,
         503,
       );
-      assert.equal(
-        (await request(`/reviews/${pinnedAttempt.attemptId}`, "DELETE", admin))
-          .status,
-        200,
-      );
+      // Hold the first durable retirement update until the repository has been
+      // re-enabled, then fail it. The subsequent retry must close the old
+      // handle before preparing a replacement for these same files.
+      const sqlClient = databaseState.administrator;
+      await sqlClient.query(`
+        create sequence fixture_retirement_calls;
+        create function fixture_interrupt_retirement() returns trigger
+          language plpgsql security definer set search_path = pg_catalog, public as $$
+        begin
+          if nextval('public.fixture_retirement_calls') = 1 then
+            perform pg_advisory_xact_lock(419272, 1);
+            raise exception 'fixture: interrupted retirement write';
+          end if;
+          return new;
+        end;
+        $$;
+        create trigger fixture_retirement before update on index_workspaces
+        for each row when (old.public_id = '${devWorkspace.id}' and new.state = 'unready')
+        execute function fixture_interrupt_retirement();
+        select pg_advisory_lock(419272, 1);
+      `);
+      try {
+        assert.equal(
+          (
+            await request(
+              `/reviews/${pinnedAttempt.attemptId}`,
+              "DELETE",
+              admin,
+            )
+          ).status,
+          200,
+        );
+        await eventually(
+          async () =>
+            (
+              await sqlClient.query(
+                "select is_called from fixture_retirement_calls",
+              )
+            ).rows[0].is_called,
+        );
+        registry.repositories.fixture.codebaseMemoryEnabled = true;
+        await applyRegistry(database, registry);
+      } finally {
+        await sqlClient.query("select pg_advisory_unlock(419272, 1)");
+      }
+      await eventually(async () => {
+        const retry = await request(
+          `/repositories/${devWorkspace.repositoryId}/index`,
+          "POST",
+          admin,
+          { prepare: true },
+        );
+        const binding = await retry.json();
+        return (
+          retry.ok &&
+          binding.workspaceId === devWorkspace.id &&
+          binding.headSha === second
+        );
+      }, 60000);
       assert.equal(
         (await request(`/tokens/${issued.id}`, "DELETE", admin)).status,
         200,
@@ -573,7 +642,7 @@ test(
 test(
   "source-only attempts hand off exact Git objects and expire without indexing infrastructure",
   { timeout: 90000 },
-  async () => {
+  async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "razbor-source-test-"));
     const state = await databaseFixture();
     let service: IndexService | undefined;
@@ -642,6 +711,11 @@ test(
           body: payload === undefined ? undefined : JSON.stringify(payload),
         });
 
+      assert.equal((await request("/health", "GET", "invalid")).status, 401);
+      assert.deepEqual(await (await request("/health", "GET", admin)).json(), {
+        status: "ready",
+        capabilities: { codebaseMemory: false },
+      });
       /** Reserve a real database attempt before its repository setting changes. */
       const reserve = async () => {
         const review = await submitReview(state.database, repo);
@@ -658,6 +732,33 @@ test(
       const other = await reserve();
       registry.repositories.fixture.codebaseMemoryEnabled = true;
       await applyRegistry(state.database, registry);
+      await eventually(
+        async () =>
+          (await getRepository(state.database, repositoryId))?.setupError ===
+          codebaseMemoryUnavailableMessage,
+      );
+      await state.administrator.query(
+        "UPDATE repositories SET setup_error = 'Index setup failed' WHERE public_id=$1 AND setup_state='error'",
+        [repositoryId],
+      );
+      await eventually(
+        async () =>
+          (await getRepository(state.database, repositoryId))?.setupError ===
+          codebaseMemoryUnavailableMessage,
+      );
+      const required = await reserve();
+      const incompatible = await request("/reviews", "POST", admin, {
+        ...required,
+        ttlMs: 30000,
+      });
+      assert.equal(incompatible.status, 503);
+      assert.equal(
+        incompatible.headers.get("x-razbor-error-code"),
+        codebaseMemoryUnavailableCode,
+      );
+      assert.deepEqual(await incompatible.json(), {
+        error: codebaseMemoryUnavailableMessage,
+      });
       assert.equal(
         (
           await request("/reviews", "POST", admin, {
@@ -675,6 +776,82 @@ test(
       assert.equal(response.status, 201, await response.clone().text());
       const lease = await response.json();
       assert.equal(lease.headSha, headSha);
+      await t.test(
+        "queued handoff checks durable token revocation at the start of transfer",
+        async (t) => {
+          const secondGrant = await issueToken(
+            state.database,
+            lease.workspaceId,
+            config.service.owner,
+            { refresh: false },
+          );
+          const gate = new EventEmitter();
+          const firstAtTransfer = once(gate, "transfer");
+          const secondAdmitted = once(gate, "admitted");
+          const releaseFirst = once(gate, "release");
+          const authorize = Tokens.prototype.authorize;
+          const authorizeWorkspace = Tokens.prototype.authorizeWorkspace;
+          let transfers = 0;
+          // Isolate the dispatch check from the independent background cancellation poll.
+          t.mock.method(Tokens.prototype, "poll", async () => {});
+          t.mock.method(
+            Tokens.prototype,
+            "authorize",
+            async function (this: Tokens, token: string) {
+              const grant = await authorize.call(this, token);
+              if (token === secondGrant.token) gate.emit("admitted");
+              return grant;
+            },
+          );
+          t.mock.method(
+            Tokens.prototype,
+            "authorizeWorkspace",
+            async function (
+              this: Tokens,
+              ...args: Parameters<typeof authorizeWorkspace>
+            ) {
+              transfers++;
+              if (args[0] === lease.token) {
+                gate.emit("transfer");
+                await releaseFirst;
+              }
+              return authorizeWorkspace.call(this, ...args);
+            },
+          );
+          const sourceUrl = `/reviews/${first.attemptId}/source`;
+          const firstDownload = request(sourceUrl, "GET", lease.token);
+          await firstAtTransfer;
+          const secondDownload = request(sourceUrl, "GET", secondGrant.token);
+          try {
+            await secondAdmitted;
+            // Let the admitted HTTP handler enqueue its operation behind the first one.
+            await setImmediate();
+            assert.equal(transfers, 1);
+            await revokeToken(
+              state.database,
+              secondGrant.id,
+              config.service.owner,
+            );
+          } finally {
+            gate.emit("release");
+          }
+          const [allowed, denied] = await Promise.all([
+            firstDownload,
+            secondDownload,
+          ]);
+          assert.equal(allowed.status, 200);
+          assert.equal(
+            Buffer.from(await allowed.arrayBuffer())
+              .subarray(0, 4)
+              .toString(),
+            "PACK",
+          );
+          assert.equal(transfers, 2);
+          assert.equal(denied.status, 503);
+          assert.equal(denied.headers.get("x-razbor-object-format"), null);
+          assert.ok((await denied.json()).error);
+        },
+      );
       for (const key of ["project", "indexHeadSha", "indexBranch"])
         assert.ok(!(key in lease));
       assert.equal(
@@ -844,6 +1021,20 @@ test(
         state.database,
       );
       port = await service.listen();
+      assert.deepEqual(await (await request("/health", "GET", admin)).json(), {
+        status: "ready",
+        capabilities: { codebaseMemory: false },
+      });
+      await writeFile(
+        path.join(root, "missing-binary"),
+        "not the approved binary",
+        { mode: 0o755 },
+      );
+      assert.equal(
+        (await (await request("/health", "GET", admin)).json()).capabilities
+          .codebaseMemory,
+        false,
+      );
       for (const id of [staleId, linkedId])
         assert.equal(
           (

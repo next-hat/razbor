@@ -22,7 +22,7 @@
     "test:verification": "node --import=tsx --test tests/packages/harness/verification.spec.ts",
     "test:capabilities": "node --import=tsx --test tests/packages/harness/capabilities.spec.ts tests/apps/runner/capabilities.spec.ts",
     "test:broker": "node --import=tsx --test --test-isolation=none tests/apps/web/runner-broker.spec.ts",
-    "test:indexer": "node --import=tsx --test tests/apps/indexer/integration.spec.ts",
+    "test:indexer": "node --import=tsx --test tests/apps/indexer/*.spec.ts",
     "smoke:capabilities": "node --import=tsx --test tests/apps/runner/capability-smoke.spec.ts",
     "test": "pnpm run test:capabilities && node --import=tsx --test tests/packages/database/registry.spec.ts",
     "test:coverage": "c8 pnpm test",

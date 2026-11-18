@@ -2,6 +2,16 @@ import { z } from "zod";
 
 import { publicIdSchema } from "@contracts/src/ids.js";
 
+export const codebaseMemoryUnavailableMessage =
+  "Codebase Memory is enabled for this repository but unavailable on the source service. Configure the service with the supported bundle or disable Codebase Memory for this repository, then retry.";
+
+export const codebaseMemoryUnavailableCode = "codebase_memory_unavailable";
+
+export const sourceHealthSchema = z.object({
+  status: z.literal("ready"),
+  capabilities: z.object({ codebaseMemory: z.boolean() }).optional(),
+});
+
 const corpusProgressSchema = z
   .object({
     processed: z.number().int().nonnegative().safe(),

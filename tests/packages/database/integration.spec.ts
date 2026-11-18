@@ -44,6 +44,57 @@ import { createQueue, dispatchPending } from "@razbor/queue";
 
 import { databaseFixture } from "@tests/packages/database/fixture.js";
 
+test("registry uses owner-scoped deployment defaults only when creating an undeclared preference", async (t) => {
+  const fixture = await databaseFixture();
+  t.after(() => fixture.close());
+  const git = {
+    branch: "main",
+    upstream: "refs/remotes/origin/main",
+    remotes: { origin: "https://example.invalid/repo.git" },
+  };
+  const local = { git, indexing: { owner: "source" } };
+  const config = registrySchema.parse({
+    registry: { key: "file" },
+    repositories: {
+      omitted: local,
+      explicit: { ...local, codebaseMemoryEnabled: true },
+      other: { git, indexing: { owner: "other" } },
+    },
+  });
+  /** Read the persisted choices by stable registry key after each isolated import. */
+  async function choices() {
+    return Object.fromEntries(
+      (await listRepositories(fixture.database)).map((repo) => [
+        repo.configKey,
+        repo.codebaseMemoryEnabled,
+      ]),
+    );
+  }
+  await applyRegistry(fixture.database, config, "source");
+  assert.deepEqual(await choices(), {
+    omitted: false,
+    explicit: true,
+    other: true,
+  });
+  delete config.repositories.explicit.codebaseMemoryEnabled;
+  await applyRegistry(fixture.database, config, "other");
+  assert.deepEqual(await choices(), {
+    omitted: false,
+    explicit: true,
+    other: true,
+  });
+  config.repositories.omitted.codebaseMemoryEnabled = true;
+  config.repositories.explicit.codebaseMemoryEnabled = false;
+  config.repositories.legacy = config.repositories.other;
+  await applyRegistry(fixture.database, config);
+  assert.deepEqual(await choices(), {
+    omitted: true,
+    explicit: false,
+    other: true,
+    legacy: true,
+  });
+});
+
 test("repository settings fence index grants while preserving an active attempt's source and index policy", async (t) => {
   const fixture = await databaseFixture();
   const db = fixture.database;
@@ -82,6 +133,10 @@ test("repository settings fence index grants while preserving an active attempt'
     const indexed = await beginAttempt(db, indexedReview.id, owner, 60000);
     assert.ok(indexed.kind === "started" && indexed.codebaseMemoryEnabled);
     const queued = await submitReview(db, request);
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "indexing"),
+      true,
+    );
     config.repositories.project.codebaseMemoryEnabled = false;
     await applyRegistry(db, config);
     const [project] = await listIndexProjects(db, repo.id);
@@ -145,6 +200,31 @@ test("repository settings fence index grants while preserving an active attempt'
     await assert.rejects(
       ensureDevelopmentWorkspaces(db, owner, root, repo.id, source.attemptId),
     );
+    // Re-enable while the pinned attempt owns preparation, before it publishes readiness.
+    config.repositories.project.codebaseMemoryEnabled = true;
+    await applyRegistry(db, config);
+    await workspaceState(db, owner, workspace.id, "ready", revision.baseSha);
+    /** Publish the result of the still-running preparation at its recorded graph revision. */
+    const finishSharedSetup = (headSha: string) =>
+      repositoryIndexSetup(
+        db,
+        owner,
+        repo.id,
+        "ready",
+        undefined,
+        pinned.git,
+        indexed.attemptId,
+        {
+          project: workspace.id,
+          headSha,
+        },
+      );
+    assert.equal(await finishSharedSetup(revision.headSha), false);
+    assert.equal((await getRepository(db, repo.id))?.setupState, "pending");
+    assert.equal(await finishSharedSetup(revision.baseSha), true);
+    assert.equal((await getRepository(db, repo.id))?.setupState, "ready");
+    config.repositories.project.codebaseMemoryEnabled = false;
+    await applyRegistry(db, config);
     await finishAttempt(db, indexedReview.id, indexed.attemptId, owner, {
       summary: "Fixture complete",
       findings: [],

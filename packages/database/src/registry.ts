@@ -83,7 +83,7 @@ export const registrySchema = z
       z
         .object({
           webhook: webhookSettingsSchema.optional(),
-          codebaseMemoryEnabled: z.boolean().default(true),
+          codebaseMemoryEnabled: z.boolean().optional(),
           forge: identifier.optional(),
           selector: z.string().min(1).max(1024).optional(),
           git: repositoryConfigSchema,
@@ -221,9 +221,14 @@ async function validateImportCredentialContext(
 /**
  * Apply declared forge and repository settings under the registry lock,
  * preserving ownership and identity; changed source policies invalidate
- * verification without deleting absent entries.
+ * verification without deleting absent entries. An omitted indexing preference keeps
+ * the saved value or defaults a new repository according to its source-service owner.
  */
-export async function applyRegistry(database: Database, input: RegistryConfig) {
+export async function applyRegistry(
+  database: Database,
+  input: RegistryConfig,
+  sourceOnlyOwner?: string,
+) {
   const config = registrySchema.parse(input);
   return database.transaction(async (tx) => {
     await tx.execute(sql`select pg_advisory_xact_lock(748321, 2)`);
@@ -312,6 +317,10 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
           existing.indexOwner !== r.indexing.owner)
       )
         throw new RegistryConflict();
+      const codebaseMemoryEnabled =
+        r.codebaseMemoryEnabled ??
+        existing?.codebaseMemoryEnabled ??
+        r.indexing.owner !== sourceOnlyOwner;
       // A declared path may change; verification must still resolve the bound external ID.
       const values = {
         managedBy,
@@ -321,7 +330,7 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
         git: r.git,
         indexOwner: r.indexing.owner,
         persistent: r.indexing.persistent,
-        codebaseMemoryEnabled: r.codebaseMemoryEnabled,
+        codebaseMemoryEnabled,
       };
       if (!existing)
         await tx.insert(repositories).values({
@@ -334,7 +343,7 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
           !isDeepStrictEqual(existing.git, r.git) ||
           existing.selector !== values.selector;
         const indexingChanged =
-          existing.codebaseMemoryEnabled !== r.codebaseMemoryEnabled ||
+          existing.codebaseMemoryEnabled !== codebaseMemoryEnabled ||
           existing.persistent !== r.indexing.persistent;
         if (!sourceChanged && !indexingChanged) continue;
         await tx
@@ -346,7 +355,7 @@ export async function applyRegistry(database: Database, input: RegistryConfig) {
             ...(indexingChanged
               ? {
                   setupState:
-                    r.codebaseMemoryEnabled && r.indexing.persistent
+                    codebaseMemoryEnabled && r.indexing.persistent
                       ? "pending"
                       : "ready",
                   setupError: null,

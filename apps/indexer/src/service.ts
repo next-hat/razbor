@@ -4,6 +4,8 @@ import {
   type ServerResponse,
 } from "node:http";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { constants } from "node:fs";
+import { access, lstat } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
@@ -20,11 +22,14 @@ import {
   workspaceState,
   assertRepositoryActive,
   recoverRepositoryIndexSetup,
+  markIndexCapabilityUnavailable,
   pendingRepositoryIndexes,
   repositoryIndexSetup,
   type Database,
 } from "@razbor/database";
 import {
+  codebaseMemoryUnavailableCode,
+  codebaseMemoryUnavailableMessage,
   reviewRequestSchema,
   publicIdSchema,
   indexPreparationStatusRequestSchema,
@@ -46,6 +51,13 @@ import {
 import { Tokens, type AccessGrant } from "@indexer/src/tokens.js";
 import { SynchronizationError } from "@indexer/src/source.js";
 import { Embeddings } from "@indexer/src/embeddings.js";
+
+class CodebaseMemoryUnavailable extends Error {
+  /** Carry a public diagnostic without exposing local paths or dependency errors. */
+  constructor() {
+    super(codebaseMemoryUnavailableMessage);
+  }
+}
 
 const leaseSchema = reviewRequestSchema
   .extend({
@@ -129,6 +141,7 @@ export class IndexService {
   private reaping = false;
   private readonly removals = new Map<string, Promise<void>>();
   private indexResources?: Promise<Embeddings | undefined>;
+  private binaryCheck?: { identity: string; available: Promise<boolean> };
   private readonly preparations = new Map<
     string,
     {
@@ -212,16 +225,16 @@ export class IndexService {
         this.config.service.owner,
       )) {
         const workspace = await this.restoreWorkspace(w);
-        if (w.attemptId) this.attempts.set(w.attemptId, w.id);
+        if (workspace && w.attemptId) this.attempts.set(w.attemptId, w.id);
         if (
           w.temporary ||
           w.repositoryStatus === "deleting" ||
           w.state === "deleting"
         ) {
           if (workspace)
-            await this.removeWorkspace(w.id).catch(() =>
+            await this.removeWorkspace(w.id).catch((error: unknown) =>
               logger.warn(
-                { workspaceId: w.id },
+                { workspaceId: w.id, error: errorDetails(error) },
                 "workspace cleanup will retry",
               ),
             );
@@ -284,6 +297,37 @@ export class IndexService {
   private async restoreWorkspace(
     w: Awaited<ReturnType<typeof ownedWorkspaces>>[number],
   ) {
+    try {
+      await validateWorkspaceStorage(this.config.service.data_root, w);
+    } catch (error) {
+      logger.warn(
+        {
+          workspaceId: w.id,
+          repositoryId: w.repositoryId,
+          temporary: w.temporary,
+          error: errorDetails(error),
+        },
+        "workspace storage unavailable; verify its owned path before recovery",
+      );
+      if (w.temporary) {
+        // Revoke by durable ID. Keep the unsafe path out of filesystem cleanup
+        // until an operator repairs the mapping and the reaper validates it.
+        this.cleanupPending.add(w.id);
+        this.tokens.cancelWorkspace(w.id);
+        if (w.state !== "deleting")
+          await startWorkspaceDeletion(
+            this.database,
+            this.config.service.owner,
+            w.id,
+          ).catch((cause: unknown) =>
+            logger.warn(
+              { workspaceId: w.id, error: errorDetails(cause) },
+              "workspace revocation will retry",
+            ),
+          );
+      }
+      return;
+    }
     const Workspace = w.temporary ? ReviewWorkspace : IndexWorkspace;
     const workspace = new Workspace(
       w.id,
@@ -293,27 +337,39 @@ export class IndexService {
       w.git,
       this.database,
     );
-    try {
-      await validateWorkspaceStorage(this.config.service.data_root, w);
-    } catch (error) {
-      if (w.temporary) throw error;
-      logger.warn(
-        { workspaceId: w.id, error: errorDetails(error) },
-        "persistent index storage unavailable",
-      );
-      return;
-    }
     this.workspaces.set(w.id, workspace);
     return workspace;
   }
 
-  /** Validate optional dependencies on the first indexed preparation and permit a retry after failure. */
+  /**
+   * Check the configured bundle without starting a graph or contacting embeddings.
+   * Reuse its digest while the file identity and change time still match.
+   */
+  private async supportsCodebaseMemory() {
+    const executable = this.config.memory?.executable;
+    if (!executable) return false;
+    try {
+      const stat = await lstat(executable, { bigint: true });
+      if (!stat.isFile()) return false;
+      await access(executable, constants.X_OK);
+      const identity = `${stat.dev}:${stat.ino}:${stat.ctimeNs}`;
+      if (this.binaryCheck?.identity !== identity)
+        this.binaryCheck = {
+          identity,
+          available: verifyExecutable(executable).then(
+            () => true,
+            () => false,
+          ),
+        };
+      return this.binaryCheck.available;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Load embedding storage and credentials only for an indexed preparation, retrying failures. */
   private async loadIndexResources() {
-    if (!this.config.memory)
-      throw new Error("Codebase Memory is not installed");
-    const executable = this.config.memory.executable;
     this.indexResources ??= (async () => {
-      await verifyExecutable(executable);
       if (!this.config.embeddings) return;
       await embeddingStorageReady(this.database);
       return Embeddings.create(this.config.embeddings);
@@ -328,9 +384,12 @@ export class IndexService {
    * Load or create the active repository’s shared workspace, replacing its backend when the
    * durable Git policy changes.
    */
-  private async developmentWorkspace(repositoryId: string, attemptId?: string) {
-    if (!this.config.memory)
-      throw new Error("Codebase Memory is not installed");
+  private async developmentWorkspace(
+    repositoryId: string,
+    attemptId?: string,
+  ): Promise<IndexWorkspace> {
+    if (!(await this.supportsCodebaseMemory()))
+      throw new CodebaseMemoryUnavailable();
     await assertRepositoryActive(
       this.database,
       this.config.service.owner,
@@ -349,16 +408,21 @@ export class IndexService {
     if (!saved || !["ready", "unready"].includes(saved.state))
       throw new Error("persistent workspace unavailable");
     await validateWorkspaceStorage(this.config.service.data_root, saved, true);
-    await this.removals.get(saved.id);
+    const removing = this.removals.get(saved.id);
+    if (removing) {
+      await removing;
+      return this.developmentWorkspace(repositoryId, attemptId);
+    }
     let workspace = this.workspaces.get(saved.id);
     if (workspace?.temporary) throw new Error("shared workspace required");
     if (workspace && workspace.root !== saved.root)
       throw new Error("workspace storage ownership mismatch");
-    if (workspace && !isDeepStrictEqual(workspace.policy, saved.git)) {
-      await workspace.close();
-      this.workspaces.delete(saved.id);
-      this.preparationProgress.delete(repositoryId);
-      workspace = undefined;
+    if (
+      workspace &&
+      (workspace.retired || !isDeepStrictEqual(workspace.policy, saved.git))
+    ) {
+      await this.retireIndex(workspace);
+      return this.developmentWorkspace(repositoryId, attemptId);
     }
     if (!workspace) {
       workspace = new IndexWorkspace(
@@ -372,6 +436,21 @@ export class IndexService {
       this.workspaces.set(saved.id, workspace);
     }
     return workspace;
+  }
+
+  /** Finish closing the old index before allowing any caller to bind another handle to its storage. */
+  private retireIndex(workspace: IndexWorkspace) {
+    const pending = this.removals.get(workspace.id);
+    if (pending) return pending;
+    const retiring = workspace
+      .close()
+      .then(() => {
+        this.workspaces.delete(workspace.id);
+        this.preparationProgress.delete(workspace.repositoryId);
+      })
+      .finally(() => this.removals.delete(workspace.id));
+    this.removals.set(workspace.id, retiring);
+    return retiring;
   }
 
   /** Return a waiting indexed attempt whose durable snapshot can authorize shared preparation. */
@@ -393,30 +472,23 @@ export class IndexService {
     )) {
       if (
         !w.temporary &&
-        !w.codebaseMemoryEnabled &&
+        (!w.codebaseMemoryEnabled || !this.config.memory) &&
         w.state !== "deleting" &&
         w.repositoryStatus !== "deleting"
       ) {
         const workspace = this.workspaces.get(w.id);
         if (
           workspace &&
+          !workspace.temporary &&
           !this.removals.has(w.id) &&
           !this.indexedAttempt(w.repositoryId) &&
           ![...this.reviewIndexes.values()].some(
             (lease) => lease.workspace === workspace,
           )
         ) {
-          const retiring = workspace
-            .close()
-            .then(() => {
-              this.workspaces.delete(w.id);
-              this.preparationProgress.delete(w.repositoryId);
-            })
-            .finally(() => this.removals.delete(w.id));
-          this.removals.set(w.id, retiring);
-          void this.track(retiring).catch(() =>
+          void this.track(this.retireIndex(workspace)).catch((error: unknown) =>
             logger.warn(
-              { workspaceId: w.id },
+              { workspaceId: w.id, error: errorDetails(error) },
               "disabled index cleanup will retry",
             ),
           );
@@ -440,11 +512,20 @@ export class IndexService {
       // Cleanup cancels preparation before it waits for the workspace operation.
       // Keep the reaper available to discover further deletions while it runs.
       if (!this.removals.has(w.id))
-        void this.track(this.removeWorkspace(w.id)).catch(() =>
-          logger.warn({ workspaceId: w.id }, "workspace cleanup will retry"),
+        void this.track(this.removeWorkspace(w.id)).catch((error: unknown) =>
+          logger.warn(
+            { workspaceId: w.id, error: errorDetails(error) },
+            "workspace cleanup will retry",
+          ),
         );
     }
-    if (this.config.memory) await this.preparePendingRepository();
+    if (await this.supportsCodebaseMemory())
+      await this.preparePendingRepository();
+    else
+      await markIndexCapabilityUnavailable(
+        this.database,
+        this.config.service.owner,
+      );
   }
 
   /**
@@ -595,6 +676,7 @@ export class IndexService {
               undefined,
               workspace.policy,
               this.indexedAttempt(repositoryId),
+              binding,
             ))
           )
             throw new Error("repository unavailable");
@@ -611,7 +693,8 @@ export class IndexService {
               this.config.service.owner,
               repositoryId,
               this.stop.signal.aborted ? "pending" : "error",
-              error instanceof SynchronizationError
+              error instanceof SynchronizationError ||
+                error instanceof CodebaseMemoryUnavailable
                 ? error.message
                 : "Indexing failed. Verify repository access and retry setup.",
               workspace?.policy,
@@ -718,14 +801,20 @@ export class IndexService {
         },
         "index request failed",
       );
-      if (!response.headersSent && !response.destroyed)
+      if (!response.headersSent && !response.destroyed) {
+        if (error instanceof CodebaseMemoryUnavailable)
+          response.setHeader(
+            "x-razbor-error-code",
+            codebaseMemoryUnavailableCode,
+          );
         json(response, error instanceof z.ZodError ? 400 : 503, {
           error:
-            error instanceof SynchronizationError
+            error instanceof SynchronizationError ||
+            error instanceof CodebaseMemoryUnavailable
               ? error.message
               : "index operation failed or workspace is not ready",
         });
-      else response.destroy();
+      } else response.destroy();
     } finally {
       request.off("aborted", cancel);
       response.off("close", disconnected);
@@ -873,24 +962,21 @@ export class IndexService {
         json(response, 403, { error: "source access does not match attempt" });
         return;
       }
-      const activeGrant = await this.tokens.authorizeWorkspace(
-        token,
-        workspace.id,
-        workspace.repositoryId,
-      );
       await workspace.streamReviewSource(
         response,
         AbortSignal.any([
           signal,
-          activeGrant.stop.signal,
-          ...(activeGrant.expiresAt
-            ? [
-                AbortSignal.timeout(
-                  Math.max(1, activeGrant.expiresAt - Date.now()),
-                ),
-              ]
+          grant.stop.signal,
+          ...(grant.expiresAt
+            ? [AbortSignal.timeout(Math.max(1, grant.expiresAt - Date.now()))]
             : []),
         ]),
+        () =>
+          this.tokens.authorizeWorkspace(
+            token,
+            workspace.id,
+            workspace.repositoryId,
+          ),
       );
       return;
     }
@@ -927,7 +1013,10 @@ export class IndexService {
   ) {
     if (request.method === "GET" && url.pathname === "/health") {
       await this.database.ready();
-      json(response, 200, { status: "ready" });
+      json(response, 200, {
+        status: "ready",
+        capabilities: { codebaseMemory: await this.supportsCodebaseMemory() },
+      });
       return true;
     }
     if (request.method === "POST" && url.pathname === "/index-progress") {
@@ -1059,6 +1148,8 @@ export class IndexService {
     const started = performance.now();
     let phase = "review_source";
     try {
+      if (saved.codebaseMemoryEnabled && !(await this.supportsCodebaseMemory()))
+        throw new CodebaseMemoryUnavailable();
       await workspace.prepareReviewSource(signal, lease);
 
       /** Publish the verified checkout before issuing its attempt-scoped token. */

@@ -134,7 +134,10 @@ loopback source service. It checks indexed and source-only assignments across a
 repository setting change, source forwarding, attempt tokens, the private index
 MCP endpoint and independent durable memory, without a model endpoint. Database
 regressions cover file ownership, legacy defaults, attempt snapshots and index
-token authorization.
+token authorization. A setup regression disables and re-enables indexing before
+an active preparation publishes its result, and accepts only the revision the
+persistent workspace actually prepared. Broker tests exercise capability-based
+creation defaults and the review error for an unavailable required index.
 
 The fixture creates PostgreSQL migration and restricted runtime roles, including
 the pg-boss schema. Comment tests use local sockets and never contact a real forge
@@ -172,16 +175,23 @@ the local suites.
 
 ## Indexer integration
 
-Both cases run the service against local bare Git repositories and a disposable
-PostgreSQL database. The source-only case needs Git, Docker, local sockets and
+These specs use disposable PostgreSQL databases. Review handoff cases run the
+service against local bare Git repositories. The source-only case needs Git, Docker, local sockets and
 `postgres:17-alpine`. It imports the pinned base and feature-branch commits through the runner
 checkout path and checks attempt authorization, lease expiry and removal. It also
 checks that stale Git policies and invalid or symlinked index directories cannot
 block source preparation or cause cleanup to delete unrelated files. The fixture
-runs without a graph binary, vector extension or embedding endpoint.
+runs without a graph binary, vector extension or embedding endpoint. A controlled
+barrier verifies that a queued source transfer must pass authorization at
+dispatch. Capability checks cover missing and invalid bundles. Startup recovery
+tests exercise an invalid temporary mapping and empty or occupied daemon runtime
+directories. The fixtures remove their workspaces, sockets and databases.
 
 The indexed case also exercises fetching, refresh, pinned graph access,
-revocation, dirty checkouts, divergence recovery and cleanup.
+revocation, dirty checkouts, divergence recovery and cleanup. A connected client
+checks the current Git policy after a branch change. A PostgreSQL advisory lock
+and trigger interrupt retirement at its durable state write so re-enabling can
+exercise the cleanup retry.
 
 Provision the pinned v0.11.0 bundle using the [indexing guide](../docs/indexing.md):
 

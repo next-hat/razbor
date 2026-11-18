@@ -14,7 +14,10 @@ import {
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
-import { publicIdSchema } from "@razbor/contracts";
+import {
+  codebaseMemoryUnavailableMessage,
+  publicIdSchema,
+} from "@razbor/contracts";
 
 import { requireContextSession } from "@database/src/contexts.js";
 import type { Database } from "@database/src/connection.js";
@@ -875,11 +878,12 @@ export async function createIndexToken(
   return { ...record, token };
 }
 
-/** Require an active repository assigned to the supplied indexer owner. */
+/** Require an active owned repository and, for shared indexes, its expected Git policy. */
 export async function assertRepositoryActive(
   database: Database,
   owner: string,
   repositoryId: string,
+  expectedPolicy?: WorkspacePolicy,
 ) {
   publicIdSchema("repository").parse(repositoryId);
   const [repository] = await database.db
@@ -890,6 +894,9 @@ export async function assertRepositoryActive(
         eq(repositories.publicId, repositoryId),
         eq(repositories.indexOwner, owner),
         eq(repositories.status, "active"),
+        expectedPolicy
+          ? sql`${repositories.git} = ${JSON.stringify(expectedPolicy)}::jsonb`
+          : undefined,
       ),
     );
   if (!repository) throw new Error("repository unavailable");
@@ -916,6 +923,31 @@ export async function recoverRepositoryIndexSetup(
     );
 }
 
+/** Publish a safe setup error for this owner's enabled repositories when its bundle is unavailable. */
+export async function markIndexCapabilityUnavailable(
+  database: Database,
+  owner: string,
+) {
+  await database.db
+    .update(repositories)
+    .set({
+      setupState: "error",
+      setupError: codebaseMemoryUnavailableMessage,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(repositories.indexOwner, owner),
+        eq(repositories.status, "active"),
+        eq(repositories.codebaseMemoryEnabled, true),
+        or(
+          sql`${repositories.setupState} <> 'error'`,
+          sql`${repositories.setupError} is distinct from ${codebaseMemoryUnavailableMessage}`,
+        ),
+      ),
+    );
+}
+
 /** Read the oldest batch of active repositories awaiting setup by this indexer. */
 export async function pendingRepositoryIndexes(
   database: Database,
@@ -937,8 +969,8 @@ export async function pendingRepositoryIndexes(
 }
 
 /**
- * Update owned repository setup state only while lifecycle and optional Git
- * policy still match; return whether the guarded update succeeded.
+ * Update owned repository setup while its Git policy still matches. A preparation
+ * that completed across a preference change can publish its exact stored revision.
  */
 export async function repositoryIndexSetup(
   database: Database,
@@ -948,6 +980,7 @@ export async function repositoryIndexSetup(
   error?: string,
   policy?: GitPolicy,
   pinnedAttemptId?: string,
+  prepared?: { project: string; headSha: string },
 ) {
   publicIdSchema("repository").parse(repositoryId);
   const binding = and(
@@ -958,6 +991,23 @@ export async function repositoryIndexSetup(
       ? sql`${repositories.git} = ${JSON.stringify(policy)}::jsonb`
       : undefined,
   );
+  // Re-enabling can reset setup to pending (or ready for on-demand indexes) while
+  // the service still owns the single preparation. Only its matching ready index
+  // can satisfy that request; an error from old work cannot replace new setup.
+  const completedWorkspace =
+    state === "ready" && prepared && policy
+      ? and(
+          inArray(repositories.setupState, ["indexing", "pending", "ready"]),
+          sql`exists (select 1 from ${indexWorkspaces}
+            where ${indexWorkspaces.publicId} = ${prepared.project}
+              and ${indexWorkspaces.repositoryId} = ${repositories.id}
+              and ${indexWorkspaces.owner} = ${repositories.indexOwner}
+              and not ${indexWorkspaces.temporary}
+              and ${indexWorkspaces.state} = 'ready'
+              and ${indexWorkspaces.indexSha} = ${prepared.headSha}
+              and ${indexWorkspaces.git} = ${repositories.git})`,
+        )
+      : undefined;
   const updated = await database.db
     .update(repositories)
     .set({
@@ -973,7 +1023,7 @@ export async function repositoryIndexSetup(
         binding,
         eq(repositories.codebaseMemoryEnabled, true),
         state === "ready" || state === "error"
-          ? eq(repositories.setupState, "indexing")
+          ? (completedWorkspace ?? eq(repositories.setupState, "indexing"))
           : undefined,
       ),
     )

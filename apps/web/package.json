@@ -34,6 +34,7 @@
     "zod": "^4.6.7"
   },
   "exports": {
+    "./indexer": "./lib/indexer.ts",
     "./runner-broker": "./lib/runner-broker.ts",
     "./index-panel": "./components/index-panel.tsx",
     "./review-markdown": "./components/review-markdown.tsx",

@@ -218,6 +218,15 @@ Keep registry and repository keys stable to preserve identities and history.
 Imports retain missing entries and only run explicitly. Remove registrations
 from the file when no longer needed; importing later can recreate a deleted one.
 
+An explicit `codebaseMemoryEnabled` in a repository table takes precedence.
+When it is omitted, a registry reapply keeps the existing repository's setting.
+For a new repository, `manage config apply` can read `RAZBOR_INDEX_CONFIG`
+from its own environment. Point it to the source-service TOML mounted inside
+the management container. A matching owner configured without `[memory]`
+defaults to source-only. Other owners and installations without this file
+retain the historical indexed default. The development source-only overlay
+supplies the file for both registry and management commands.
+
 ### Change an existing checkout to HTTPS
 
 Updating a registry URL does not update cached remotes or UI registrations that

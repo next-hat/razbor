@@ -139,9 +139,13 @@ export class ReviewWorkspace extends OwnedWorkspace {
 
   /**
    * Serialize a bounded Git pack stream for the exact base and head commits, checking
-   * repository state and terminating the Git child before releasing workspace ownership.
+   * the bound grant immediately before pack generation and waiting for the Git child to exit.
    */
-  async streamReviewSource(response: ServerResponse, signal: AbortSignal) {
+  async streamReviewSource(
+    response: ServerResponse,
+    signal: AbortSignal,
+    authorize: () => Promise<unknown>,
+  ) {
     return this.serial(async () => {
       const active = AbortSignal.any([
         signal,
@@ -171,6 +175,8 @@ export class ReviewWorkspace extends OwnedWorkspace {
         ["rev-parse", "--show-object-format"],
         active,
       );
+      await authorize();
+      active.throwIfAborted();
       const child = spawn(
         "git",
         [

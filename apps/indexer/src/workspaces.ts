@@ -1,4 +1,4 @@
-import { rm, lstat } from "node:fs/promises";
+import { rm, lstat, realpath, rmdir } from "node:fs/promises";
 import path from "node:path";
 
 import type { IndexPreparation } from "@razbor/contracts";
@@ -25,6 +25,11 @@ export class IndexWorkspace extends OwnedWorkspace {
   private readyHead?: string;
   private semantic?: SemanticIndex;
   private documents?: DocumentIndex;
+
+  /** Retirement permanently cancels this handle, even when durable cleanup must be retried. */
+  get retired() {
+    return this.stop.signal.aborted;
+  }
 
   /** Resolve the configured graph module for operations requiring a persistent index. */
   private get memory() {
@@ -73,6 +78,64 @@ export class IndexWorkspace extends OwnedWorkspace {
   }
 
   /**
+   * Recover the previous service's workspace-specific daemon before reusing or deleting its files.
+   * A source-only installation can retire an empty runtime, or preserve an ambiguous one for inspection.
+   */
+  private async recoverDaemon(retainWorkspace = false) {
+    if (this.backendInitialized) return;
+    if (this.backend) {
+      await this.closeBackend();
+      return;
+    }
+    const state = path.join(this.root, "state");
+    const runtime = daemonRuntimeDirectory(state);
+    const stat = await lstat(runtime).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
+    });
+    if (!stat) return;
+    if (
+      !stat.isDirectory() ||
+      stat.uid !== process.getuid!() ||
+      (stat.mode & 0o022) !== 0 ||
+      (await realpath(runtime)) !== runtime
+    )
+      throw new Error(
+        `Invalid daemon runtime ownership at ${runtime}. Verify the workspace-specific directory before retrying.`,
+      );
+
+    // Under the service storage lock an empty private namespace has no CBM
+    // listener or lifetime-lock files. rmdir atomically refuses any contents.
+    try {
+      await rmdir(runtime);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+    }
+    const memory = this.config.memory;
+    const verified =
+      memory &&
+      (await verifyExecutable(memory.executable).then(
+        () => true,
+        () => false,
+      ));
+    if (!verified) {
+      const message = `Retained daemon state at ${runtime}. Stop the previous index service, verify its workspace daemon has exited, then remove only this runtime directory and retry cleanup.`;
+      if (!retainWorkspace) throw new Error(message);
+      logger.warn({ workspaceId: this.id }, message);
+      return;
+    }
+    this.backend = new MemoryBackend(
+      memory,
+      this.source.repository,
+      state,
+      this.id,
+      false,
+    );
+    await this.closeBackend();
+  }
+
+  /**
    * Refresh the shared checkout; only confirmed divergence triggers one clean reclone after
    * stopping the old backend and removing its index state.
    */
@@ -87,25 +150,6 @@ export class IndexWorkspace extends OwnedWorkspace {
         "workspace diverged from upstream; rebuilding checkout and index",
       );
       const state = path.join(this.root, "state");
-      // A previous service process may have left an isolated daemon alive.
-      if (
-        !this.backend &&
-        !this.backendInitialized &&
-        (await lstat(state).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => {
-            if (error.code === "ENOENT") return false;
-            throw error;
-          },
-        ))
-      )
-        this.backend = new MemoryBackend(
-          this.memory,
-          this.source.repository,
-          state,
-          this.id,
-          false,
-        );
       await this.closeBackend();
       await rm(state, { recursive: true, force: true });
       // One recovery attempt; clone/index failures remain visible and unready.
@@ -147,6 +191,7 @@ export class IndexWorkspace extends OwnedWorkspace {
         this.database,
         this.config.service.owner,
         this.repositoryId,
+        this.policy,
       );
       if (reuseReady && this.backend && this.readyHead) {
         reportProgress?.({ phase: "source_validation" });
@@ -188,6 +233,7 @@ export class IndexWorkspace extends OwnedWorkspace {
         reportProgress?.({ phase: next });
       };
       try {
+        await this.recoverDaemon();
         const previousIndex = await this.backend?.waitForIndex(active);
         updatePhase("source_sync", this.config.service.sync_ms);
         const head = await this.refreshSource(active);
@@ -376,7 +422,7 @@ export class IndexWorkspace extends OwnedWorkspace {
 
   /**
    * Run a serialized operation only against a clean ready index, rechecking repository
-   * activity and any review-pinned revision before granting backend access.
+   * activity, Git policy and any review-pinned revision before granting backend access.
    */
   async access<T>(
     signal: AbortSignal,
@@ -395,6 +441,7 @@ export class IndexWorkspace extends OwnedWorkspace {
         this.database,
         this.config.service.owner,
         this.repositoryId,
+        this.policy,
       );
       if (!this.backend || !this.readyHead)
         throw new Error("workspace index is not ready; refresh required");
@@ -405,7 +452,15 @@ export class IndexWorkspace extends OwnedWorkspace {
         throw new Error("workspace revision changed; refresh required");
       }
       await this.source.clean(active);
-      return operation(this.backend, this.readyHead, active);
+      const result = await operation(this.backend, this.readyHead, active);
+      await assertRepositoryActive(
+        this.database,
+        this.config.service.owner,
+        this.repositoryId,
+        this.policy,
+      );
+      active.throwIfAborted();
+      return result;
     });
   }
 
@@ -420,36 +475,14 @@ export class IndexWorkspace extends OwnedWorkspace {
       this.readyHead = undefined;
       this.semantic?.reset();
       this.documents?.reset();
+      await this.recoverDaemon(!deleting);
+      await this.closeBackend();
       if (deleting)
         await deleteEmbeddingIndex(
           this.database,
           this.config.service.owner,
           this.id,
         );
-      if (!this.backend && !this.backendInitialized) {
-        const state = path.join(this.root, "state");
-        // A clean shutdown removes this socket directory. Retained Git and
-        // index files alone do not need a binary to be safely removed.
-        const exists = await lstat(daemonRuntimeDirectory(state)).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => {
-            if (error.code === "ENOENT") return false;
-            throw error;
-          },
-        );
-        if (exists) {
-          // Recovery can run before the first indexed request verifies the bundle.
-          await verifyExecutable(this.memory.executable);
-          this.backend = new MemoryBackend(
-            this.memory,
-            this.source.repository,
-            state,
-            this.id,
-            false,
-          );
-        }
-      }
-      await this.closeBackend();
       if (!deleting)
         await workspaceState(
           this.database,

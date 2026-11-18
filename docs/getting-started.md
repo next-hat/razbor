@@ -98,8 +98,8 @@ docker compose -f compose.yml -f compose.source.yml up --build -d
 docker compose -f compose.yml -f compose.source.yml ps -a
 ```
 
-Use the same file pair for subsequent Compose commands. Turn off **Codebase
-Memory** when connecting each repository.
+Use the same file pair for subsequent Compose commands. When the console detects
+the Git-only service, **Codebase Memory** defaults to off for new connections.
 
 For indexed development, run:
 

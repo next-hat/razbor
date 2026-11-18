@@ -1,5 +1,13 @@
 # Use with compose.yml for a deployment without Codebase Memory.
+x-registry-source-config: &registry-source-config
+  environment:
+    RAZBOR_INDEX_CONFIG: /index-config/indexer.toml
+  volumes:
+    - ${RAZBOR_INDEX_CONFIG:-./config/source.example.toml}:/index-config/indexer.toml:ro
+
 services:
+  registry: *registry-source-config
+  manage: *registry-source-config
   embedding-model:
     profiles: [indexing]
   embeddings:

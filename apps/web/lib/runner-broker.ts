@@ -9,6 +9,8 @@ import type { RequestInit as UndiciRequestInit } from "undici";
 import { z } from "zod";
 
 import {
+  codebaseMemoryUnavailableCode,
+  codebaseMemoryUnavailableMessage,
   commitSchema,
   memoryOperationSchema,
   publicIdSchema,
@@ -467,6 +469,10 @@ export class RunnerBroker {
       }),
     } as RequestInit & Pick<UndiciRequestInit, "dispatcher">);
     if (!response.ok) {
+      const memoryUnavailable =
+        codebaseMemoryEnabled &&
+        response.headers.get("x-razbor-error-code") ===
+          codebaseMemoryUnavailableCode;
       logger.warn(
         {
           reviewId: attempt.job.reviewId,
@@ -481,6 +487,16 @@ export class RunnerBroker {
         "runner source preparation rejected",
       );
       await response.body?.cancel().catch(() => {});
+      if (memoryUnavailable) {
+        this.record(attempt, {
+          time: new Date().toISOString(),
+          source: "app",
+          stage: "prepare",
+          level: "error",
+          message: codebaseMemoryUnavailableMessage,
+        });
+        throw new TerminalReviewError(codebaseMemoryUnavailableMessage);
+      }
       throw new Error("source preparation unavailable");
     }
     const body = await boundedRunnerBody(
@@ -657,7 +673,9 @@ export class RunnerBroker {
       );
       if (!attempt.finalizing) {
         const terminal =
-          Date.now() >= attempt.deadline || job.retryCount >= job.retryLimit;
+          error instanceof TerminalReviewError ||
+          Date.now() >= attempt.deadline ||
+          job.retryCount >= job.retryLimit;
         await attempt.logs;
         await finishAttempt(
           this.database,
@@ -667,6 +685,7 @@ export class RunnerBroker {
           undefined,
           terminal,
         ).catch(() => {});
+        if (error instanceof TerminalReviewError) throw error;
         if (terminal)
           throw new TerminalReviewError(
             "runner attempt deadline or retry limit reached",

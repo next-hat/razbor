@@ -21,8 +21,9 @@ credential = { file = "/forge-secrets/razbor.forgejo.token" }
 
 # Plain Git remains supported without a hosted forge binding.
 [repositories.razbor]
+# Omit to use the deployment default on creation and retain the saved value on reapply.
 # Set false for Git-only reviews, including when indexing.persistent is true.
-codebaseMemoryEnabled = true
+# codebaseMemoryEnabled = false
 
 [repositories.razbor.indexing]
 owner = "local-indexer"

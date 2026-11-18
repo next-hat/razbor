@@ -39,17 +39,42 @@ For Nanocl, substitute your built release tag in the private statefile and run:
 nanocl state apply -s razbor-platform.yml -- --source-only
 ```
 
-Use the same mode on subsequent applies. For each repository, turn off
-**Codebase Memory** in the connection wizard or in **Settings → General**.
-File-managed repositories use `codebaseMemoryEnabled = false` under their
-repository table. The flag defaults to true and new review attempts capture
-its current value. Install the indexed service before enabling it.
+Use the same mode on subsequent applies. When the source service reports that
+Codebase Memory is unavailable, the connection wizard defaults new repositories
+to source-only. Existing repositories keep their preference. Disable indexing
+under **Settings → General** or install the supported bundle and retry setup.
+For file-managed repositories, set `codebaseMemoryEnabled = false` under each
+repository table to choose source-only explicitly. Reapplying a registry with
+the setting omitted preserves the saved choice. For new registrations, point
+the management CLI's `RAZBOR_INDEX_CONFIG` to the mounted service TOML so it
+can use the matching owner's source-only default without contacting the
+service. New review attempts capture the saved preference.
 
 Existing indexed installations can switch individual repositories off while
 keeping their current images and PostgreSQL volume. Keep a pgvector-capable
 PostgreSQL image for databases that already contain vector columns. Disabling
 a repository stops new index grants and refreshes. Leased attempts keep their
 grants, and the existing index is retained.
+
+### Switch an existing NanoCL platform to source-only
+
+1. Disable Codebase Memory for the affected repositories and let active indexed
+   attempts finish. Back up PostgreSQL. Keep the existing namespace, group,
+   storage mounts, credentials and image tags in the private statefile. For a
+   database with pgvector installed, pin the PostgreSQL Cargo to its existing
+   pgvector-capable image even in source-only mode. Preserve the
+   `razbor_postgres_data` and index data volumes.
+2. Render the private statefile with `nanocl state render -s razbor-platform.yml -- --source-only`.
+   The output contains credentials. Inspect it locally and compare the declared
+   resources with the live `razbor-platform` group. The expected removals are
+   the `razbor-embeddings` Cargo and the `razbor-platform.embeddings` Secret.
+   Resolve any other differences before pruning the group.
+3. After inspection, run
+   `nanocl state apply -s razbor-platform.yml --remove-orphans -- --source-only`.
+   NanoCL 0.18.1 prunes omitted group members only with `--remove-orphans`.
+   Check the command output and verify both embeddings resources are gone and
+   the Git source service and database are healthy. Fresh installations use the
+   apply command above without pruning.
 
 To add indexed search to an existing source-only installation, keep its database
 and source volumes. Select the indexed service image and configure `[memory]`.

@@ -215,7 +215,15 @@ async function main() {
         if (command !== "apply" || args.length !== 1)
           throw new Error("unknown administrative command");
         const config = await loadRegistry(args[0]);
-        await applyRegistry(database, config);
+        // A registry can be imported before its source service starts.
+        const source = process.env.RAZBOR_INDEX_CONFIG
+          ? await loadIndexerConfig(process.env.RAZBOR_INDEX_CONFIG)
+          : undefined;
+        await applyRegistry(
+          database,
+          config,
+          source?.memory ? undefined : source?.service.owner,
+        );
         await applyWebhookSettings(database, config);
         console.log(
           "Registry applied; IDs preserved. Webhook setup reconciled; inspect repository webhook status.",
