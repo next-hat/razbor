@@ -219,7 +219,8 @@ test(
     });
     for (const repository of repositories)
       await submitReview(db, { repositoryId: repository.id, baseSha, headSha });
-    const broker = new RunnerBroker(db, await createQueue(db));
+    const queue = await createQueue(db);
+    const broker = new RunnerBroker(db, queue);
     try {
       const assignments: NonNullable<
         Awaited<ReturnType<RunnerBroker["claim"]>>["assignment"]
@@ -312,11 +313,34 @@ test(
         );
       }
       rejectIndex = true;
+      // Fail the durable terminal write while allowing pg-boss to settle its claim.
+      await fixture.administrator.query(
+        "ALTER TABLE reviews ADD CONSTRAINT fixture_terminal_write CHECK (status <> 'failed') NOT VALID",
+      );
       const review = await submitReview(db, {
         repositoryId: plain.job.repositoryId,
         baseSha,
         headSha,
       });
+      const retryBy = Date.now() + 15000;
+      let [job] = await queue.findJobs(queue.name, { key: review.id });
+      while (
+        job?.state !== "retry" &&
+        job?.state !== "cancelled" &&
+        Date.now() < retryBy
+      ) {
+        await delay(50);
+        [job] = await queue.findJobs(queue.name, { key: review.id });
+      }
+      assert.equal(job?.state, "retry");
+      assert.equal((await getReview(db, review.id))?.status, "running");
+      await fixture.administrator.query(
+        "ALTER TABLE reviews DROP CONSTRAINT fixture_terminal_write",
+      );
+      await fixture.administrator.query(
+        "UPDATE review_attempts SET lease_until = now() WHERE review_id = (SELECT id FROM reviews WHERE public_id=$1)",
+        [review.id],
+      );
       const end = Date.now() + 15000;
       while (
         (await getReview(db, review.id))?.status !== "failed" &&

@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { once } from "node:events";
 import { promisify } from "node:util";
 import { mkdir } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
@@ -7,16 +8,33 @@ import { gitEnvironment } from "@razbor/harness/git";
 
 const exec = promisify(execFile);
 
-/** Poll an observable service condition until it succeeds or the fixture deadline expires. */
+/** Bound the entire poll, including an in-flight predicate, and cancel its I/O on expiry. */
 export async function eventually(
-  check: () => Promise<boolean>,
+  check: (signal: AbortSignal) => Promise<boolean>,
   timeout = 30000,
 ) {
-  const end = Date.now() + timeout;
-  while (!(await check())) {
-    if (Date.now() >= end)
-      throw new Error("fixture condition deadline exceeded");
-    await delay(100);
+  const deadline = performance.now() + timeout;
+  const controller = new AbortController();
+  const { signal } = controller;
+  const error = new Error("fixture condition deadline exceeded");
+  const timer = setTimeout(() => controller.abort(error), timeout);
+  const expired = once(signal, "abort").then(() => {
+    throw error;
+  });
+  /** Stop at the deadline even when a synchronous part of the predicate delayed the timer. */
+  async function poll() {
+    for (;;) {
+      signal.throwIfAborted();
+      const ready = await check(signal);
+      if (performance.now() >= deadline) throw error;
+      if (ready) return;
+      await delay(100, undefined, { signal });
+    }
+  }
+  try {
+    await Promise.race([expired, poll()]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 

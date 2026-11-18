@@ -188,7 +188,11 @@ export async function ensureDevelopmentWorkspaces(
  * Read an indexer's undeleted workspace mappings for internal filesystem
  * management, translating database IDs to public IDs.
  */
-export async function ownedWorkspaces(database: Database, owner: string) {
+export async function ownedWorkspaces(
+  database: Database,
+  owner: string,
+  workspaceId?: string,
+) {
   const rows = await database.db
     .select({
       workspace: indexWorkspaces,
@@ -203,6 +207,12 @@ export async function ownedWorkspaces(database: Database, owner: string) {
     .where(
       and(
         eq(indexWorkspaces.owner, owner),
+        workspaceId === undefined
+          ? undefined
+          : eq(
+              indexWorkspaces.publicId,
+              publicIdSchema("workspace").parse(workspaceId),
+            ),
         sql`${indexWorkspaces.state} <> 'deleted'`,
       ),
     );
@@ -923,16 +933,22 @@ export async function recoverRepositoryIndexSetup(
     );
 }
 
-/** Publish a safe setup error for this owner's enabled repositories when its bundle is unavailable. */
-export async function markIndexCapabilityUnavailable(
+/**
+ * Mark queued setup while the bundle is missing. When it returns, retry persistent setup
+ * and let on-demand repositories wait for their next request. Live jobs publish their own result.
+ */
+export async function reconcileIndexCapability(
   database: Database,
   owner: string,
+  available: boolean,
 ) {
   await database.db
     .update(repositories)
     .set({
-      setupState: "error",
-      setupError: codebaseMemoryUnavailableMessage,
+      setupState: available
+        ? sql`case when ${repositories.persistent} then 'pending' else 'ready' end`
+        : "error",
+      setupError: available ? null : codebaseMemoryUnavailableMessage,
       updatedAt: new Date(),
     })
     .where(
@@ -940,10 +956,12 @@ export async function markIndexCapabilityUnavailable(
         eq(repositories.indexOwner, owner),
         eq(repositories.status, "active"),
         eq(repositories.codebaseMemoryEnabled, true),
-        or(
-          sql`${repositories.setupState} <> 'error'`,
-          sql`${repositories.setupError} is distinct from ${codebaseMemoryUnavailableMessage}`,
-        ),
+        available
+          ? and(
+              eq(repositories.setupState, "error"),
+              eq(repositories.setupError, codebaseMemoryUnavailableMessage),
+            )
+          : eq(repositories.setupState, "pending"),
       ),
     );
 }

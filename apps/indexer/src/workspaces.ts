@@ -77,6 +77,12 @@ export class IndexWorkspace extends OwnedWorkspace {
     }
   }
 
+  /** Stop a known local backend without reading the registry or deleting the checkout during failed shutdown. */
+  stopBackend() {
+    this.cancel();
+    return this.serial(() => this.closeBackend());
+  }
+
   /**
    * Recover the previous service's workspace-specific daemon before reusing or deleting its files.
    * A source-only installation can retire an empty runtime, or preserve an ambiguous one for inspection.

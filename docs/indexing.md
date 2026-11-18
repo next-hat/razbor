@@ -19,6 +19,15 @@ Stored indexes can be reused when indexing is enabled again. The separate
 indexing for enabled file-managed repositories. See [source-only deployment](deployment.md#deploy-without-codebase-memory)
 for the service configuration.
 
+The web service sends the index management bearer token when it checks deployment
+capabilities, provisions indexes, and reads preparation status. The supplied
+Compose and NanoCL configurations use HTTP on the private service network.
+Anyone who can observe traffic on that hop can read and reuse the token. Keep
+the indexer and its network accessible only to trusted workloads. For traffic
+that crosses hosts or an untrusted network, configure `RAZBOR_INDEX_ENDPOINT`
+to use an HTTPS endpoint with a certificate trusted by the web service and
+protect the connection from TLS termination to the indexer as well.
+
 An index follows the configured branch, usually the default branch. It does not
 include local uncommitted changes or create a graph for each pull request.
 

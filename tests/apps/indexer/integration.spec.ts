@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { randomBytes } from "node:crypto";
 import { EventEmitter, once } from "node:events";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import {
   mkdtemp,
   mkdir,
@@ -38,6 +40,7 @@ import {
   issueToken,
   revokeToken,
   getRepository,
+  repositoryIndexSetup,
   requestRepositoryDeletion,
   submitReview,
   beginAttempt,
@@ -71,7 +74,7 @@ test(
       : "set CBM_EXECUTABLE to the provisioned v0.11.0 portable binary",
     timeout: 240000,
   },
-  async () => {
+  async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "razbor-index-test-"));
     const upstream = path.join(root, "upstream.git");
     const admin = randomBytes(32).toString("base64url");
@@ -124,17 +127,42 @@ test(
             git: repo,
             indexing: { owner: "local-indexer", persistent: true },
           },
+          recovery: {
+            git: repo,
+            indexing: { owner: "local-indexer", persistent: true },
+          },
         },
       });
       await applyRegistry(database, registry);
+      const read = fs.createReadStream;
+      let failedReads = 0;
+      const unavailable = t.mock.method(
+        fs,
+        "createReadStream",
+        (...[file, options]: Parameters<typeof read>) => {
+          if (file === executable) {
+            failedReads++;
+            throw Object.assign(new Error("fixture bundle read interrupted"), {
+              code: "EIO",
+            });
+          }
+          return read(file, options);
+        },
+      );
+      syncBuiltinESMExports();
+      t.after(() => {
+        unavailable.mock.restore();
+        syncBuiltinESMExports();
+      });
       service = new IndexService(config, admin, database);
       const port = await service.listen();
       const workspaces = await ownedWorkspaces(database, "local-indexer");
       const fixtureId = await resolveRepository(database, "fixture");
       const otherId = await resolveRepository(database, "other");
+      const recoveryId = await resolveRepository(database, "recovery");
       const devWorkspace = workspaces.find((w) => w.repositoryId === fixtureId);
       const otherWorkspace = workspaces.find((w) => w.repositoryId === otherId);
-      assert.ok(devWorkspace && otherWorkspace);
+      assert.ok(devWorkspace && otherWorkspace && recoveryId);
       const issued = await issueToken(
         database,
         devWorkspace.id,
@@ -181,10 +209,45 @@ test(
           body: body === undefined ? undefined : JSON.stringify(body),
           signal,
         });
-      assert.deepEqual(await (await request("/health", "GET", admin)).json(), {
-        status: "ready",
-        capabilities: { codebaseMemory: true },
-      });
+      await Promise.all(
+        [1, 2, 3].map(async () => {
+          assert.deepEqual(
+            await (await request("/health", "GET", admin)).json(),
+            {
+              status: "ready",
+              capabilities: { codebaseMemory: false },
+            },
+          );
+        }),
+      );
+      assert.equal(failedReads, 1);
+      await repositoryIndexSetup(
+        database,
+        "local-indexer",
+        recoveryId,
+        "pending",
+      );
+      await eventually(
+        async () =>
+          (await getRepository(database, recoveryId))?.setupError ===
+          codebaseMemoryUnavailableMessage,
+      );
+      // Restore read access without changing the executable identity or restarting the service.
+      unavailable.mock.restore();
+      syncBuiltinESMExports();
+      await eventually(
+        async (signal) =>
+          (
+            await (
+              await request("/health", "GET", admin, undefined, signal)
+            ).json()
+          ).capabilities.codebaseMemory,
+      );
+      await eventually(
+        async () =>
+          (await getRepository(database, recoveryId))?.setupState === "ready",
+        90000,
+      );
       /** Connect an authenticated MCP client and track it for fixture cleanup. */
       const connect = async (token: string) => {
         const client = new Client({
@@ -447,8 +510,9 @@ test(
       assert.equal(expiring.status, 201);
       const shortLease = await expiring.json();
       await eventually(
-        async () =>
-          (await request("/mcp", "POST", shortLease.token, {})).status === 401,
+        async (signal) =>
+          (await request("/mcp", "POST", shortLease.token, {}, signal))
+            .status === 401,
         5000,
       );
       await eventually(async () =>
@@ -572,12 +636,13 @@ test(
       } finally {
         await sqlClient.query("select pg_advisory_unlock(419272, 1)");
       }
-      await eventually(async () => {
+      await eventually(async (signal) => {
         const retry = await request(
           `/repositories/${devWorkspace.repositoryId}/index`,
           "POST",
           admin,
           { prepare: true },
+          signal,
         );
         const binding = await retry.json();
         return (
@@ -701,6 +766,7 @@ test(
         method: string,
         token: string,
         payload?: unknown,
+        signal?: AbortSignal,
       ) =>
         fetch(`http://127.0.0.1:${port}${route}`, {
           method,
@@ -709,6 +775,7 @@ test(
             "content-type": "application/json",
           },
           body: payload === undefined ? undefined : JSON.stringify(payload),
+          signal,
         });
 
       assert.equal((await request("/health", "GET", "invalid")).status, 401);
@@ -732,15 +799,6 @@ test(
       const other = await reserve();
       registry.repositories.fixture.codebaseMemoryEnabled = true;
       await applyRegistry(state.database, registry);
-      await eventually(
-        async () =>
-          (await getRepository(state.database, repositoryId))?.setupError ===
-          codebaseMemoryUnavailableMessage,
-      );
-      await state.administrator.query(
-        "UPDATE repositories SET setup_error = 'Index setup failed' WHERE public_id=$1 AND setup_state='error'",
-        [repositoryId],
-      );
       await eventually(
         async () =>
           (await getRepository(state.database, repositoryId))?.setupError ===
@@ -786,9 +844,14 @@ test(
             { refresh: false },
           );
           const gate = new EventEmitter();
-          const firstAtTransfer = once(gate, "transfer");
-          const secondAdmitted = once(gate, "admitted");
           const releaseFirst = once(gate, "release");
+          const downloads: Promise<Response>[] = [];
+          const controller = new AbortController();
+          const signal = AbortSignal.any([
+            controller.signal,
+            t.signal,
+            AbortSignal.timeout(10000),
+          ]);
           const authorize = Tokens.prototype.authorize;
           const authorizeWorkspace = Tokens.prototype.authorizeWorkspace;
           let transfers = 0;
@@ -819,11 +882,29 @@ test(
             },
           );
           const sourceUrl = `/reviews/${first.attemptId}/source`;
-          const firstDownload = request(sourceUrl, "GET", lease.token);
-          await firstAtTransfer;
-          const secondDownload = request(sourceUrl, "GET", secondGrant.token);
+          /** Detect a response or connection failure before the handler reaches its synchronization point. */
+          async function reachGate(event: string, token: string) {
+            const reached = once(gate, event, { signal });
+            const download = request(
+              sourceUrl,
+              "GET",
+              token,
+              undefined,
+              signal,
+            );
+            downloads.push(download);
+            await Promise.race([
+              reached,
+              download.then((response) => {
+                throw new Error(
+                  `source request returned HTTP ${response.status} before ${event}`,
+                );
+              }),
+            ]);
+          }
           try {
-            await secondAdmitted;
+            await reachGate("transfer", lease.token);
+            await reachGate("admitted", secondGrant.token);
             // Let the admitted HTTP handler enqueue its operation behind the first one.
             await setImmediate();
             assert.equal(transfers, 1);
@@ -832,24 +913,24 @@ test(
               secondGrant.id,
               config.service.owner,
             );
+            gate.emit("release");
+            const [allowed, denied] = await Promise.all(downloads);
+            assert.equal(allowed.status, 200);
+            assert.equal(
+              Buffer.from(await allowed.arrayBuffer())
+                .subarray(0, 4)
+                .toString(),
+              "PACK",
+            );
+            assert.equal(transfers, 2);
+            assert.equal(denied.status, 503);
+            assert.equal(denied.headers.get("x-razbor-object-format"), null);
+            assert.ok((await denied.json()).error);
           } finally {
             gate.emit("release");
+            controller.abort();
+            await Promise.allSettled(downloads);
           }
-          const [allowed, denied] = await Promise.all([
-            firstDownload,
-            secondDownload,
-          ]);
-          assert.equal(allowed.status, 200);
-          assert.equal(
-            Buffer.from(await allowed.arrayBuffer())
-              .subarray(0, 4)
-              .toString(),
-            "PACK",
-          );
-          assert.equal(transfers, 2);
-          assert.equal(denied.status, 503);
-          assert.equal(denied.headers.get("x-razbor-object-format"), null);
-          assert.ok((await denied.json()).error);
         },
       );
       for (const key of ["project", "indexHeadSha", "indexBranch"])

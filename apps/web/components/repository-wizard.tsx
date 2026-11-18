@@ -259,9 +259,7 @@ export function RepositoryWizard({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...connectionInput(),
-            ...(memoryChoice !== undefined || codebaseMemoryAvailable !== null
-              ? { codebaseMemoryEnabled }
-              : {}),
+            codebaseMemoryEnabled,
             ...(agentId ? { agentId } : {}),
             callbackBase: selectedCallback.trim(),
             ...(forgeType === "github" && !usesGithubApp

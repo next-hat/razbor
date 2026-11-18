@@ -677,6 +677,7 @@ export class RunnerBroker {
           Date.now() >= attempt.deadline ||
           job.retryCount >= job.retryLimit;
         await attempt.logs;
+        // A failed write must reach execute as a retryable error.
         await finishAttempt(
           this.database,
           attempt.job.reviewId,
@@ -684,7 +685,7 @@ export class RunnerBroker {
           this.owner,
           undefined,
           terminal,
-        ).catch(() => {});
+        );
         if (error instanceof TerminalReviewError) throw error;
         if (terminal)
           throw new TerminalReviewError(

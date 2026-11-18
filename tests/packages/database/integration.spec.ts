@@ -6,7 +6,11 @@ import path from "node:path";
 import os from "node:os";
 import { createServer } from "node:http";
 
-import { publicIdSchema, type ReviewAttemptMetrics } from "@razbor/contracts";
+import {
+  codebaseMemoryUnavailableMessage,
+  publicIdSchema,
+  type ReviewAttemptMetrics,
+} from "@razbor/contracts";
 import {
   connectDatabase,
   listRepositories,
@@ -32,6 +36,7 @@ import {
   listIndexProjects,
   pendingRepositoryIndexes,
   repositoryIndexSetup,
+  reconcileIndexCapability,
   workspaceState,
 } from "@razbor/database";
 import {
@@ -93,6 +98,76 @@ test("registry uses owner-scoped deployment defaults only when creating an undec
     other: true,
     legacy: true,
   });
+});
+
+test("bundle recovery retries only affected persistent setup and preserves unrelated repository states", async (t) => {
+  const fixture = await databaseFixture();
+  t.after(() => fixture.close());
+  const db = fixture.database;
+  const owner = "indexer";
+  const git = {
+    branch: "main",
+    upstream: "refs/remotes/origin/main",
+    remotes: { origin: "https://example.invalid/repo.git" },
+  };
+  const project = { git, indexing: { owner } };
+  await applyRegistry(
+    db,
+    registrySchema.parse({
+      registry: { key: "outage" },
+      repositories: {
+        persistent: project,
+        onDemand: { git, indexing: { owner, persistent: false } },
+        published: project,
+        running: project,
+        unrelated: project,
+        disabled: { ...project, codebaseMemoryEnabled: false },
+        foreign: { git, indexing: { owner: "other" } },
+      },
+    }),
+  );
+  const { administrator } = fixture;
+  await administrator.query(
+    "UPDATE repositories SET setup_state='pending' WHERE config_key IN ('persistent','onDemand','disabled','foreign')",
+  );
+  await administrator.query(
+    "UPDATE repositories SET setup_state='indexing' WHERE config_key='running'",
+  );
+  await administrator.query(
+    "UPDATE repositories SET setup_state='error', setup_error='Verify repository access.' WHERE config_key='unrelated'",
+  );
+  /** Snapshot setup values and timestamps so repeated polling must leave matching rows untouched. */
+  const snapshot = async () =>
+    (
+      await administrator.query(
+        "SELECT config_key, setup_state, setup_error, updated_at::text FROM repositories ORDER BY config_key",
+      )
+    ).rows;
+  const before = await snapshot();
+  await reconcileIndexCapability(db, owner, false);
+  const unavailable = await snapshot();
+  for (const [index, row] of unavailable.entries()) {
+    if (["persistent", "onDemand"].includes(row.config_key))
+      assert.deepEqual(
+        [row.setup_state, row.setup_error],
+        ["error", codebaseMemoryUnavailableMessage],
+      );
+    else assert.deepEqual(row, before[index]);
+  }
+  await reconcileIndexCapability(db, owner, false);
+  assert.deepEqual(await snapshot(), unavailable);
+  await reconcileIndexCapability(db, owner, true);
+  const recovered = await snapshot();
+  for (const [index, row] of recovered.entries()) {
+    if (row.config_key === "persistent" || row.config_key === "onDemand")
+      assert.deepEqual(
+        [row.setup_state, row.setup_error],
+        [row.config_key === "persistent" ? "pending" : "ready", null],
+      );
+    else assert.deepEqual(row, before[index]);
+  }
+  await reconcileIndexCapability(db, owner, true);
+  assert.deepEqual(await snapshot(), recovered);
 });
 
 test("repository settings fence index grants while preserving an active attempt's source and index policy", async (t) => {

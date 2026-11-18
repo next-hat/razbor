@@ -137,7 +137,11 @@ regressions cover file ownership, legacy defaults, attempt snapshots and index
 token authorization. A setup regression disables and re-enables indexing before
 an active preparation publishes its result, and accepts only the revision the
 persistent workspace actually prepared. Broker tests exercise capability-based
-creation defaults and the review error for an unavailable required index.
+creation defaults and the review error for an unavailable required index. A
+database constraint forces the terminal write to fail, so the broker test
+can verify that pg-boss retries the job and the review subsequently finishes.
+Persistence checks verify that bundle recovery affects only the owner's eligible
+repositories and preserves unrelated setup errors and active preparations.
 
 The fixture creates PostgreSQL migration and restricted runtime roles, including
 the pg-boss schema. Comment tests use local sockets and never contact a real forge
@@ -183,15 +187,24 @@ checks that stale Git policies and invalid or symlinked index directories cannot
 block source preparation or cause cleanup to delete unrelated files. The fixture
 runs without a graph binary, vector extension or embedding endpoint. A controlled
 barrier verifies that a queued source transfer must pass authorization at
-dispatch. Capability checks cover missing and invalid bundles. Startup recovery
+dispatch. Each barrier fails if its request ends early. Condition polling
+shares a deadline with the underlying HTTP fetch. A stalled predicate exercises
+that deadline. Capability checks cover missing and invalid bundles. Startup recovery
 tests exercise an invalid temporary mapping and empty or occupied daemon runtime
 directories. The fixtures remove their workspaces, sockets and databases.
 
-The indexed case also exercises fetching, refresh, pinned graph access,
+The indexed case simulates a transient read error on the pinned executable,
+then checks that health recovers and queued setup resumes with the same binary.
+It also exercises fetching, refresh, pinned graph access,
 revocation, dirty checkouts, divergence recovery and cleanup. A connected client
 checks the current Git policy after a branch change. A PostgreSQL advisory lock
 and trigger interrupt retirement at its durable state write so re-enabling can
-exercise the cleanup retry.
+exercise the cleanup retry. A separate test holds a stale database snapshot
+while a repository is re-enabled, refreshes its retained workspace by ID, and
+checks that the graph daemon stops and the checkout survives when the registry
+is unavailable during shutdown. Another holds startup inside a database
+transaction to verify that the successor can acquire the storage lock only
+after the original service finishes with it.
 
 Provision the pinned v0.11.0 bundle using the [indexing guide](../docs/indexing.md):
 
@@ -200,9 +213,10 @@ export RAZBOR_CBM_BUNDLE=/absolute/path/to/codebase-memory-bundle
 CBM_EXECUTABLE="$RAZBOR_CBM_BUNDLE/codebase-memory-mcp" pnpm run test:indexer
 ```
 
-Docker and `postgres:17-alpine` are also required. Only the indexed case skips without
-`CBM_EXECUTABLE`. It uses its own database and source
-directory, reads no live credentials, and does not enable embeddings.
+Docker and `postgres:17-alpine` are also required. The indexed integration and
+retained-workspace refresh cases skip without `CBM_EXECUTABLE`. Each uses its
+own database and source directory, reads no live credentials, and leaves
+embeddings disabled.
 
 ## Kata runner smoke check
 

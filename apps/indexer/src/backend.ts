@@ -24,6 +24,9 @@ export const releaseVersion = "0.11.0";
 export const binarySha256 =
   "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510";
 
+/** An unsupported platform or bundle cannot pass verification until its identity changes. */
+export class UnsupportedExecutable extends Error {}
+
 /** Use a short, workspace-specific directory for the daemon's Unix sockets. */
 export function daemonRuntimeDirectory(state: string) {
   return `/tmp/rdm-${createHash("sha256").update(state).digest("hex").slice(0, 20)}`;
@@ -44,15 +47,17 @@ export type BackendConfig = {
  */
 export async function verifyExecutable(executable: string) {
   if (process.platform !== "linux" || process.arch !== "x64")
-    throw new Error(
+    throw new UnsupportedExecutable(
       "configured Codebase Memory portable bundle requires linux/amd64",
     );
   if (!(await lstat(executable)).isFile())
-    throw new Error("Codebase Memory executable must be a regular file");
+    throw new UnsupportedExecutable(
+      "Codebase Memory executable must be a regular file",
+    );
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(executable)) hash.update(chunk);
   if (hash.digest("hex") !== binarySha256)
-    throw new Error(
+    throw new UnsupportedExecutable(
       "Codebase Memory binary does not match the pinned v0.11.0 portable release; run the documented provisioning command",
     );
 }

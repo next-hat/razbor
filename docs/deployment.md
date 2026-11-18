@@ -42,7 +42,9 @@ nanocl state apply -s razbor-platform.yml -- --source-only
 Use the same mode on subsequent applies. When the source service reports that
 Codebase Memory is unavailable, the connection wizard defaults new repositories
 to source-only. Existing repositories keep their preference. Disable indexing
-under **Settings → General** or install the supported bundle and retry setup.
+under **Settings → General** or install the supported bundle. Once the source
+service verifies the bundle, it automatically resumes setup for repositories
+whose setup failed because the bundle was unavailable.
 For file-managed repositories, set `codebaseMemoryEnabled = false` under each
 repository table to choose source-only explicitly. Reapplying a registry with
 the setting omitted preserves the saved choice. For new registrations, point

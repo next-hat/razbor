@@ -33,6 +33,22 @@ import { IndexService } from "@razbor/indexer/service";
 import { eventually } from "@tests/apps/indexer/fixtures.js";
 import { databaseFixture } from "@tests/packages/database/fixture.js";
 
+test(
+  "fixture deadline aborts an in-flight check even if it never settles",
+  { timeout: 2000 },
+  async () => {
+    let requestSignal: AbortSignal | undefined;
+    await assert.rejects(
+      eventually((signal) => {
+        requestSignal = signal;
+        return new Promise<boolean>(() => {});
+      }, 20),
+      /fixture condition deadline exceeded/,
+    );
+    assert.equal(requestSignal?.aborted, true);
+  },
+);
+
 test("source-only recovery quarantines invalid checkouts and preserves occupied daemon runtimes", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "razbor-recovery-"));
   t.after(() => rm(root, { recursive: true, force: true }));
