@@ -734,7 +734,6 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
       pageInfo: { hasNextPage: false },
       nodes: [{ state: "COMMENTED" }],
     },
-    reviews: { pageInfo: { hasPreviousPage: false }, nodes: votes },
   };
   let enforcedRuleset = false;
   let bypass = "never";
@@ -742,18 +741,70 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   let checkpoints = 0;
   let pendingApp = 1;
   let optionalConclusion = "skipped";
+  let historyFault:
+    | "stale head"
+    | "repeated cursor"
+    | "new opinion"
+    | "historical dismissal"
+    | undefined;
+  let historyReads = 0;
   const mutations: string[] = [];
   fakeFetch(t, (path, method, body) => {
     if (path === "/api/graphql") {
-      if (String(body.query).includes("query RazborApproval")) {
-        assert.match(String(body.query), /dismissesStaleReviews/);
-        assert.match(String(body.query), /reviewThreads/);
+      const query = String(body.query);
+      const earlier = query.includes("query RazborEarlierVotes");
+      if (earlier || query.includes("query RazborApproval")) {
+        const variables = body.variables as Record<string, string>;
+        assert.equal(variables.bot, approvalBot.login);
+        assert.match(query, /startCursor/);
+        if (earlier) {
+          historyReads++;
+          assert.match(query, /before:\s*\$before/);
+          assert.match(variables.before, /^vote-\d+$/);
+        } else {
+          assert.match(query, /dismissesStaleReviews/);
+          assert.match(query, /reviewThreads/);
+        }
+        const end = earlier ? Number(variables.before.slice(5)) : votes.length;
+        const start = Math.max(0, end - 100);
+        const reviews = {
+          pageInfo: {
+            hasPreviousPage: start > 0,
+            startCursor:
+              earlier && historyFault === "repeated cursor"
+                ? variables.before
+                : start < end
+                  ? "vote-" + start
+                  : null,
+            endCursor: start < end ? "vote-" + (end - 1) : null,
+          },
+          nodes: votes.slice(start, end).map((vote) => ({ ...vote })),
+        };
+        if (earlier && historyFault === "new opinion") {
+          votes.push({ ...votes[0], id: "NEW", state: "DISMISSED" });
+          historyFault = undefined;
+        }
+        if (earlier && historyFault === "historical dismissal") {
+          votes[0].state = "DISMISSED";
+          historyFault = undefined;
+        }
         return {
           data: {
+            ...(variables.voteId && {
+              currentVote:
+                votes.find((vote) => vote.id === variables.voteId) ?? null,
+            }),
             repository: {
               databaseId: 10,
               defaultBranchRef: { name: "main" },
-              pullRequest: pr,
+              pullRequest: {
+                ...pr,
+                headRefOid:
+                  earlier && historyFault === "stale head"
+                    ? baseSha
+                    : pr.headRefOid,
+                reviews,
+              },
             },
           },
         };
@@ -988,6 +1039,63 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     await api.approveReview(request, approvalBot, false, checkpoint),
     "dismissed",
   );
+  // The newest page contains only comments or opinions from another revision or actor.
+  votes[0].state = "APPROVED";
+  const oldOpinion = votes[0];
+  const comment = { ...oldOpinion, state: "COMMENTED" };
+  votes.push(
+    ...Array.from({ length: 100 }, (_, i) => ({
+      ...comment,
+      id: "COMMENT-" + i,
+    })),
+  );
+  votes.push({
+    ...oldOpinion,
+    id: "OTHER-HEAD",
+    state: "DISMISSED",
+    commit: { oid: baseSha },
+  });
+  votes.push({
+    ...oldOpinion,
+    id: "OTHER-ACTOR",
+    state: "DISMISSED",
+    author: { databaseId: 999 },
+  });
+  assert.equal(
+    await api.approveReview(request, approvalBot, true, checkpoint, true),
+    "approved",
+  );
+  assert.equal(historyReads, 1);
+  for (const [state, body, expected] of [
+    ["DISMISSED", oldOpinion.body, "dismissed"],
+    ["APPROVED", "another approval", "unsupported"],
+  ]) {
+    votes.push({ ...oldOpinion, id: "LATEST", state, body });
+    assert.equal(
+      await api.approveReview(request, approvalBot, false, checkpoint),
+      expected,
+    );
+    votes.pop();
+  }
+  historyFault = "new opinion";
+  await assert.rejects(
+    api.approveReview(request, approvalBot, true, checkpoint, true),
+    { reason: "unavailable", uncertain: false },
+  );
+  votes.pop();
+  historyFault = "historical dismissal";
+  assert.equal(
+    await api.approveReview(request, approvalBot, true, checkpoint, true),
+    "dismissed",
+  );
+  oldOpinion.state = "APPROVED";
+  historyFault = "stale head";
+  assert.notEqual(
+    await api.approveReview(request, approvalBot, false, checkpoint),
+    "approved",
+  );
+  historyFault = undefined;
+  votes.splice(1);
   // A marked review remains addressable after either ref changes and after closure.
   votes[0].state = "APPROVED";
   pr.state = "CLOSED";
@@ -1023,6 +1131,40 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     await api.retireApproval(request, approvalBot, false, checkpoint, true),
     "retired",
   );
+  // Only an exhaustive bounded read authorizes a fresh vote.
+  pr.state = "OPEN";
+  pr.headRefOid = headSha;
+  pr.baseRefName = "main";
+  loseResponse = false;
+  votes.splice(
+    0,
+    votes.length,
+    ...Array.from({ length: 2001 }, (_, i) => ({
+      ...comment,
+      id: "PAGE-" + i,
+    })),
+  );
+  const readsBeforeLimit = historyReads;
+  assert.equal(
+    await api.approveReview(request, approvalBot, false, checkpoint),
+    "unsupported",
+  );
+  assert.equal(historyReads - readsBeforeLimit, 19);
+  historyFault = "repeated cursor";
+  const readsBeforeCycle = historyReads;
+  assert.equal(
+    await api.approveReview(request, approvalBot, false, checkpoint),
+    "unsupported",
+  );
+  assert.equal(historyReads - readsBeforeCycle, 1);
+  historyFault = undefined;
+  assert.deepEqual(mutations, ["approval", "dismiss"]);
+  votes.length = 101;
+  assert.equal(
+    await api.approveReview(request, approvalBot, false, checkpoint),
+    "approved",
+  );
+  assert.deepEqual(mutations, ["approval", "dismiss", "approval"]);
 });
 
 test("GitLab approval uses the numeric MR and SHA guard and requires revision-bound evidence to recover", async (t) => {

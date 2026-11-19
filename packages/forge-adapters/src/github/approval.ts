@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { z } from "zod";
 
 import {
@@ -27,8 +29,15 @@ import {
   mergeState,
 } from "@forge-adapters/src/merge.js";
 
-const query = `query RazborApproval($owner:String!, $name:String!, $number:Int!, $bot:String!) {
-  repository(owner:$owner,name:$name) {
+const maxVotePages = 20;
+
+const opinionFields = `id state body commit{oid} author{... on Bot{databaseId}}`;
+
+const voteFields = `{pageInfo{hasPreviousPage startCursor endCursor} nodes{${opinionFields}}}`;
+
+const approvalVariables = `$owner:String!, $name:String!, $number:Int!, $bot:String!`;
+
+const approvalSelection = `repository(owner:$owner,name:$name) {
     databaseId defaultBranchRef{name}
     pullRequest(number:$number) {
       id number state isDraft author{login} headRefOid baseRefOid baseRefName
@@ -38,7 +47,23 @@ const query = `query RazborApproval($owner:String!, $name:String!, $number:Int!,
       baseRef{refUpdateRule{viewerAllowedToDismissReviews} branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiredStatusChecks{context app{databaseId}}}}
       reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved}}
       latestOpinionatedReviews(first:100){pageInfo{hasNextPage} nodes{state}}
-      reviews(last:100,author:$bot){pageInfo{hasPreviousPage} nodes{body state commit{oid} author{... on Bot{databaseId}}}}
+      reviews(last:100,author:$bot)${voteFields}
+    }
+}`;
+
+const query = `query RazborApproval(${approvalVariables}) { ${approvalSelection} }`;
+
+const approvalWithVoteQuery = `query RazborApprovalWithVote(${approvalVariables},$voteId:ID!) {
+  ${approvalSelection}
+  currentVote:node(id:$voteId){... on PullRequestReview{${opinionFields} pullRequest{id}}}
+}`;
+
+const earlierVotesQuery = `query RazborEarlierVotes(${approvalVariables}, $before:String!) {
+  repository(owner:$owner,name:$name) {
+    databaseId defaultBranchRef{name}
+    pullRequest(number:$number) {
+      id number state isDraft headRefOid baseRefOid baseRefName
+      reviews(last:100,author:$bot,before:$before)${voteFields}
     }
   }
 }`;
@@ -48,6 +73,12 @@ const vote = z.object({
   body: z.string(),
   commit: z.object({ oid: commitSha }).nullable(),
   author: z.object({ databaseId: mergeId.optional() }).nullable(),
+});
+
+const markedVote = vote.extend({ id: z.string().min(1) });
+
+const voteOnPull = markedVote.extend({
+  pullRequest: z.object({ id: z.string() }),
 });
 
 const approvalRepository = z.object({
@@ -118,11 +149,52 @@ const approvalRepository = z.object({
       nodes: z.array(z.object({ state: z.string() })),
     }),
     reviews: z.object({
-      pageInfo: z.object({ hasPreviousPage: z.boolean() }),
-      nodes: z.array(vote),
+      pageInfo: z.object({
+        hasPreviousPage: z.boolean(),
+        startCursor: z.string().nullish(),
+        endCursor: z.string().nullish(),
+      }),
+      nodes: z.array(markedVote).max(100),
     }),
   }),
 });
+
+const approvalSnapshot = z.object({
+  repository: approvalRepository,
+  currentVote: z.unknown().optional(),
+});
+
+const votePage = approvalRepository.extend({
+  pullRequest: approvalRepository.shape.pullRequest.pick({
+    id: true,
+    number: true,
+    state: true,
+    isDraft: true,
+    headRefOid: true,
+    baseRefOid: true,
+    baseRefName: true,
+    reviews: true,
+  }),
+});
+
+/** Reject a page for a different PR, revision or destination, including a PR that closed or became a draft. */
+function votePageRestriction(
+  repo: z.infer<typeof votePage>,
+  request: ForgeMergeRequest,
+  pullId: string,
+) {
+  const pr = repo.pullRequest;
+  if (
+    repo.databaseId !== request.externalRepositoryId ||
+    repo.defaultBranchRef.name !== request.baseBranch ||
+    pr.number !== String(request.number) ||
+    pr.id !== pullId ||
+    differentRevision(request, pr.headRefOid, pr.baseRefOid, pr.baseRefName)
+  )
+    return mergeState("stale", "revision_changed");
+  if (pr.state !== "OPEN" || pr.isDraft)
+    return mergeState("blocked", "not_open_ready");
+}
 
 /** Verify the destination, exact checked commit, current reviewer decisions, conversations and absence of an armed merge. */
 export async function inspectGithubApproval(
@@ -142,42 +214,79 @@ export async function inspectGithubApproval(
     api.app.login.toLowerCase() !== bot.login.toLowerCase()
   )
     return { decision: mergeState("blocked", "approval_actor_unavailable") };
-  const { repository: repo } = z
-    .object({ repository: approvalRepository })
-    .parse(
-      await api.graphql(query, {
-        owner: api.owner,
-        name: api.name,
-        number: request.number,
-        bot: bot.login,
-      }),
+  const variables = {
+    owner: api.owner,
+    name: api.name,
+    number: request.number,
+    bot: bot.login,
+  };
+  /** Match submitted opinions by the authenticated App actor on this reviewed head. */
+  function isPinnedOpinion(review: z.infer<typeof vote>) {
+    return (
+      review.author?.databaseId === bot.id &&
+      review.commit?.oid === request.headSha &&
+      ["DISMISSED", "CHANGES_REQUESTED", "APPROVED"].includes(review.state)
     );
+  }
+  /** Refresh protection and the newest reviews, including the current state of a previously matched older vote. */
+  async function readCurrent(voteId?: string) {
+    return approvalSnapshot.parse(
+      voteId
+        ? await api.graphql(approvalWithVoteQuery, { ...variables, voteId })
+        : await api.graphql(query, variables),
+    );
+  }
+  let { repository: repo } = await readCurrent();
+  const pullId = repo.pullRequest.id;
+  let page: z.infer<typeof votePage> = repo;
+  const cursors = new Set<string>();
+  let opinion: z.infer<typeof markedVote> | undefined;
+  for (;;) {
+    const restriction = votePageRestriction(page, request, pullId);
+    if (restriction) return { decision: restriction };
+    const reviews = page.pullRequest.reviews;
+    opinion = [...reviews.nodes].reverse().find(isPinnedOpinion);
+    if (opinion || !reviews.pageInfo.hasPreviousPage) break;
+    const before = reviews.pageInfo.startCursor;
+    if (!before || cursors.has(before) || cursors.size >= maxVotePages - 1)
+      return { decision: mergeState("blocked", "approval_unconfirmed") };
+    cursors.add(before);
+    page = z
+      .object({ repository: votePage })
+      .parse(
+        await api.graphql(earlierVotesQuery, { ...variables, before }),
+      ).repository;
+  }
+  if (cursors.size) {
+    const newest = repo.pullRequest.reviews;
+    const refreshed = await readCurrent(opinion?.id);
+    repo = refreshed.repository;
+    const restriction = votePageRestriction(repo, request, pullId);
+    if (restriction) return { decision: restriction };
+    // Concurrent reviews can move the backward pagination window. Retry from a
+    // fresh snapshot instead of combining an older opinion with a different tail.
+    if (!isDeepStrictEqual(repo.pullRequest.reviews, newest))
+      throw new ForgeOperationError("unavailable");
+    if (opinion) {
+      const current = voteOnPull.safeParse(refreshed.currentVote);
+      if (
+        !current.success ||
+        current.data.id !== opinion.id ||
+        current.data.pullRequest.id !== pullId ||
+        !isPinnedOpinion(current.data)
+      )
+        throw new ForgeOperationError("unavailable");
+      opinion = current.data;
+    }
+  }
   const pr = repo.pullRequest;
   const tip = pr.commits.nodes[0].commit;
-  if (
-    repo.databaseId !== request.externalRepositoryId ||
-    repo.defaultBranchRef.name !== request.baseBranch ||
-    pr.number !== String(request.number) ||
-    tip.oid !== request.headSha ||
-    differentRevision(request, pr.headRefOid, pr.baseRefOid, pr.baseRefName)
-  )
+  if (tip.oid !== request.headSha)
     return { decision: mergeState("stale", "revision_changed") };
-  if (pr.state !== "OPEN" || pr.isDraft)
-    return { decision: mergeState("blocked", "not_open_ready") };
   if (!pr.author || pr.author.login.toLowerCase() === bot.login.toLowerCase())
     return { decision: mergeState("blocked", "approval_actor_unavailable") };
-  if (pr.reviews.pageInfo.hasPreviousPage)
-    return { decision: mergeState("blocked", "approval_unconfirmed") };
 
-  const own = pr.reviews.nodes.filter(
-    (v) => v.commit?.oid === request.headSha && v.author?.databaseId === bot.id,
-  );
   const marker = approvalMarker(request);
-  const opinion = own
-    .reverse()
-    .find((v) =>
-      ["DISMISSED", "CHANGES_REQUESTED", "APPROVED"].includes(v.state),
-    );
   let previous: ForgeApprovalResult | undefined;
   if (opinion)
     previous =
@@ -357,8 +466,6 @@ export async function approveGithubReview(
   return "approved";
 }
 
-const markedVote = vote.extend({ id: z.string().min(1) });
-
 const retirementPage = z.object({
   repository: z.object({
     databaseId: mergeId,
@@ -396,7 +503,7 @@ export async function retireGithubApproval(
   const votes: z.infer<typeof markedVote>[] = [];
   let after: string | null = null;
   let pullId: string | undefined;
-  for (let page = 0; page < 20; page++) {
+  for (let page = 0; page < maxVotePages; page++) {
     const { repository } = retirementPage.parse(
       await api.graphql(
         `query RazborRetireApproval($owner:String!,$name:String!,$number:Int!,$bot:String!,$after:String) {
@@ -432,7 +539,8 @@ export async function retireGithubApproval(
     );
     if (!pr.reviews.pageInfo.hasNextPage) break;
     const next = pr.reviews.pageInfo.endCursor;
-    if (!next || next === after || page === 19) return "unconfirmed";
+    if (!next || next === after || page === maxVotePages - 1)
+      return "unconfirmed";
     after = next;
   }
   const owned = votes.filter((v) => v.body.endsWith(marker));
@@ -448,9 +556,7 @@ export async function retireGithubApproval(
   const response = z
     .object({
       dismissPullRequestReview: z.object({
-        pullRequestReview: markedVote.extend({
-          pullRequest: z.object({ id: z.string() }),
-        }),
+        pullRequestReview: voteOnPull,
       }),
     })
     .safeParse(
