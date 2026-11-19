@@ -264,7 +264,9 @@ function nextEscalationCheck(human: boolean) {
     ? new Date(Date.now() + 600_000)
     : sql`case when
     coalesce((${pullRequests.escalationComment}->>'pendingReservations')::integer,0) > 0
-    or ${pullRequests.escalationComment}->>'uncertainEdit' = 'true'
+    or ${pullRequests.escalationComment}->'uncertainEdit' = 'true'::jsonb
+    or (jsonb_typeof(${pullRequests.escalationComment}->'uncertainEdit') = 'array'
+        and ${pullRequests.escalationComment}->'uncertainEdit' <> '[]'::jsonb)
     then now() + interval '1 hour' else null end`;
 }
 

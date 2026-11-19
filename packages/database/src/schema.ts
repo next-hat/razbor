@@ -331,7 +331,8 @@ export type EscalationComment = {
   botId: string;
   reservationRetryAt?: number;
   pendingReservations?: number;
-  uncertainEdit?: boolean;
+  /** Hashes of unconfirmed edit bodies on remoteId, or true for unidentifiable pending writes. */
+  uncertainEdit?: boolean | string[];
   remoteId?: string;
   creatingBody?: string;
   shownBody?: string;

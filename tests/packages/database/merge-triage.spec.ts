@@ -408,6 +408,8 @@ test(
     let delayedReservation = "";
     let closedReservation = "";
     let delayedMention = "";
+    let delayedCorrection = "";
+    let nextPatchOutcome: "delayed" | "lost acknowledgment" | undefined;
     let rejectedMention = false;
     let policyVoteHead = headSha;
     t.mock.method(
@@ -523,7 +525,16 @@ test(
               delayedMention = body;
               throw new Error("mention PATCH delayed");
             }
+            if (number === 1 && nextPatchOutcome === "delayed") {
+              nextPatchOutcome = undefined;
+              delayedCorrection = body;
+              throw new Error("correction PATCH delayed");
+            }
             comments.set(id, body);
+            if (number === 1 && nextPatchOutcome === "lost acknowledgment") {
+              nextPatchOutcome = undefined;
+              throw new Error("applied PATCH response lost");
+            }
           }
           return Response.json({
             id: Number(id),
@@ -876,17 +887,33 @@ test(
     await processMergeTriage(restart);
     assert.match(delayedMention, /@alice @extra1 @extra2/);
     assert.equal(remoteComments.get("78"), delayedReservation);
-    // The provider has accepted the mention-bearing edit but it is still invisible.
+    // Two edits are still in flight. A third applies immediately but loses its response.
+    nextPatchOutcome = "delayed";
+    await due(first);
+    await processMergeTriage(db);
+    assert.doesNotMatch(delayedCorrection, /@alice/);
+    assert.equal(remoteComments.get("78"), delayedReservation);
+    nextPatchOutcome = "lost acknowledgment";
     await due(first);
     await processMergeTriage(restart);
-    assert.match(remoteComments.get("78")!, /Human review required/);
-    assert.doesNotMatch(remoteComments.get("78")!, /@alice/);
+    const appliedCorrection = remoteComments.get("78")!;
+    assert.match(appliedCorrection, /Human review required/);
+    assert.doesNotMatch(appliedCorrection, /@alice/);
+    /** Compare the displayed decision across separately identifiable delivery attempts. */
+    function visibleDecision(note: string) {
+      return note.replace(/<!--[^>]*-->/g, "").trimEnd();
+    }
+    assert.equal(
+      visibleDecision(appliedCorrection),
+      visibleDecision(delayedCorrection),
+    );
+    assert.notEqual(appliedCorrection, delayedCorrection);
     // The first POST appears late. Only the committed ID ever contains the escalation.
     remoteComments.set("77", delayedReservation);
     await due(first);
     await processMergeTriage(restart);
     assert.deepEqual([...remoteComments.keys()], ["78"]);
-    assert.equal(patchBodies.length, 2);
+    assert.equal(patchBodies.length, 3);
     assert.equal(
       (
         await db.pool.query(
@@ -896,16 +923,11 @@ test(
       ).rows[0].n,
       1,
     );
-    // Deliver the first PATCH after a newer decision has already replaced it.
+    // Later, acknowledged decisions do not settle either delayed request.
     await complete(first, 73);
     await processMergeTriage(db);
     const updatedBody = remoteComments.get("78")!;
     assert.match(updatedBody, /73\/100/);
-    remoteComments.set("78", delayedMention);
-    await due(first);
-    await processMergeTriage(restart);
-    assert.equal(remoteComments.get("78"), updatedBody);
-    // A successful newer PATCH cannot prove that the timed-out PATCH is finished.
     await db.pool.query(
       "update pull_requests set state='closed' where public_id=$1",
       [first],
@@ -920,12 +942,36 @@ test(
       )
     ).rows[0];
     assert.equal(afterClose.escalation_comment.pendingReservations, 0);
-    assert.equal(afterClose.escalation_comment.uncertainEdit, true);
+    assert.equal(afterClose.escalation_comment.uncertainEdit.length, 2);
     assert.equal(afterClose.due, true);
+    // Deliver the older requests once each, in reverse order, after closure.
+    remoteComments.set("78", delayedCorrection);
+    await due(first);
+    await processMergeTriage(restart);
+    assert.equal(
+      visibleDecision(remoteComments.get("78")!),
+      visibleDecision(resolvedBody),
+    );
+    assert.ok((await deadline(first))!.getTime() > Date.now());
     remoteComments.set("78", delayedMention);
     await due(first);
     await processMergeTriage(restart);
-    assert.equal(remoteComments.get("78"), resolvedBody);
+    assert.equal(
+      visibleDecision(remoteComments.get("78")!),
+      visibleDecision(resolvedBody),
+    );
+    assert.equal(await deadline(first), null);
+    const writesAfterSettlement = patchBodies.length;
+    await processMergeTriage(db);
+    assert.equal(patchBodies.length, writesAfterSettlement);
+    // A preview worker did not record receipts. Seeing even the exact current body
+    // cannot retire that fence until the old comment ID is confirmed deleted.
+    await db.pool.query(
+      "update pull_requests set merge_after=now(), escalation_comment=jsonb_set(escalation_comment,'{uncertainEdit}','true') where public_id=$1",
+      [first],
+    );
+    await processMergeTriage(restart);
+    assert.ok((await deadline(first))!.getTime() > Date.now());
     await db.pool.query(
       "update pull_requests set state='open' where public_id=$1",
       [first],
@@ -937,6 +983,15 @@ test(
     assert.equal(posts, 3);
     assert.match(remoteComments.get("79")!, /Human review required/);
     assert.doesNotMatch(remoteComments.get("79")!, /@/);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select escalation_comment->>'uncertainEdit' as pending from pull_requests where public_id=$1",
+          [first],
+        )
+      ).rows[0].pending,
+      null,
+    );
     fallbackOnly = true;
     const repeat = await complete(first, 100);
     await processMergeTriage(db);

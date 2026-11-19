@@ -1,3 +1,5 @@
+import { createHash, randomUUID } from "node:crypto";
+
 import { and, eq } from "drizzle-orm";
 
 import {
@@ -27,6 +29,13 @@ type Repo = typeof repositories.$inferSelect;
 type ProviderClient = Awaited<ReturnType<typeof triageForge>>;
 
 const reservationWaitMs = 120_000;
+
+const maxPendingEditReceipts = 32;
+
+/** Identify the exact body sent by one edit, including its unique hidden receipt. */
+function editDigest(body: string) {
+  return createHash("sha256").update(body).digest("hex");
+}
 
 /** Reconcile an already-fenced owned comment before creating or editing the single persistent escalation. */
 export async function syncEscalation(
@@ -179,6 +188,19 @@ export async function syncEscalation(
     if (!(await save(saved))) return;
     current = { id, body: reservation, user: bot };
   }
+  // The provider transport sends each mutation once. Readback of this exact
+  // body settles that edit only, even if a newer decision is already due.
+  if (Array.isArray(saved.uncertainEdit)) {
+    const observed = editDigest(current.body);
+    if (saved.uncertainEdit.includes(observed)) {
+      const remaining = saved.uncertainEdit.filter((hash) => hash !== observed);
+      saved = {
+        ...saved,
+        uncertainEdit: remaining.length ? remaining : undefined,
+      };
+      if (!(await save(saved))) return;
+    }
+  }
   const reviewers: string[] = [];
   if (human) {
     const allowed = new Set(
@@ -220,23 +242,35 @@ export async function syncEscalation(
   const withMentions = renderMergeEscalation(options);
   const mention = human && !saved.mentioned && reviewers.length > 0;
   const body = renderMergeEscalation({ ...options, mention });
-  if (current.body === body || current.body === withMentions) {
+  // Receipts identify individual deliveries; they do not change the decision.
+  const displayed = current.body.replace(
+    /\n<!-- razbor-edit:[0-9a-f-]{36} -->(?=\n<!-- razbor:pr_[A-Za-z0-9]{16}:escalation -->$)/,
+    "",
+  );
+  if (displayed === body || displayed === withMentions) {
     if (saved.shownBody !== current.body)
       await save({
         ...saved,
         shownBody: current.body,
         mentioned:
           saved.mentioned ||
-          (reviewers.length > 0 && current.body === withMentions),
+          (reviewers.length > 0 && displayed === withMentions),
       });
     return;
   }
-  // Commit the write intent first. An ambiguous edit may arrive after a
-  // confirmed correction, including after this PR closes.
+  const wireBody =
+    body.slice(0, -marker.length) +
+    `<!-- razbor-edit:${randomUUID()} -->\n${marker}`;
+  const pendingEdits = saved.uncertainEdit || [];
+  // Legacy unknown writes and an exceptional backlog retain the conservative
+  // fence. A normal acknowledgement below removes only the new edit's intent.
   const intent: EscalationComment = {
     ...saved,
     mentioned: saved.mentioned || mention,
-    uncertainEdit: true,
+    uncertainEdit:
+      pendingEdits === true || pendingEdits.length >= maxPendingEditReceipts
+        ? true
+        : [...pendingEdits, editDigest(wireBody)],
   };
   if (!(await save(intent))) return;
   const id = current.id;
@@ -253,7 +287,7 @@ export async function syncEscalation(
           id,
           bot.id,
           expectedMarker,
-          body,
+          wireBody,
         );
       } catch (error) {
         if (!(error instanceof ForgeOperationError) || error.uncertain)
@@ -271,7 +305,7 @@ export async function syncEscalation(
         .set({
           escalationComment: {
             ...saved,
-            shownBody: body,
+            shownBody: wireBody,
             mentioned: intent.mentioned,
           },
         })
