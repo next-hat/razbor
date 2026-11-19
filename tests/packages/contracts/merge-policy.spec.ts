@@ -702,6 +702,14 @@ test("reviewer selection, fallback, and comment reconciliation only mention boun
   });
   assert.ok(long.includes("@" + longLogin));
   assert.deepEqual(body.match(/@[\w.-]+/g), ["@alice"]);
+  const capped = renderMergeEscalation({
+    ...comment,
+    decision: {
+      ...comment.decision,
+      reviewers: ["alice", "bob", "chris", "dana"],
+    },
+  });
+  assert.deepEqual(capped.match(/@[\w.-]+/g), ["@alice", "@bob", "@chris"]);
   assert.equal(body.includes("\n/"), false);
   assert.ok(body.includes(comment.headSha) && body.endsWith(comment.marker));
   assert.doesNotMatch(

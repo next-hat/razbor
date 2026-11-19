@@ -59,6 +59,8 @@ If you ran an earlier Phase 3 preview, disable automation before upgrading, then
 
 The server reconciles published findings, including open and uncertain findings from earlier runs, before checking the forge. High or critical risk, affected critical areas, incomplete investigation, and an explicit request for human review all require a human. Markdown can explain project criticality. The server owns authorization and enforces the saved structured policy and provider protections.
 
+A review started from a PR in the console can also leave outstanding findings. A later review of that PR receives their saved identities and can mark each occurrence resolved with evidence. When the findings exceed the context limit, successive reviews can assess them in batches. Every occurrence still counts in the merge decision until it has a matching resolution. A single historical finding larger than the entire context limit continues to require human review.
+
 Razbor ranks owners whose patterns match the pinned Git comparison first. A deleted file uses its original path, and a rename can select owners of both paths. The next candidates are allowlisted people suggested by the model or matched by a risk category. Configuration order breaks ties within each group. Reviews completed before path matching was available use their recorded assessments; a fresh review computes path ownership.
 
 Razbor can mention up to three configured individual accounts in its durable escalation comment. It checks ranked candidates against the provider until three accounts are verified. If none resolve, it tries a configured fallback. The bot updates its original comment with the reviewed commit and reasons. Repeated observations of the same decision do not generate another mention. Once escalated under an enabled policy, the PR stays in the provider’s human-controlled workflow. Razbor withdraws any earlier vote, including on the same commit, and reports when the forge cannot confirm its withdrawal. Keep the PR in human review until that vote has been settled.
@@ -79,7 +81,28 @@ For new escalations, Razbor reserves a comment without mentioning anyone, saves 
 
 Each edit carries a unique hidden receipt. Razbor records the hash of the complete outgoing comment and its mention attempt before sending the edit. A definitive rejection restores the mention for a retry. After a timeout, Razbor can update the decision without repeating the mention. When it reads the exact edit back on the same bot-owned comment, it clears that receipt. If a late edit restored an older decision, Razbor corrects the comment. A settled PR stops its hourly edit checks once every outstanding receipt has been accounted for.
 
-Razbor keeps checking when an edit may still arrive. Older installations recorded ambiguous edits without receipts. Razbor uses the same conservative recovery if more than 32 edits to one comment are simultaneously unconfirmed. Confirmed deletion retires all outstanding edits for that comment ID. To retire an unresolved check manually, drain the dispatcher, confirm in the provider request history that all prior edits to that ID have completed, and verify that the note matches the saved `shownBody`. A database operator can then remove only the `uncertainEdit` key from that PR’s `escalation_comment` and set `merge_after = now()` before restarting the dispatcher.
+Two edits can finish between reads. The provider may then display only the later edit, leaving the earlier receipt pending. To settle an individual receipt, drain all dispatchers and identify the repository, PR, bot and comment at the provider. Check the provider's request records for the exact outgoing body, including its hidden edit ID. Match its SHA-256 digest to the saved receipt and verify the request completed or was definitively rejected and can no longer arrive. Record the outcome and evidence in the incident.
+
+In a database maintenance transaction, bind `$1` to the PR public ID, `$2` to the bot ID, `$3` to the remote comment ID and `$4` to the verified lowercase hex digest. Run this once per verified receipt. Commit only if the update returns the expected PR and remaining receipts. Roll back on a mismatch. Resume the dispatcher so it can restore the current decision.
+
+```sql
+UPDATE pull_requests
+SET escalation_comment = CASE
+      WHEN jsonb_array_length(escalation_comment->'uncertainEdit') = 1
+        THEN escalation_comment - 'uncertainEdit'
+      ELSE jsonb_set(escalation_comment, '{uncertainEdit}',
+                     (escalation_comment->'uncertainEdit') - $4::text)
+    END,
+    merge_after = now()
+WHERE public_id = $1 AND escalation_comment->>'botId' = $2
+  AND escalation_comment->>'remoteId' = $3
+  AND jsonb_typeof(escalation_comment->'uncertainEdit') = 'array'
+  AND $4::text ~ '^[0-9a-f]{64}$'
+  AND (escalation_comment->'uncertainEdit') ? $4::text
+RETURNING public_id, escalation_comment->'uncertainEdit' AS remaining_receipts;
+```
+
+Older installations recorded ambiguous edits without receipts. Razbor uses the same recovery if more than 32 edits to one comment are simultaneously unconfirmed. For a boolean `uncertainEdit`, drain the dispatchers, verify in the provider request records that **all** prior edits to that comment ID have settled, and check the note against the saved `shownBody`. A database operator can then remove that flag for the verified PR, bot and comment, set `merge_after = now()`, and resume the dispatcher. Confirmed deletion also retires outstanding edits for that comment ID.
 
 While human review is required, Razbor periodically checks that its note still exists. Recreating a confirmed deleted note preserves its notification history. Older installations that already sent a direct notification retain the original write fence until an exact bot-owned note is found or the operator confirms a definitive provider rejection from its request logs.
 
@@ -95,5 +118,7 @@ WHERE public_id = $1
   AND escalation_comment->>'remoteId' IS NULL
 RETURNING public_id;
 ```
+
+This recovery preserves the one-mention limit. If the provider confirmed that no notification reached the reviewers, notify them manually after resuming the dispatcher.
 
 The supported configuration differs by provider. See [provider protection, permissions and limitations](merge-providers.md).
