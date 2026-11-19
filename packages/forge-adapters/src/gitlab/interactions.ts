@@ -33,6 +33,7 @@ import { resolveReviewer } from "@forge-adapters/src/merge.js";
 import {
   approveGitlabReview,
   inspectGitlabApproval,
+  retireGitlabApproval,
 } from "@forge-adapters/src/gitlab/approval.js";
 import {
   inspectGitlabMerge,
@@ -398,6 +399,25 @@ export class GitlabForge implements Forge {
       reconcileOnly,
       beforeWrite,
       acknowledged,
+    );
+  }
+
+  /** Withdraw an acknowledged vote using only the account that submitted it. */
+  retireApproval(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    acknowledged: boolean,
+    beforeWrite: () => Promise<void>,
+    withdrawalUncertain = false,
+  ) {
+    return retireGitlabApproval(
+      this.transport,
+      this.route,
+      request,
+      bot,
+      acknowledged,
+      beforeWrite,
+      withdrawalUncertain,
     );
   }
 

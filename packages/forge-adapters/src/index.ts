@@ -91,6 +91,7 @@ export type {
   Forge,
   ForgeActor,
   ForgeApprovalResult,
+  ForgeApprovalRetirement,
   ForgeChange,
   ForgeMergeCheckpoint,
   ForgeMergeRequest,

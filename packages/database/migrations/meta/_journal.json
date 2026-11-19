@@ -260,6 +260,13 @@
       "when": 1790000000037,
       "tag": "0036_forge_approval",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1790000000038,
+      "tag": "0037_reconcile_forge_authority",
+      "breakpoints": true
     }
   ]
 }

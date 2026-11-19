@@ -165,6 +165,8 @@ export function selectMergeReviewers(
 }
 
 const humanReasons = {
+  approval_retirement_pending:
+    "An earlier Razbor approval may still count on the forge. Wait for its withdrawal and obtain a human review before merging.",
   missing_policy_snapshot: "This review has no saved merge policy.",
   missing_assessment: "This review has no merge readiness assessment.",
   confidence_below_threshold:
@@ -369,6 +371,8 @@ function commentLiteral(text: string): string {
 }
 
 export const forgeMergeReasonMessages = {
+  github_schedule_owner_unbound:
+    "GitHub cannot bind the eligibility check to Razbor’s native merge request. Complete the merge through the human workflow.",
   approval_unsupported:
     "The provider cannot safely approve this reviewed revision.",
   approval_actor_unavailable:

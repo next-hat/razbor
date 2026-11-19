@@ -281,6 +281,11 @@ export class ForgejoInteractions implements Forge {
     return "unsupported";
   }
 
+  /** Forgejo cannot verify or retire a recorded approval under the supported API. */
+  async retireApproval(): Promise<"unconfirmed"> {
+    return "unconfirmed";
+  }
+
   /** Both inspected Forgejo releases persist a PR ID without its reviewed head in scheduled merges. */
   async inspectMerge(request: ForgeMergeRequest) {
     mergeRequestSchema.parse(request);

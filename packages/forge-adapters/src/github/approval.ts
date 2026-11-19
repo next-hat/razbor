@@ -15,6 +15,7 @@ import {
   ForgeOperationError,
   type ForgeActor,
   type ForgeApprovalResult,
+  type ForgeApprovalRetirement,
   type ForgeMergeRequest,
   type ForgeMergeState,
 } from "@forge-adapters/src/interactions.js";
@@ -34,7 +35,7 @@ const query = `query RazborApproval($owner:String!, $name:String!, $number:Int!,
       isInMergeQueue autoMergeRequest{enabledAt} mergeable mergeStateStatus reviewDecision
       headRepository{databaseId} headRef{branchProtectionRule{${lockFields}}}
       commits(last:1){nodes{commit{oid status{contexts{context state}}}}}
-      baseRef{branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiredStatusChecks{context app{databaseId}}}}
+      baseRef{refUpdateRule{viewerAllowedToDismissReviews} branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiredStatusChecks{context app{databaseId}}}}
       reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved}}
       latestOpinionatedReviews(first:100){pageInfo{hasNextPage} nodes{state}}
       reviews(last:100,author:$bot){pageInfo{hasPreviousPage} nodes{body state commit{oid} author{... on Bot{databaseId}}}}
@@ -89,6 +90,9 @@ const approvalRepository = z.object({
         .length(1),
     }),
     baseRef: z.object({
+      refUpdateRule: z
+        .object({ viewerAllowedToDismissReviews: z.boolean() })
+        .nullable(),
       branchProtectionRule: z
         .object({
           isAdminEnforced: z.boolean(),
@@ -188,6 +192,8 @@ export async function inspectGithubApproval(
       pullId: pr.id,
       previous,
     };
+  if (!pr.baseRef.refUpdateRule?.viewerAllowedToDismissReviews)
+    return { decision: mergeState("blocked", "approval_actor_unavailable") };
   if (pr.isInMergeQueue || pr.autoMergeRequest)
     return { decision: mergeState("blocked", "existing_schedule") };
   if (
@@ -212,7 +218,7 @@ export async function inspectGithubApproval(
     !["CLEAN", "BLOCKED", "UNSTABLE"].includes(pr.mergeStateStatus)
   )
     return { decision: mergeState("blocked", "merge_restrictions") };
-  const rules = await rulesetChecks(api, request, true);
+  const rules = await rulesetChecks(api, request);
   const classic = pr.baseRef.branchProtectionRule;
   const sourceLocked =
     pr.headRepository?.databaseId === repo.databaseId &&
@@ -272,7 +278,6 @@ export async function inspectGithubApproval(
         ),
     ),
     runs,
-    false,
     api.app.appId,
   );
   if (unmet) return { decision: unmet };
@@ -350,4 +355,131 @@ export async function approveGithubReview(
   )
     throw new ForgeOperationError("invalid-response", true);
   return "approved";
+}
+
+const markedVote = vote.extend({ id: z.string().min(1) });
+
+const retirementPage = z.object({
+  repository: z.object({
+    databaseId: mergeId,
+    pullRequest: z.object({
+      id: z.string().min(1),
+      number: mergeId,
+      state: z.enum(["OPEN", "CLOSED", "MERGED"]),
+      reviews: z.object({
+        pageInfo: z.object({
+          hasNextPage: z.boolean(),
+          endCursor: z.string().nullable(),
+        }),
+        nodes: z.array(markedVote),
+      }),
+    }),
+  }),
+});
+
+/** Locate the earlier marked review even after a retarget or push, and dismiss only its immutable ID. */
+export async function retireGithubApproval(
+  api: GithubApi,
+  request: ForgeMergeRequest,
+  bot: ForgeActor,
+  acknowledged: boolean,
+  beforeWrite: () => Promise<void>,
+): Promise<ForgeApprovalRetirement> {
+  mergeRequestSchema.parse(request);
+  if (
+    !api.app ||
+    api.app.id !== bot.id ||
+    api.app.login.toLowerCase() !== bot.login.toLowerCase()
+  )
+    return "unconfirmed";
+  const marker = approvalMarker(request);
+  const votes: z.infer<typeof markedVote>[] = [];
+  let after: string | null = null;
+  let pullId: string | undefined;
+  for (let page = 0; page < 20; page++) {
+    const { repository } = retirementPage.parse(
+      await api.graphql(
+        `query RazborRetireApproval($owner:String!,$name:String!,$number:Int!,$bot:String!,$after:String) {
+        repository(owner:$owner,name:$name) { databaseId pullRequest(number:$number) {
+          id number state reviews(first:100,author:$bot,after:$after) {
+            pageInfo{hasNextPage endCursor} nodes{id state body commit{oid} author{... on Bot{databaseId}}}
+          }
+        }}
+      }`,
+        {
+          owner: api.owner,
+          name: api.name,
+          number: request.number,
+          bot: bot.login,
+          after,
+        },
+      ),
+    );
+    const pr = repository.pullRequest;
+    if (
+      repository.databaseId !== request.externalRepositoryId ||
+      pr.number !== String(request.number) ||
+      (pullId && pr.id !== pullId)
+    )
+      return "unconfirmed";
+    if (pr.state === "MERGED") return "retired";
+    pullId = pr.id;
+    votes.push(
+      ...pr.reviews.nodes.filter(
+        (v) =>
+          v.author?.databaseId === bot.id && v.commit?.oid === request.headSha,
+      ),
+    );
+    if (!pr.reviews.pageInfo.hasNextPage) break;
+    const next = pr.reviews.pageInfo.endCursor;
+    if (!next || next === after || page === 19) return "unconfirmed";
+    after = next;
+  }
+  const owned = votes.filter((v) => v.body.endsWith(marker));
+  if (!owned.length)
+    return acknowledged && !votes.some((v) => v.state === "APPROVED")
+      ? "retired"
+      : "unconfirmed";
+  if (owned.length !== 1) return "unconfirmed";
+  const review = owned[0];
+  if (review.state === "DISMISSED") return "retired";
+  if (review.state !== "APPROVED") return "unconfirmed";
+  await beforeWrite();
+  const response = z
+    .object({
+      dismissPullRequestReview: z.object({
+        pullRequestReview: markedVote.extend({
+          pullRequest: z.object({ id: z.string() }),
+        }),
+      }),
+    })
+    .safeParse(
+      await api.graphql(
+        `mutation RazborDismissApproval($id:ID!, $message:String!) {
+      dismissPullRequestReview(input:{pullRequestReviewId:$id,message:$message}) {
+        pullRequestReview{id state body commit{oid} author{... on Bot{databaseId}} pullRequest{id}}
+      }
+    }`,
+        {
+          id: review.id,
+          message:
+            "Razbor withdrew its approval after the review or repository policy changed.",
+        },
+        true,
+      ),
+    );
+  const dismissed = response.success
+    ? response.data.dismissPullRequestReview.pullRequestReview
+    : undefined;
+  if (
+    !dismissed ||
+    dismissed.id !== review.id ||
+    dismissed.pullRequest.id !== pullId ||
+    dismissed.state !== "DISMISSED" ||
+    dismissed.author?.databaseId !== bot.id ||
+    dismissed.commit?.oid !== request.headSha ||
+    !dismissed.body.endsWith(marker)
+  )
+    throw new ForgeOperationError("invalid-response", true);
+  return "retired";
 }

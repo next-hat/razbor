@@ -759,6 +759,9 @@ export const reviews = pgTable(
     forgeApproval: jsonb("forge_approval").$type<{
       botId: string;
       status: ReviewApprovalStatus;
+      retiring?: boolean;
+      retirementSent?: boolean;
+      retireAfter?: number;
     }>(),
     mergeDecision: jsonb("merge_decision").$type<MergeDecision>(),
     mergeAction: text("merge_action").$type<

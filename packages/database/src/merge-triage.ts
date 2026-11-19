@@ -22,9 +22,11 @@ import {
   withCurrentMergeReview,
 } from "@database/src/merge-policy.js";
 import {
+  hasRetiringApproval,
   mergeRequest,
   retireMerge,
   retireOrphanedCheck,
+  retireReviewApprovals,
 } from "@database/src/merge-recovery.js";
 import {
   dispatchOutbox,
@@ -104,6 +106,8 @@ async function writeGuardedMerge(
             and(eq(reviews.id, review.id), eq(reviews.mergeAction, "writing")),
           );
         if (!armed || armed.stage !== stage) return false;
+        if (await hasRetiringApproval(tx, pr.id))
+          throw new ForgeOperationError("permission");
         /** Durably fence every mutating step before sending its HTTP request. */
         async function checkpoint(next: ForgeMergeWriteStage) {
           if (
@@ -395,6 +399,18 @@ async function triagePullRequest(database: Database, prId: string) {
       ),
     );
   try {
+    // A recap's historical findings can already have been resolved. Revoke for
+    // those only once the current provider audit confirms human review is needed.
+    const withdrawAll =
+      pr.humanEscalated ||
+      (decision.status === "human_review_required" && !onlyHistoricalChecks);
+    let withdrawalPending = await withCurrentMergeReview(
+      database,
+      repo,
+      pr,
+      review,
+      (tx) => retireReviewApprovals(database, tx, repo, pr.id, withdrawAll),
+    );
     for (const old of older) {
       let retired = false;
       try {
@@ -512,8 +528,22 @@ async function triagePullRequest(database: Database, prId: string) {
           ));
         input.outstandingFindingsAudited = true;
         if (
+          input.outstandingFindings &&
+          !withdrawAll &&
+          withdrawalPending === undefined
+        ) {
+          withdrawalPending = await withCurrentMergeReview(
+            database,
+            repo,
+            pr,
+            review,
+            (tx) => retireReviewApprovals(database, tx, repo, pr.id, true),
+          );
+        }
+        if (
           snapshot.policy.enabled &&
           snapshot.policy.autoApprove &&
+          withdrawalPending === undefined &&
           snapshot.version === repo.mergePolicyVersion &&
           input.revisionCurrent &&
           !input.humanEscalated &&
@@ -581,7 +611,15 @@ async function triagePullRequest(database: Database, prId: string) {
           decision.reasons = [
             { code: state.reason, message: forgeMergeReason(state.reason) },
           ];
-        if (
+        if (fenced && state.reason === "github_schedule_owner_unbound") {
+          if (await retireMerge(database, repo, pr, review, async () => api))
+            return;
+          decision = reason(
+            "blocked",
+            "write_uncertain",
+            "Resolve the earlier GitHub native request and its eligibility check before merging.",
+          );
+        } else if (
           fenced &&
           snapshot.policy.autoApprove &&
           approval?.status !== "approved" &&
@@ -696,6 +734,8 @@ async function triagePullRequest(database: Database, prId: string) {
     }
     if (!fenced && snapshot?.policy.dryRun && state?.state === "blocked")
       retry = false;
+    if (!fenced && state?.reason === "github_schedule_owner_unbound")
+      retry = false;
     if (
       !fenced &&
       !snapshot?.policy.dryRun &&
@@ -709,6 +749,18 @@ async function triagePullRequest(database: Database, prId: string) {
         "The requested approval has not been confirmed for this revision.",
       );
       retry = false;
+    }
+    if (withdrawalPending !== undefined) {
+      const pending = reason(
+        "blocked",
+        "approval_retirement_pending",
+        "An earlier Razbor approval may still count on the forge. Wait for its withdrawal and obtain a human review before merging.",
+      );
+      if (decision.status === "human_review_required")
+        decision.reasons.push(...pending.reasons);
+      else decision = pending;
+      approval = undefined;
+      if (!fenced) retry = false;
     }
     let human =
       decision.status === "human_review_required" &&
@@ -770,12 +822,17 @@ async function triagePullRequest(database: Database, prId: string) {
     }
     const send =
       decision.status === "auto_merge_eligible" &&
+      withdrawalPending === undefined &&
       (!snapshot?.policy.autoApprove || approval?.status === "approved") &&
       action !== "dry_run" &&
       action !== "scheduled" &&
       state?.state === "ready";
     const writeStage = !fenced && send ? "prepared" : review.mergeWriteStage;
     if (send) action = "writing";
+    const approvalRetryAt =
+      withdrawalPending !== undefined
+        ? new Date(Date.now() + 60_000)
+        : approval?.retryAt;
     const saved = await withCurrentMergeReview(
       database,
       repo,
@@ -807,7 +864,7 @@ async function triagePullRequest(database: Database, prId: string) {
               human ||
               reportDryRun ||
               pr.escalationComment ||
-              approval?.retryAt
+              approvalRetryAt
                 ? new Date(Date.now() + retryMs)
                 : null,
           })
@@ -846,7 +903,7 @@ async function triagePullRequest(database: Database, prId: string) {
       (human ||
         reportDryRun ||
         pr.escalationComment ||
-        approval?.retryAt ||
+        approvalRetryAt ||
         nativeRetryAt)
     ) {
       // Successful dry-run delivery sleeps until a real state change. Keep
@@ -856,7 +913,7 @@ async function triagePullRequest(database: Database, prId: string) {
         await tx
           .update(pullRequests)
           .set({
-            mergeAfter: sql`least(${next}, ${approval?.retryAt?.toISOString() ?? null}::timestamptz, ${nativeRetryAt?.toISOString() ?? null}::timestamptz)`,
+            mergeAfter: sql`least(${next}, ${approvalRetryAt?.toISOString() ?? null}::timestamptz, ${nativeRetryAt?.toISOString() ?? null}::timestamptz)`,
           })
           .where(eq(pullRequests.id, pr.id));
       });

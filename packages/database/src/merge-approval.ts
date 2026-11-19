@@ -12,6 +12,7 @@ import {
 
 import type { Database } from "@database/src/connection.js";
 import { withCurrentMergeReview } from "@database/src/merge-policy.js";
+import { hasRetiringApproval } from "@database/src/merge-recovery.js";
 import { pullRequests, repositories, reviews } from "@database/src/schema.js";
 import type { triageForge } from "@database/src/webhooks.js";
 
@@ -29,6 +30,7 @@ export async function syncReviewApproval(
   reconcileOnly: boolean,
 ): Promise<ApprovalResult | undefined> {
   return withCurrentMergeReview(database, repo, pr, review, async (tx) => {
+    if (await hasRetiringApproval(tx, pr.id)) return { status: "unavailable" };
     // A fresh review on the same head must not duplicate a late vote, restore a
     // withdrawn vote or count a different installation as a second approver.
     const [previous] = await tx

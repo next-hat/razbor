@@ -17,7 +17,6 @@ import {
   type Forge,
   type ForgeActor,
   type ForgeChange,
-  type ForgeMergeCheckpoint,
   type ForgeMergeRequest,
   type ForgePullRequest,
   type ForgeReviewComment,
@@ -33,10 +32,10 @@ import { resolveReviewer } from "@forge-adapters/src/merge.js";
 import {
   approveGithubReview,
   inspectGithubApproval,
+  retireGithubApproval,
 } from "@forge-adapters/src/github/approval.js";
 import {
   inspectGithubMerge,
-  scheduleGithubMerge,
   cancelGithubMerge,
 } from "@forge-adapters/src/github/merge.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
@@ -313,9 +312,9 @@ export class GithubForge implements Forge {
     });
   }
 
-  /** Read native branch protection, review and revocable eligibility evidence. */
-  async inspectMerge(request: ForgeMergeRequest) {
-    return (await inspectGithubMerge(this.mergeApi(), request)).decision;
+  /** Read terminal PR state and evidence for retiring a legacy native merge. */
+  inspectMerge(request: ForgeMergeRequest) {
+    return inspectGithubMerge(this.mergeApi(), request);
   }
 
   /** Check review and CI readiness independently of native merge permissions. */
@@ -342,18 +341,25 @@ export class GithubForge implements Forge {
     );
   }
 
-  /** Enable native auto-merge while the exact revision's check is pending. */
-  scheduleMerge(
+  /** Dismiss an exact marked review by its immutable GitHub node ID. */
+  retireApproval(
     request: ForgeMergeRequest,
-    resumeOnly = false,
-    checkpoint?: ForgeMergeCheckpoint,
+    bot: ForgeActor,
+    acknowledged: boolean,
+    beforeWrite: () => Promise<void>,
   ) {
-    return scheduleGithubMerge(
+    return retireGithubApproval(
       this.mergeApi(),
       request,
-      resumeOnly,
-      checkpoint,
+      bot,
+      acknowledged,
+      beforeWrite,
     );
+  }
+
+  /** GitHub cannot bind a successful Check Run to the owner of a particular native schedule. */
+  async scheduleMerge(): Promise<never> {
+    throw new ForgeOperationError("unsupported");
   }
 
   /** Revoke the saved review's App check without mutating a human's schedule. */

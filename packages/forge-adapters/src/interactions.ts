@@ -6,6 +6,8 @@ export type ForgeActor = { id: string; login: string };
 export type ForgeApprovalResult =
   "approved" | "absent" | "unsupported" | "stale" | "dismissed";
 
+export type ForgeApprovalRetirement = "retired" | "unconfirmed";
+
 export type ForgeChange = {
   number: number;
   /** Only an explicit false from the provider authorizes an automatic review. */
@@ -306,6 +308,14 @@ export interface Forge {
     beforeWrite: () => Promise<void>,
     acknowledged?: boolean,
   ): Promise<ForgeApprovalResult>;
+  /** Remove only the bound bot's earlier vote. A missing vote cannot settle an unacknowledged submission. */
+  retireApproval(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    acknowledged: boolean,
+    beforeWrite: () => Promise<void>,
+    withdrawalUncertain?: boolean,
+  ): Promise<ForgeApprovalRetirement>;
   /** Revalidate immediately and schedule only a guarded, non-bypassing native operation. */
   scheduleMerge(
     request: ForgeMergeRequest,

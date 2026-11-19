@@ -63,55 +63,29 @@ function fakeFetch(
   });
 }
 
-const locked = {
-  pattern: "**/*",
-  lockBranch: true,
-  isAdminEnforced: true,
-  lockAllowsFetchAndMerge: false,
-  allowsDeletions: false,
-  allowsForcePushes: false,
-  restrictsPushes: false,
-  pushAllowances: { pageInfo: { hasNextPage: false }, nodes: [] },
-};
-
 const checkName = "Razbor / merge eligibility";
 
-/** Model the native App check separately from PR-specific auto-merge state to exercise recovery boundaries. */
+/** A persisted eligibility run from an older dispatcher on the reviewed commit. */
+function legacyCheck(id: number, reviewId = request.reviewId) {
+  return {
+    id,
+    name: checkName,
+    app: { id: 1 },
+    head_sha: headSha,
+    external_id: `razbor/10/7/${baseSha}/${reviewId}`,
+    status: "in_progress",
+    conclusion: null as string | null,
+  };
+}
+
+/** Supply only the reads and the cancellation PATCH needed for legacy GitHub reconciliation. */
 function githubFixture(t: TestContext) {
   const pr = {
-    id: "NODE7",
     number: 7,
     state: "OPEN",
-    isDraft: false,
     headRefOid: headSha,
-    headRepository: { databaseId: 10 },
     baseRefOid: baseSha,
     baseRefName: "main",
-    viewerCanMergeAsAdmin: false,
-    viewerCanEnableAutoMerge: true,
-    reviewDecision: null as string | null,
-    mergeable: "MERGEABLE",
-    mergeStateStatus: "BLOCKED",
-    mergeQueue: null,
-    headRef: {
-      branchProtectionRule: { ...locked },
-      target: { oid: headSha, parents: { nodes: [{ oid: baseSha }] } },
-    },
-    baseRef: {
-      branchProtectionRule: {
-        pattern: "main",
-        isAdminEnforced: true,
-        allowsForcePushes: false,
-        allowsDeletions: false,
-        requiresStatusChecks: true,
-        requiresConversationResolution: true as boolean | undefined,
-        requiresStrictStatusChecks: true,
-        requiredStatusChecks: [
-          { context: checkName, app: { databaseId: 1 } },
-          { context: "CI", app: { databaseId: 3 } },
-        ],
-      },
-    },
     autoMergeRequest: null as null | {
       enabledBy: { databaseId: number };
       mergeMethod: string;
@@ -120,332 +94,160 @@ function githubFixture(t: TestContext) {
   const repo = {
     databaseId: 10,
     defaultBranchRef: { name: "main" },
-    autoMergeAllowed: true,
-    mergeCommitAllowed: true,
-    rebaseMergeAllowed: true,
-    squashMergeAllowed: true,
-    pullRequests: {
-      pageInfo: { hasNextPage: false },
-      nodes: [{ number: 7, headRefOid: headSha }],
-    },
-    branchProtectionRules: {
-      pageInfo: { hasNextPage: false },
-      nodes: [structuredClone(locked)],
-    },
     pullRequest: pr,
   };
-  const runs = [
-    {
-      id: 1,
-      name: "CI",
-      app: { id: 3 },
-      head_sha: headSha,
-      external_id: "ci",
-      status: "completed",
-      conclusion: "success" as string | null,
-    },
-  ];
+  const runs: ReturnType<typeof legacyCheck>[] = [];
   const mutations: string[] = [];
   const flags = {
-    rulesetBypass: "never",
-    dedicatedGate: false,
-    conversationRuleset: false,
-    armResponse: undefined as Response | undefined,
-    loseArmResponse: false,
-    moveHeadOnArm: false,
-    loseCreateResponse: false,
+    suiteCount: 1,
+    truncated: false,
     loseRetireResponse: false,
-    delayRelease: false,
-    checkSuiteCount: 1,
-    secondCheckPage: undefined as
-      { total_count: number; check_runs: typeof runs } | undefined,
+    rejection: undefined as Response | undefined,
   };
   fakeFetch(t, (path, method, body) => {
-    if (path === "/api/graphql" && String(body.query).startsWith("query ")) {
-      if (String(body.query).includes("viewerCanEnableAutoMerge"))
-        assert.match(
-          String(body.query),
-          /baseRef\s*\{\s*branchProtectionRule\s*\{[^{}]*\brequiresConversationResolution\b/,
-        );
+    if (path === "/api/graphql" && String(body.query).startsWith("query "))
       return { data: { repository: repo } };
-    }
-    if (
-      path === "/api/graphql" &&
-      String(body.query).includes("enablePullRequestAutoMerge")
-    ) {
-      mutations.push("arm");
-      assert.deepEqual(body.variables, {
-        input: {
-          pullRequestId: "NODE7",
-          expectedHeadOid: headSha,
-          mergeMethod: "SQUASH",
-          clientMutationId: runs.at(-1)?.external_id.split("/").at(-1),
-        },
-      });
-      assert.equal(runs.at(-1)?.status, "in_progress");
-      if (flags.armResponse) return flags.armResponse;
-      if (flags.moveHeadOnArm) {
-        pr.headRefOid = "c".repeat(40);
-        return { errors: [{ message: "head changed" }] };
-      }
-      pr.autoMergeRequest = {
-        enabledBy: { databaseId: 2 },
-        mergeMethod: "SQUASH",
-      };
-      if (flags.loseArmResponse) throw new Error("connection dropped");
-      return {
-        data: { enablePullRequestAutoMerge: { pullRequest: { id: pr.id } } },
-      };
-    }
     const route = "/api/v3/repos/team/project";
-    if (path === route) return { id: 10 };
-    if (path.startsWith(route + "/rules/branches/main?"))
-      return [
-        ...(flags.dedicatedGate
-          ? [
-              {
-                type: "required_status_checks",
-                ruleset_id: 70,
-                parameters: {
-                  required_status_checks: [
-                    { context: checkName, integration_id: 1 },
-                  ],
-                },
-              },
-            ]
-          : []),
-        ...(flags.conversationRuleset
-          ? [
-              {
-                type: "pull_request",
-                ruleset_id: 70,
-                parameters: { required_review_thread_resolution: true },
-              },
-            ]
-          : []),
-      ];
-    if (path === route + "/rulesets/70")
-      return {
-        id: 70,
-        target: "branch",
-        enforcement: "active",
-        current_user_can_bypass: flags.rulesetBypass,
-      };
-    if (path === `${route}/commits/${headSha}/check-suites?per_page=1`)
-      return {
-        total_count: flags.checkSuiteCount,
-        check_suites: [{ head_sha: headSha }],
-      };
-    if (path.startsWith(`${route}/commits/${headSha}/check-runs?`)) {
+    if (method === "GET" && path === route) return { id: repo.databaseId };
+    if (
+      method === "GET" &&
+      path.startsWith(`${route}/commits/${headSha}/check-runs?`)
+    ) {
       const params = new URLSearchParams(path.split("?")[1]);
-      const page = Number(params.get("page") ?? 1);
+      assert.equal(params.get("filter"), "all");
+      assert.equal(params.get("app_id"), "1");
       assert.equal(params.get("per_page"), "100");
-      if (page === 2 && flags.secondCheckPage) return flags.secondCheckPage;
-      let found = runs;
-      if (params.get("filter") === "all") {
-        assert.equal(params.get("app_id"), "1");
-        found = runs.filter(
-          (row) => row.app.id === 1 && row.name === params.get("check_name"),
-        );
-      }
+      const found = runs.filter(
+        (r) => r.name === params.get("check_name") && r.app.id === 1,
+      );
+      const offset = (Number(params.get("page")) - 1) * 100;
       return {
         total_count: found.length,
-        check_runs: found.slice((page - 1) * 100, page * 100),
+        check_runs:
+          flags.truncated && offset ? [] : found.slice(offset, offset + 100),
       };
     }
-    if (method === "POST" && path === `${route}/check-runs`) {
-      mutations.push("create_pending");
-      assert.equal(body.head_sha, headSha);
-      assert.equal(body.status, "in_progress");
-      const id = runs.length + 1;
-      runs.push({
-        id,
-        name: String(body.name),
-        app: { id: 1 },
-        external_id: String(body.external_id),
-        head_sha: headSha,
-        status: String(body.status),
-        conclusion: null,
-      });
-      if (flags.loseCreateResponse)
-        throw new Error("check acknowledgement lost");
-      return { id };
+    if (
+      method === "GET" &&
+      path === `${route}/commits/${headSha}/check-suites?per_page=1`
+    )
+      return {
+        total_count: flags.suiteCount,
+        check_suites: [{ head_sha: headSha }],
+      };
+    const gate = runs.find((run) => path === `${route}/check-runs/${run.id}`);
+    if (gate && method === "PATCH" && body.conclusion === "cancelled") {
+      mutations.push(`cancel ${gate.id}`);
+      if (flags.rejection) return flags.rejection;
+      Object.assign(gate, body);
+      if (flags.loseRetireResponse)
+        throw new Error("cancellation acknowledgement lost");
+      return gate;
     }
-    const run = runs.find((item) => path === `${route}/check-runs/${item.id}`);
-    if (method === "PATCH" && run) {
-      mutations.push(String(body.conclusion));
-      if (body.conclusion === "success" && flags.delayRelease)
-        throw new Error("eligibility release still in flight");
-      Object.assign(run, body);
-      if (
-        body.name === "Razbor / retired merge eligibility" &&
-        flags.loseRetireResponse
-      )
-        throw new Error("retirement acknowledgement lost");
-      return run;
-    }
-    assert.fail(`unexpected ${method} ${path}`);
+    mutations.push(`${method} ${path}`);
+    assert.fail(
+      "legacy reconciliation attempted an unexpected provider operation",
+    );
   });
   return { api: forge("github"), repo, pr, runs, mutations, flags };
 }
 
-test("GitHub checks the pinned App, all verified checks, protection and targets before arming the exact PR", async (t) => {
+test("GitHub refuses every fresh native schedule and never releases an old gate on resume", async (t) => {
   const f = githubFixture(t);
-  assert.equal((await f.api.inspectMerge(request)).state, "ready");
-  assert.deepEqual(f.mutations, []);
-  f.pr.baseRef.branchProtectionRule.requiredStatusChecks[0].app.databaseId = 99;
-  assert.equal((await f.api.inspectMerge(request)).state, "blocked");
-  f.pr.baseRef.branchProtectionRule.requiredStatusChecks[0].app.databaseId = 1;
-  f.runs[0].conclusion = "failure";
-  assert.equal((await f.api.inspectMerge(request)).state, "blocked");
-  f.runs[0].conclusion = "success";
-  f.pr.headRef.branchProtectionRule.lockBranch = false;
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  f.pr.headRef.branchProtectionRule.lockBranch = true;
-  f.repo.branchProtectionRules.nodes[0].pattern = "release/*";
-  assert.equal(
-    (await f.api.inspectMerge(request)).reason,
-    "exclusive_destination_required",
-  );
-  f.repo.branchProtectionRules.nodes[0].pattern = "**/*";
-  assert.equal(
-    (await f.api.inspectMerge({ ...request, baseBranch: "feature" })).state,
-    "stale",
-  );
-  f.pr.mergeStateStatus = "UNKNOWN";
-  assert.equal((await f.api.inspectMerge(request)).state, "awaiting_checks");
-  f.pr.mergeStateStatus = "BLOCKED";
-  f.pr.mergeable = "UNKNOWN";
-  assert.equal((await f.api.inspectMerge(request)).state, "awaiting_checks");
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  assert.equal(
-    (await f.api.inspectMerge({ ...request, baseSha: headSha })).state,
-    "stale",
-  );
-  f.pr.reviewDecision = "REVIEW_REQUIRED";
-  assert.equal((await f.api.inspectMerge(request)).state, "blocked");
-  f.pr.mergeable = "MERGEABLE";
-  f.pr.reviewDecision = null;
-  assert.deepEqual(f.mutations, []);
-  assert.equal(await f.api.scheduleMerge(request), "scheduled");
-  assert.deepEqual(f.mutations, ["create_pending", "arm", "success"]);
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  assert.equal(await f.api.cancelMerge(request), "unsupported");
-  assert.equal(f.pr.autoMergeRequest?.enabledBy.databaseId, 2);
-  f.pr.autoMergeRequest = null;
-  assert.equal(await f.api.cancelMerge(request), "cancelled");
-  assert.equal((await f.api.inspectMerge(request)).state, "blocked");
-});
-
-test("GitHub pages through required and historical checks and rejects inconsistent pages before a write", async (t) => {
-  const f = githubFixture(t);
-  const ci = f.runs[0];
-  const background = Array.from({ length: 100 }, (_, i) => ({
-    ...ci,
-    id: 300 + i,
-    name: `background-${i}`,
-    app: { id: 1 },
-    external_id: `background-${i}`,
-  }));
-  f.runs.unshift(...background);
-  ci.conclusion = "failure";
-  assert.equal(
-    (await f.api.inspectMerge(request)).reason,
-    "required_check_failed",
-  );
-  ci.conclusion = "success";
-  for (const invalid of [
-    { total_count: 101, check_runs: [background[0]] },
-    { total_count: 101, check_runs: [{ ...ci, head_sha: baseSha }] },
-    { total_count: 101, check_runs: [] },
-    { total_count: 102, check_runs: [ci, { ...ci, id: 999 }] },
-  ]) {
-    f.flags.secondCheckPage = invalid;
-    await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
+  assert.deepEqual(await f.api.inspectMerge(request), {
+    state: "blocked",
+    reason: "github_schedule_owner_unbound",
+  });
+  for (const stage of [
+    undefined,
+    "prepared",
+    "creating_check",
+    "submitting",
+    "armed",
+    "releasing",
+    "acknowledged",
+  ] as const) {
+    for (const resume of [true, false]) {
+      const checkpoint = t.mock.fn(async () => {});
+      await assert.rejects(
+        f.api.scheduleMerge(
+          { ...request, writeStage: stage },
+          resume,
+          checkpoint,
+        ),
+        (e) =>
+          e instanceof ForgeOperationError &&
+          e.reason === "unsupported" &&
+          !e.uncertain,
+      );
+      assert.equal(checkpoint.mock.callCount(), 0);
+    }
   }
-  f.flags.secondCheckPage = undefined;
-  f.flags.checkSuiteCount = 1001;
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  assert.deepEqual(f.mutations, []);
-  f.flags.checkSuiteCount = 1000;
-  f.runs.push(
-    ...Array.from({ length: 1900 }, (_, i) => ({
-      ...ci,
-      id: 1000 + i,
-      name: `extra-${i}`,
-    })),
+  f.runs.push(legacyCheck(22));
+  const saved = { ...request, writeStage: "armed" as const };
+  f.pr.autoMergeRequest = {
+    enabledBy: { databaseId: 2 },
+    mergeMethod: "SQUASH",
+  };
+  const armed = await f.api.inspectMerge(saved);
+  assert.equal(armed.nativeArmed, true);
+  assert.equal(armed.state, "blocked");
+  // A writer replaces the schedule after the read. A restarted dispatcher cannot release the old check.
+  f.pr.autoMergeRequest = {
+    enabledBy: { databaseId: 9 },
+    mergeMethod: "MERGE",
+  };
+  assert.equal((await f.api.inspectMerge(saved)).nativeArmed, undefined);
+  await assert.rejects(
+    forge("github").scheduleMerge(saved, true),
+    ForgeOperationError,
   );
-  await assert.rejects(f.api.inspectMerge(request), ForgeOperationError);
-  f.runs.pop();
-  assert.equal((await f.api.inspectMerge(request)).state, "ready");
-  f.runs.splice(101);
-  assert.equal(await f.api.scheduleMerge(request), "scheduled");
-
-  f.pr.autoMergeRequest = null;
-  for (const other of background) other.name = checkName;
-  f.flags.secondCheckPage = { total_count: 101, check_runs: [ci] };
-  await assert.rejects(f.api.cancelMerge(request), ForgeOperationError);
-  assert.equal(f.runs.at(-1)?.conclusion, "success");
-  f.flags.secondCheckPage = undefined;
-  assert.equal(await f.api.cancelMerge(request), "cancelled");
-  assert.equal(f.runs.at(-1)?.conclusion, "cancelled");
-  assert.ok(background.every((row) => row.conclusion === "success"));
-  assert.deepEqual(f.mutations, [
-    "create_pending",
-    "arm",
-    "success",
-    "cancelled",
-  ]);
+  assert.equal(f.runs[0].status, "in_progress");
+  assert.deepEqual(f.mutations, []);
 });
 
-test("GitHub retires only a verified pre-submission check and permits a replacement review on the same head", async (t) => {
+test("GitHub reconciles a terminal PR against the saved repository, PR, branch and commit", async (t) => {
+  const f = githubFixture(t);
+  f.pr.state = "MERGED";
+  assert.equal((await f.api.inspectMerge(request)).state, "merged");
+  f.repo.databaseId = 11;
+  assert.equal((await f.api.inspectMerge(request)).state, "stale");
+  f.repo.databaseId = 10;
+  f.pr.number = 8;
+  assert.equal((await f.api.inspectMerge(request)).state, "stale");
+  f.pr.number = 7;
+  f.pr.headRefOid = baseSha;
+  assert.equal((await f.api.inspectMerge(request)).terminal, true);
+  f.pr.headRefOid = headSha;
+  f.pr.baseRefName = "feature";
+  assert.equal((await f.api.inspectMerge(request)).terminal, true);
+  f.pr.baseRefName = "main";
+  f.pr.state = "OPEN";
+  f.pr.baseRefOid = headSha;
+  assert.equal((await f.api.inspectMerge(request)).state, "stale");
+  assert.deepEqual(f.mutations, []);
+});
+
+test("GitHub identifies an exact legacy orphan and retires it after a lost acknowledgement without scheduling", async (t) => {
   const f = githubFixture(t);
   const creating = { ...request, writeStage: "creating_check" as const };
   const next = { ...request, reviewId: "rev_abcdefghijklmnop" };
-  f.flags.loseCreateResponse = true;
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  f.flags.loseCreateResponse = false;
-  const gate = f.runs.pop()!;
-  // Until the delayed check becomes visible its absence cannot retire or repeat the creation.
-  assert.equal(
-    (await f.api.inspectMerge(creating)).reason,
-    "eligibility_check_unconfirmed",
-  );
-  await assert.rejects(
-    f.api.scheduleMerge(creating, true),
-    ForgeOperationError,
-  );
   assert.equal(await f.api.cancelMerge(creating), "unsupported");
+  const gate = legacyCheck(24);
   f.runs.push(gate);
-  assert.equal(
-    (await f.api.inspectMerge(next)).reason,
-    "conflicting_eligibility_check",
-  );
   assert.equal(
     (await f.api.inspectMerge(next)).pendingCheckReviewId,
     request.reviewId,
   );
-  const originalExternalId = gate.external_id;
-  gate.external_id = gate.external_id.replace("/7/", "/8/");
-  assert.equal(
-    (await f.api.inspectMerge(next)).pendingCheckReviewId,
-    undefined,
-  );
-  gate.external_id = originalExternalId;
-  gate.status = "completed";
-  gate.conclusion = "success";
+  const owner = gate.external_id;
+  gate.external_id = owner.replace("/7/", "/8/");
   assert.equal(
     (await f.api.inspectMerge(next)).pendingCheckReviewId,
     undefined,
   );
   assert.equal(await f.api.cancelMerge(creating), "unsupported");
-  assert.equal(
-    (await f.api.inspectMerge(next)).reason,
-    "conflicting_eligibility_check",
-  );
-  gate.conclusion = null;
-  gate.status = "in_progress";
-  gate.app.id = 3;
+  gate.external_id = owner;
+  gate.app.id = 2;
   assert.equal(await f.api.cancelMerge(creating), "unsupported");
   gate.app.id = 1;
   f.pr.autoMergeRequest = {
@@ -454,221 +256,82 @@ test("GitHub retires only a verified pre-submission check and permits a replacem
   };
   assert.equal(await f.api.cancelMerge(creating), "unsupported");
   f.pr.autoMergeRequest = null;
-  assert.deepEqual(f.mutations, ["create_pending"]);
-  const expectedExternalId = gate.external_id;
-  // Older unrelated CI jobs must not exhaust the bound for the two eligibility names.
-  f.runs.push(
-    ...Array.from({ length: 105 }, (_, i) => ({
-      ...f.runs[0],
-      id: 50 + i,
-      app: { id: 1 },
-    })),
-  );
   f.flags.loseRetireResponse = true;
   await assert.rejects(f.api.cancelMerge(creating), ForgeOperationError);
   f.flags.loseRetireResponse = false;
-  assert.equal(await f.api.cancelMerge(creating), "cancelled");
-  f.runs.splice(2, 105);
+  assert.equal(await forge("github").cancelMerge(creating), "cancelled");
   assert.equal(gate.name, "Razbor / retired merge eligibility");
-  assert.equal(gate.external_id, expectedExternalId);
   assert.equal(gate.conclusion, "cancelled");
-  assert.equal(await f.api.cancelMerge(creating), "cancelled");
   assert.equal(
-    (await f.api.inspectMerge(request)).reason,
-    "retired_eligibility_check",
+    (await f.api.inspectMerge(next)).pendingCheckReviewId,
+    undefined,
   );
-  assert.equal((await f.api.inspectMerge(next)).state, "ready");
-  assert.equal(await f.api.scheduleMerge(next), "scheduled");
-  assert.deepEqual(f.mutations, [
-    "create_pending",
-    "cancelled",
-    "create_pending",
-    "arm",
-    "success",
-  ]);
-  assert.equal(gate.conclusion, "cancelled");
+  await assert.rejects(f.api.scheduleMerge(next), ForgeOperationError);
+  assert.deepEqual(f.mutations, ["cancel 24"]);
 });
 
-test("GitHub waits for native conversation resolution on the default branch or an enforced ruleset", async (t) => {
+test("GitHub verifies all legacy check pages before retiring the exact operation", async (t) => {
   const f = githubFixture(t);
-  f.pr.baseRef.branchProtectionRule.requiresConversationResolution = false;
-  assert.equal(
-    (await f.api.inspectMerge(request)).reason,
-    "conversation_resolution_required",
+  f.runs.push(
+    ...Array.from({ length: 101 }, (_, i) =>
+      legacyCheck(i + 1, "rev_abcdefghijklmnop"),
+    ),
+    legacyCheck(102),
   );
-  f.pr.baseRef.branchProtectionRule.requiresConversationResolution = undefined;
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  f.flags.conversationRuleset = true;
-  f.flags.rulesetBypass = "pull_requests_only";
-  assert.equal(
-    (await f.api.inspectMerge(request)).reason,
-    "conversation_resolution_required",
-  );
-  f.flags.rulesetBypass = "never";
-  assert.equal((await f.api.inspectMerge(request)).state, "ready");
+  const saved = { ...request, writeStage: "acknowledged" as const };
+  f.flags.truncated = true;
+  await assert.rejects(f.api.cancelMerge(saved), ForgeOperationError);
+  f.flags.truncated = false;
+  f.flags.suiteCount = 1001;
+  await assert.rejects(f.api.cancelMerge(saved), ForgeOperationError);
+  f.flags.suiteCount = 1;
   assert.deepEqual(f.mutations, []);
-  await assert.rejects(
-    f.api.scheduleMerge(request, false, async (stage) => {
-      if (stage === "armed") f.flags.conversationRuleset = false;
-    }),
-    (error) => error instanceof ForgeOperationError && error.uncertain,
-  );
-  assert.deepEqual(f.mutations, ["create_pending", "arm"]);
-  assert.equal(f.runs.at(-1)?.status, "in_progress");
+  assert.equal(await f.api.cancelMerge(saved), "cancelled");
+  assert.deepEqual(f.mutations, ["cancel 102"]);
+  assert.equal(f.runs[0].conclusion, null);
 });
 
-test("GitHub restores a confirmed rate-limited native submission and preserves generic permission refusals", async (t) => {
+test("GitHub distinguishes a confirmed legacy release from an uncertain release and preserves native ownership", async (t) => {
+  const f = githubFixture(t);
+  const saved = { ...request, writeStage: "releasing" as const };
+  const gate = legacyCheck(25);
+  f.runs.push(gate);
+  f.pr.autoMergeRequest = {
+    enabledBy: { databaseId: 2 },
+    mergeMethod: "SQUASH",
+  };
+  assert.equal((await f.api.inspectMerge(saved)).state, "blocked");
+  Object.assign(gate, { status: "completed", conclusion: "success" });
+  assert.equal((await f.api.inspectMerge(saved)).state, "scheduled");
+  f.pr.autoMergeRequest.enabledBy.databaseId = 9;
+  assert.equal((await f.api.inspectMerge(saved)).nativeArmed, undefined);
+  assert.equal(await f.api.cancelMerge(saved), "unsupported");
+  assert.equal(f.pr.autoMergeRequest.enabledBy.databaseId, 9);
+  f.pr.autoMergeRequest = null;
+  assert.equal(await f.api.cancelMerge(saved), "cancelled");
+  assert.deepEqual(f.mutations, ["cancel 25"]);
+});
+
+test("GitHub surfaces confirmed rate limits on legacy cancellation and preserves the check for retry", async (t) => {
   const f = githubFixture(t);
   const now = Date.now();
   t.mock.method(Date, "now", () => now);
-  const stages: ForgeMergeWriteStage[] = [];
-  /** Record the provider mutation boundaries in their durable order. */
-  async function checkpoint(stage: ForgeMergeWriteStage) {
-    stages.push(stage);
-  }
-  f.flags.armResponse = Response.json(
+  f.runs.push(legacyCheck(26));
+  f.flags.rejection = Response.json(
     { message: "You have exceeded a secondary rate limit." },
     { status: 403, headers: { "Retry-After": "120" } },
   );
   await assert.rejects(
-    f.api.scheduleMerge(request, false, checkpoint),
+    f.api.cancelMerge(request),
     (e) =>
       e instanceof ForgeOperationError &&
       !e.uncertain &&
       e.retryAt === now + 120000,
   );
-  assert.deepEqual(stages, ["creating_check", "submitting", "creating_check"]);
-  const resume = { ...request, writeStage: "creating_check" as const };
-  const reset = Math.ceil(now / 1000) + 300;
-  f.flags.armResponse = new Response(null, {
-    status: 429,
-    headers: {
-      "x-ratelimit-remaining": "0",
-      "x-ratelimit-reset": String(reset),
-    },
-  });
-  await assert.rejects(
-    f.api.scheduleMerge(resume, true, checkpoint),
-    (e) =>
-      e instanceof ForgeOperationError &&
-      !e.uncertain &&
-      e.retryAt === reset * 1000,
-  );
-  assert.deepEqual(stages.slice(-2), ["submitting", "creating_check"]);
-  f.flags.armResponse = Response.json(
-    { message: "Resource not accessible by integration" },
-    { status: 403, headers: { "Retry-After": "120" } },
-  );
-  await assert.rejects(
-    f.api.scheduleMerge(resume, true, checkpoint),
-    (e) =>
-      e instanceof ForgeOperationError &&
-      e.status === 403 &&
-      e.retryAt === undefined &&
-      !e.uncertain,
-  );
-  assert.equal(stages.at(-1), "submitting");
-  assert.equal(f.pr.autoMergeRequest, null);
-  assert.deepEqual(f.mutations, ["create_pending", "arm", "arm", "arm"]);
-});
-
-test("GitHub recovers an acknowledged arm after transport loss without issuing the native mutation twice", async (t) => {
-  const f = githubFixture(t);
-  f.flags.loseArmResponse = true;
-  await assert.rejects(
-    f.api.scheduleMerge(request),
-    (error) => error instanceof ForgeOperationError && error.uncertain,
-  );
-  assert.deepEqual(f.mutations, ["create_pending", "arm"]);
-  const restarted = forge("github");
-  const saved = { ...request, writeStage: "submitting" as const };
-  assert.equal((await restarted.inspectMerge(saved)).resume, true);
-  assert.equal(await restarted.scheduleMerge(saved, true), "scheduled");
-  assert.deepEqual(f.mutations, ["create_pending", "arm", "success"]);
-});
-
-test("GitHub resumes its pending check after a lost creation acknowledgement but never repeats an uncertain release", async (t) => {
-  const f = githubFixture(t);
-  const stages: ForgeMergeWriteStage[] = [];
-  /** Model the dispatcher's committed mutation boundaries. */
-  async function checkpoint(stage: ForgeMergeWriteStage) {
-    stages.push(stage);
-  }
-  f.flags.loseCreateResponse = true;
-  await assert.rejects(f.api.scheduleMerge(request, false, checkpoint));
-  assert.deepEqual(stages, ["creating_check"]);
-  const pending = { ...request, writeStage: stages.at(-1) };
-  assert.equal((await f.api.inspectMerge(pending)).resume, true);
-  f.flags.delayRelease = true;
-  await assert.rejects(f.api.scheduleMerge(pending, true, checkpoint));
-  assert.deepEqual(stages, [
-    "creating_check",
-    "submitting",
-    "armed",
-    "releasing",
-  ]);
-  const releasing = { ...request, writeStage: stages.at(-1) };
-  assert.equal((await f.api.inspectMerge(releasing)).resume, false);
-  await assert.rejects(f.api.scheduleMerge(releasing, true, checkpoint));
-  await assert.rejects(f.api.scheduleMerge(releasing, false, checkpoint));
-  assert.deepEqual(f.mutations, ["create_pending", "arm", "success"]);
-  // The one delayed release finally reaches the provider.
-  Object.assign(f.runs[1], { status: "completed", conclusion: "success" });
-  assert.equal((await f.api.inspectMerge(releasing)).state, "scheduled");
-  assert.equal(await f.api.cancelMerge(releasing), "unsupported");
-  f.pr.autoMergeRequest = null;
-  assert.equal(await f.api.cancelMerge(releasing), "cancelled");
-  assert.deepEqual(f.mutations, [
-    "create_pending",
-    "arm",
-    "success",
-    "cancelled",
-  ]);
-});
-
-test("a depleted budget before native dispatch leaves the created check eligible to resume", async (t) => {
-  const f = githubFixture(t);
-  const now = Date.now();
-  let current = now;
-  t.mock.method(Date, "now", () => current);
-  const stages: ForgeMergeWriteStage[] = [];
-  await assert.rejects(
-    f.api.scheduleMerge(request, false, async (stage) => {
-      stages.push(stage);
-      if (stage === "submitting") current += 120000;
-    }),
-    ForgeOperationError,
-  );
-  assert.deepEqual(stages, ["creating_check", "submitting", "creating_check"]);
-  assert.deepEqual(f.mutations, ["create_pending"]);
-  const recovered = forge("github");
-  assert.equal(
-    await recovered.scheduleMerge(
-      { ...request, writeStage: stages.at(-1) },
-      true,
-    ),
-    "scheduled",
-  );
-  assert.deepEqual(f.mutations, ["create_pending", "arm", "success"]);
-});
-
-test("GitHub detects a changed revision during scheduling and leaves the check pending", async (t) => {
-  const f = githubFixture(t);
-  f.flags.moveHeadOnArm = true;
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  assert.deepEqual(f.mutations, ["create_pending", "arm"]);
-  assert.equal((await f.api.inspectMerge(request)).state, "stale");
-});
-
-test("GitHub leaves another actor's existing schedule untouched", async (t) => {
-  const f = githubFixture(t);
-  f.pr.autoMergeRequest = {
-    enabledBy: { databaseId: 9 },
-    mergeMethod: "SQUASH",
-  };
-  assert.equal((await f.api.inspectMerge(request)).reason, "existing_schedule");
-  await assert.rejects(f.api.scheduleMerge(request));
-  assert.deepEqual(f.mutations, []);
+  assert.equal(f.runs[0].conclusion, null);
+  f.flags.rejection = undefined;
+  assert.equal(await f.api.cancelMerge(request), "cancelled");
+  assert.deepEqual(f.mutations, ["cancel 26", "cancel 26"]);
 });
 
 /** Return authoritative pipeline, protection, schedule owner and revision state from an offline MR. */
@@ -953,31 +616,6 @@ test("reviewer lookup uses an exact provider user and suppresses mass, missing, 
   assert.equal(await forge("github").reviewerLogin("nobody"), null);
 });
 
-test("GitHub accepts a human-exempt ruleset only when this installation cannot bypass its own eligibility check", async (t) => {
-  const f = githubFixture(t);
-  f.pr.baseRef.branchProtectionRule.requiredStatusChecks.shift();
-  f.flags.dedicatedGate = true;
-  f.flags.rulesetBypass = "pull_requests_only";
-  assert.equal((await f.api.inspectMerge(request)).state, "blocked");
-  f.flags.rulesetBypass = "never";
-  assert.equal((await f.api.inspectMerge(request)).state, "ready");
-});
-
-test("a restarted worker refuses to re-arm a schedule that disappeared after recovery inspection", async (t) => {
-  const f = githubFixture(t);
-  f.flags.loseArmResponse = true;
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  const restarted = forge("github");
-  const saved = { ...request, writeStage: "submitting" as const };
-  assert.equal((await restarted.inspectMerge(saved)).resume, true);
-  f.pr.autoMergeRequest = null;
-  await assert.rejects(
-    restarted.scheduleMerge(saved, true),
-    ForgeOperationError,
-  );
-  assert.deepEqual(f.mutations, ["create_pending", "arm"]);
-});
-
 test("GitHub App source credentials carry read-only contents and discovery only metadata", async (t) => {
   const { privateKey } = generateKeyPairSync("rsa", { modulusLength: 2048 });
   const credentials = {
@@ -1038,19 +676,12 @@ test("GitHub App source credentials carry read-only contents and discovery only 
   );
 });
 
-test("GitHub refuses to release commit-wide eligibility for two open PRs sharing the same head", async (t) => {
-  const f = githubFixture(t);
-  f.repo.pullRequests.nodes.push({ number: 8, headRefOid: headSha });
-  assert.equal((await f.api.inspectMerge(request)).reason, "shared_head_check");
-  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
-  assert.deepEqual(f.mutations, []);
-});
-
 const approvalBot = { id: "2", login: "razbor[bot]" };
 
 test("GitHub approves a pinned revision separately from merge, reconciles the exact vote and respects a dismissal", async (t) => {
   const api = forge("github");
   const votes: {
+    id: string;
     state: string;
     body: string;
     commit: { oid: string };
@@ -1084,6 +715,7 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
       ],
     },
     baseRef: {
+      refUpdateRule: { viewerAllowedToDismissReviews: true },
       branchProtectionRule: {
         isAdminEnforced: true,
         requiresApprovingReviews: true,
@@ -1126,6 +758,40 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
           },
         };
       }
+      if (String(body.query).includes("query RazborRetireApproval")) {
+        const after = (body.variables as Record<string, unknown>).after;
+        assert.ok(after === null || after === "NEXT");
+        return {
+          data: {
+            repository: {
+              databaseId: 10,
+              pullRequest: {
+                ...pr,
+                reviews: {
+                  pageInfo: {
+                    hasNextPage: after === null,
+                    endCursor: after === null ? "NEXT" : null,
+                  },
+                  nodes: after === null ? [] : votes,
+                },
+              },
+            },
+          },
+        };
+      }
+      if (String(body.query).includes("mutation RazborDismissApproval")) {
+        assert.equal(
+          (body.variables as Record<string, string>).id,
+          "VOTE_NODE",
+        );
+        assert.equal(checkpoints, mutations.length + 1);
+        mutations.push("dismiss");
+        votes[0].state = "DISMISSED";
+        if (loseResponse) throw new Error("lost dismissal response");
+        return {
+          data: { dismissPullRequestReview: { pullRequestReview: votes[0] } },
+        };
+      }
       assert.match(
         String(body.query),
         /addPullRequestReview\(input:\{pullRequestId:\$pull,commitOID:\$head,event:APPROVE/,
@@ -1136,6 +802,7 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
       assert.equal(checkpoints, mutations.length + 1);
       mutations.push("approval");
       const review = {
+        id: "VOTE_NODE",
         state: "APPROVED",
         body: variables.body,
         commit: { oid: headSha },
@@ -1196,6 +863,16 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   async function checkpoint() {
     checkpoints++;
   }
+  pr.baseRef.refUpdateRule.viewerAllowedToDismissReviews = false;
+  assert.equal(
+    await api.approveReview(request, approvalBot, false, checkpoint),
+    "unsupported",
+  );
+  pr.baseRef.refUpdateRule.viewerAllowedToDismissReviews = true;
+  assert.equal(
+    await api.retireApproval(request, approvalBot, false, checkpoint),
+    "unconfirmed",
+  );
   assert.equal(
     (await api.inspectApproval(request, approvalBot)).state,
     "ready",
@@ -1311,7 +988,41 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     await api.approveReview(request, approvalBot, false, checkpoint),
     "dismissed",
   );
-  assert.deepEqual(mutations, ["approval"]);
+  // A marked review remains addressable after either ref changes and after closure.
+  votes[0].state = "APPROVED";
+  pr.state = "CLOSED";
+  pr.headRefOid = baseSha;
+  pr.baseRefName = "retargeted";
+  votes.push({ ...votes[0], id: "OTHER", body: "a separate review" });
+  assert.equal(
+    await api.retireApproval(
+      { ...request, externalRepositoryId: "11" },
+      approvalBot,
+      true,
+      checkpoint,
+    ),
+    "unconfirmed",
+  );
+  await assert.rejects(
+    api.retireApproval(request, approvalBot, false, checkpoint),
+    { uncertain: true },
+  );
+  assert.equal(
+    await api.retireApproval(request, approvalBot, false, checkpoint, true),
+    "retired",
+  );
+  assert.equal(votes[1].state, "APPROVED");
+  assert.deepEqual(mutations, ["approval", "dismiss"]);
+  votes.shift();
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, checkpoint),
+    "unconfirmed",
+  );
+  pr.state = "MERGED";
+  assert.equal(
+    await api.retireApproval(request, approvalBot, false, checkpoint, true),
+    "retired",
+  );
 });
 
 test("GitLab approval uses the numeric MR and SHA guard and requires revision-bound evidence to recover", async (t) => {
@@ -1350,6 +1061,8 @@ test("GitLab approval uses the numeric MR and SHA guard and requires revision-bo
   let loseResponse = false;
   let wrongReceipt = false;
   let writes = 0;
+  let withdrawalWrites = 0;
+  let actorId = 2;
   let fences = 0;
   /** Record each durable intent, which must precede exactly one GitLab POST. */
   async function checkpoint() {
@@ -1358,6 +1071,15 @@ test("GitLab approval uses the numeric MR and SHA guard and requires revision-bo
   fakeFetch(t, (path, method, body) => {
     const mrPath = "/api/v4/projects/10/merge_requests/7";
     if (method === "POST") {
+      if (path === mrPath + "/unapprove") {
+        assert.equal(fences, writes + ++withdrawalWrites);
+        assert.deepEqual(body, {});
+        approvals.approved_by = approvals.approved_by.filter(
+          ({ user }) => user.id !== actorId,
+        );
+        if (loseResponse) throw new Error("lost withdrawal");
+        return approvals;
+      }
       assert.equal(path, mrPath + "/approve");
       assert.deepEqual(body, { sha: headSha });
       assert.equal(fences, ++writes);
@@ -1366,7 +1088,7 @@ test("GitLab approval uses the numeric MR and SHA guard and requires revision-bo
       return wrongReceipt ? { ...approvals, iid: 8 } : approvals;
     }
     if (path === "/api/v4/projects/team%2Fproject") return project;
-    if (path === "/api/v4/user") return { id: 2, bot: true };
+    if (path === "/api/v4/user") return { id: actorId, bot: true };
     if (path === "/api/v4/projects/10/approvals") return settings;
     if (path === "/api/v4/projects/10/repository/branches/main")
       return { name: "main", commit: { id: baseSha } };
@@ -1495,6 +1217,50 @@ test("GitLab approval uses the numeric MR and SHA guard and requires revision-bo
     api.approveReview(request, approvalBot, false, checkpoint),
     { uncertain: true },
   );
+  approvals.approved_by = [{ user: { id: 2 } }, { user: { id: 9 } }];
+  assert.equal(
+    await api.retireApproval(request, approvalBot, false, checkpoint),
+    "unconfirmed",
+  );
+  mr.sha = baseSha;
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, checkpoint),
+    "unconfirmed",
+  );
+  mr.sha = headSha;
+  actorId = 4;
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, checkpoint),
+    "unconfirmed",
+  );
+  actorId = 2;
+  mr.target_branch = "retargeted";
+  mr.state = "closed";
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, checkpoint),
+    "retired",
+  );
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, checkpoint),
+    "retired",
+  );
+  assert.deepEqual(approvals.approved_by, [{ user: { id: 9 } }]);
+  approvals.approved_by.push({ user: { id: 2 } });
+  loseResponse = true;
+  await assert.rejects(
+    api.retireApproval(request, approvalBot, true, checkpoint),
+    { uncertain: true },
+  );
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, checkpoint, true),
+    "unconfirmed",
+  );
+  mr.state = "merged";
+  assert.equal(
+    await api.retireApproval(request, approvalBot, false, checkpoint, true),
+    "retired",
+  );
+  assert.equal(withdrawalWrites, 2);
 });
 
 test("Forgejo explicitly abstains from native approval when it cannot inspect an armed schedule", async (t) => {
@@ -1509,5 +1275,11 @@ test("Forgejo explicitly abstains from native approval when it cannot inspect an
       assert.fail("unexpected approval intent"),
     ),
     "unsupported",
+  );
+  assert.equal(
+    await api.retireApproval(request, approvalBot, true, async () =>
+      assert.fail(),
+    ),
+    "unconfirmed",
   );
 });

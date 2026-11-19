@@ -5,6 +5,7 @@ import {
   ForgeOperationError,
   type ForgeActor,
   type ForgeApprovalResult,
+  type ForgeApprovalRetirement,
   type ForgeMergeRequest,
   type ForgeMergeState,
 } from "@forge-adapters/src/interactions.js";
@@ -22,6 +23,12 @@ const approval = z.object({
   project_id: mergeId,
   approved_by: z.array(z.object({ user: z.object({ id: mergeId }) })),
   user_can_approve: z.boolean().optional(),
+});
+
+const botAccount = z.object({
+  id: mergeId,
+  bot: z.boolean(),
+  is_admin: z.boolean().optional(),
 });
 
 const mergeRequest = z.object({
@@ -80,9 +87,7 @@ export async function inspectGitlabApproval(
     return { decision: mergeState("stale", "revision_changed") };
   if (mr.state !== "opened" || mr.draft)
     return { decision: mergeState("blocked", "not_open_ready") };
-  const actor = z
-    .object({ id: mergeId, bot: z.boolean(), is_admin: z.boolean().optional() })
-    .parse(await transport.request("user"));
+  const actor = botAccount.parse(await transport.request("user"));
   if (
     !actor.bot ||
     actor.is_admin ||
@@ -197,4 +202,56 @@ export async function approveGitlabReview(
   )
     throw new ForgeOperationError("invalid-response", true);
   return "approved";
+}
+
+/** Withdraw the bound account's acknowledged vote; GitLab scopes this write to the MR and offers no SHA precondition. */
+export async function retireGitlabApproval(
+  transport: HttpForgeTransport,
+  projectRoute: string,
+  request: ForgeMergeRequest,
+  bot: ForgeActor,
+  acknowledged: boolean,
+  beforeWrite: () => Promise<void>,
+  withdrawalUncertain: boolean,
+): Promise<ForgeApprovalRetirement> {
+  mergeRequestSchema.parse(request);
+  const project = z
+    .object({ id: mergeId })
+    .parse(await transport.request(projectRoute));
+  if (project.id !== request.externalRepositoryId) return "unconfirmed";
+  const route = `projects/${project.id}/merge_requests/${request.number}`;
+  const mr = mergeRequest
+    .pick({ iid: true, project_id: true, state: true, sha: true })
+    .parse(await transport.request(route));
+  if (mr.project_id !== project.id || mr.iid !== String(request.number))
+    return "unconfirmed";
+  if (mr.state === "merged") return "retired";
+  if (
+    !["opened", "closed"].includes(mr.state) ||
+    !acknowledged ||
+    withdrawalUncertain
+  )
+    return "unconfirmed";
+  const actor = botAccount.parse(await transport.request("user"));
+  if (!actor.bot || actor.is_admin || actor.id !== bot.id) return "unconfirmed";
+  const current = approval.parse(await transport.request(`${route}/approvals`));
+  if (current.project_id !== project.id || current.iid !== mr.iid)
+    return "unconfirmed";
+  if (!current.approved_by.some(({ user }) => user.id === actor.id))
+    return "retired";
+  // A vote on a different head might belong to another operation. The caller
+  // serializes our approvals for the entire MR while the withdrawal is pending.
+  if (mr.sha !== request.headSha) return "unconfirmed";
+  await beforeWrite();
+  const response = approval.safeParse(
+    await transport.request(`${route}/unapprove`, "POST"),
+  );
+  if (
+    !response.success ||
+    response.data.project_id !== project.id ||
+    response.data.iid !== mr.iid ||
+    response.data.approved_by.some(({ user }) => user.id === actor.id)
+  )
+    throw new ForgeOperationError("invalid-response", true);
+  return "retired";
 }

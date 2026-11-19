@@ -153,6 +153,30 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
   assert.equal(row.merge_write_stage, null);
   assert.equal(row.forge_approval, null);
 
+  // A preview may have stopped dispatching this PR after its vote was acknowledged.
+  // Wake it on upgrade, preserving the original receipt and the stored decision.
+  const receipt = { botId: "1", status: "approved" };
+  await upgrade.pool.query(
+    "update reviews set forge_approval=$2 where merge_pull_request_id=$1",
+    [pr, receipt],
+  );
+  await upgrade.pool.query(
+    "update pull_requests set merge_after=null where id=$1",
+    [pr],
+  );
+  await upgrade.pool.query(
+    "delete from drizzle.__drizzle_migrations where created_at=1790000000038",
+  );
+  await migrate(url.href);
+  const [woken] = (
+    await upgrade.pool.query(
+      `select p.merge_after <= now() as due, r.forge_approval from pull_requests p
+         join reviews r on r.merge_pull_request_id=p.id where p.id=$1`,
+      [pr],
+    )
+  ).rows;
+  assert.deepEqual(woken, { due: true, forge_approval: receipt });
+
   // The last PR #6 preview already had merge_policy and merge_write_stage.
   // Its earlier high-water mark skips GitLab boundaries unless the upgrade repairs them.
   const dropBoundary = `drop trigger record_deferred_boundary on webhook_deliveries;
@@ -160,7 +184,7 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
      alter table webhook_deliveries drop column boundary_number, drop column boundary_at`;
   await upgrade.pool.query(dropBoundary);
   await upgrade.pool.query(`alter table reviews drop column forge_approval;
-     delete from drizzle.__drizzle_migrations where created_at in (1790000000032,1790000000037);
+     delete from drizzle.__drizzle_migrations where created_at in (1790000000032,1790000000037,1790000000038);
      update repositories set merge_policy_version=8, merge_policy=jsonb_set(merge_policy-'autoApprove','{policyMarkdown}','"Preview policy"')`);
   await upgrade.pool.query(
     `with hook as (
@@ -242,6 +266,38 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
       )
     ).rows[0].name,
     "delivery_due_open",
+  );
+  // A settled GitHub dry run also needs its old eligibility comment revisited,
+  // even when it has never cast a vote or submitted a native merge request.
+  await upgrade.pool.query(
+    `with configured as (
+       insert into forge_instances(public_id, config_key, managed_by, type, api_url, web_url)
+       values ('forge_0123456789abcdef','github','file','github','https://api.github.com','https://github.com')
+       returning id)
+     update repositories set forge_id=configured.id, selector='team/repo'
+       from configured where repositories.id=$1`,
+    [repo],
+  );
+  await upgrade.pool.query(
+    "update reviews set merge_action='dry_run' where merge_pull_request_id=$1",
+    [pr],
+  );
+  await upgrade.pool.query(
+    "update pull_requests set merge_after=null where id=$1",
+    [pr],
+  );
+  await upgrade.pool.query(
+    "delete from drizzle.__drizzle_migrations where created_at=1790000000038",
+  );
+  await migrate(url.href);
+  assert.equal(
+    (
+      await upgrade.pool.query(
+        "select merge_after <= now() as due from pull_requests where id=$1",
+        [pr],
+      )
+    ).rows[0].due,
+    true,
   );
 });
 
@@ -352,6 +408,7 @@ test(
     let closedReservation = "";
     let delayedMention = "";
     let rejectedMention = false;
+    let policyVoteHead = headSha;
     t.mock.method(
       globalThis,
       "fetch",
@@ -400,7 +457,10 @@ test(
             user: { id: 7, login: "contributor" },
             html_url: origin + "/team/repo/pulls/" + pullRoute[1],
             base: { sha: baseSha, ref: "main" },
-            head: { sha: headSha, ref: "docs" },
+            head: {
+              sha: Number(pullRoute[1]) === 10 ? policyVoteHead : headSha,
+              ref: "docs",
+            },
             merge_base: baseSha,
           });
         const collection = /^repos\/team\/repo\/issues\/(\d+)\/comments$/.exec(
@@ -522,6 +582,7 @@ test(
         }
         if (request.number === 9)
           throw new ForgeOperationError("permission", false, 403);
+        if (request.number === 13) return "approved";
         if (request.number === 10) {
           // Source or policy edits and PR revisions must wait across the wire write.
           await assert.rejects(
@@ -560,7 +621,7 @@ test(
         return checks;
       },
     );
-    t.mock.method(
+    const schedule = t.mock.method(
       ForgejoInteractions.prototype,
       "scheduleMerge",
       async (
@@ -1005,12 +1066,136 @@ test(
     assert.match(bodyFor(10), /provider confirmed Razbor’s approval/);
     assert.equal(writes, 0);
 
+    const escalatedPr = await pull(13);
+    const uncertainPr = await pull(14);
+    const previousApproval = await complete(escalatedPr, 99);
+    const lostApproval = await complete(uncertainPr, 99);
+    await processMergeTriage(db);
+    assert.equal(await voteStatus(previousApproval), "approved");
+    assert.equal(await voteStatus(lostApproval), "uncertain");
+    const owners = new Map([
+      [10, acknowledgedVote],
+      [13, previousApproval],
+      [14, lostApproval],
+    ]);
+    const withdrawn = new Set<number>();
+    const withdrawalWrites: number[] = [];
+    let lostVoteArrived = false;
+    let policyWithdrawalConfirmed = false;
+    t.mock.method(
+      ForgejoInteractions.prototype,
+      "retireApproval",
+      async (
+        request: ForgeMergeRequest,
+        bot: ForgeActor,
+        acknowledged: boolean,
+        beforeWrite: () => Promise<void>,
+        withdrawalUncertain?: boolean,
+      ) => {
+        if (request.number === 12) return "retired";
+        assert.equal(request.reviewId, owners.get(request.number));
+        assert.equal(request.externalRepositoryId, "2");
+        assert.equal(request.baseBranch, "main");
+        assert.equal(request.baseSha, baseSha);
+        assert.equal(request.headSha, headSha);
+        assert.equal(bot.id, "1");
+        assert.equal(acknowledged, request.number !== 14);
+        if (withdrawn.has(request.number)) {
+          // Native readback confirms the previously submitted withdrawal.
+          assert.equal(withdrawalUncertain, true);
+          if (request.number === 10 && !policyWithdrawalConfirmed)
+            return "unconfirmed";
+          return "retired";
+        }
+        if (request.number === 14 && !lostVoteArrived) return "unconfirmed";
+        await beforeWrite();
+        const [intent] = (
+          await restart.pool.query(
+            "select forge_approval from reviews where public_id=$1",
+            [request.reviewId],
+          )
+        ).rows;
+        assert.equal(intent.forge_approval.retiring, true);
+        assert.equal(intent.forge_approval.retirementSent, true);
+        withdrawn.add(request.number);
+        withdrawalWrites.push(request.number);
+        if (request.number !== 14)
+          throw new ForgeOperationError("unavailable", true);
+        return "retired";
+      },
+    );
+    const humanAfterVote = await complete(escalatedPr, 70);
+    const humanAfterLostVote = await complete(uncertainPr, 72);
+    await processMergeTriage(db);
+    assert.deepEqual(withdrawalWrites, [13]);
+    for (const reviewId of [humanAfterVote, humanAfterLostVote]) {
+      const [human] = (
+        await db.pool.query(
+          `select p.human_escalated, r.merge_decision from reviews r
+             join pull_requests p on p.id=r.merge_pull_request_id where r.public_id=$1`,
+          [reviewId],
+        )
+      ).rows;
+      assert.equal(human.human_escalated, true);
+      assert.equal(human.merge_decision.status, "human_review_required");
+      assert.ok(
+        human.merge_decision.reasons.some(
+          (reason: { code: string }) =>
+            reason.code === "approval_retirement_pending",
+        ),
+      );
+    }
+    assert.ok(await deadline(escalatedPr));
+    assert.ok(await deadline(uncertainPr));
+    assert.match(bodyFor(13), /earlier Razbor approval may still count/);
+    assert.match(bodyFor(14), /earlier Razbor approval may still count/);
+    assert.equal(await voteStatus(lostApproval), "uncertain");
+    await due(escalatedPr);
+    await due(uncertainPr);
+    await processMergeTriage(restart);
+    assert.equal(await voteStatus(previousApproval), "dismissed");
+    assert.equal(await voteStatus(lostApproval), "uncertain");
+    assert.deepEqual(withdrawalWrites, [13]);
+    lostVoteArrived = true;
+    await due(uncertainPr);
+    await processMergeTriage(restart);
+    assert.equal(await voteStatus(lostApproval), "dismissed");
+    assert.deepEqual(withdrawalWrites, [13, 14]);
+    const afterWithdrawal = await complete(escalatedPr, 99);
+    await processMergeTriage(restart);
+    assert.equal(
+      (await decision(afterWithdrawal)).status,
+      "human_review_required",
+    );
+    assert.deepEqual(voteWrites, [8, 9, 10, 13, 14]);
+    assert.equal(writes, 0);
+
     config.repositories.project.mergePolicy = {
       ...policy,
       dryRun: false,
       autoApprove: true,
     };
+    // The first withdrawal reached the provider, but its response was lost.
+    // The old policy must remain current until the retry can confirm retirement.
+    await assert.rejects(applyRegistry(db, config), { status: 409 });
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 2);
+    // A push and a fresh qualifying review cannot outrun a delayed withdrawal for the old head.
+    policyVoteHead = "c".repeat(40);
+    await db.pool.query(
+      "update pull_requests set head_sha=$2 where public_id=$1",
+      [acknowledgedPr, policyVoteHead],
+    );
+    const replacementHead = await complete(acknowledgedPr, 99);
+    const approvalCalls = approve.mock.callCount();
+    await processMergeTriage(restart);
+    assert.equal(approve.mock.callCount(), approvalCalls);
+    assert.equal((await decision(replacementHead)).status, "blocked");
+    assert.equal(await voteStatus(replacementHead), null);
+    assert.match(bodyFor(10), /earlier Razbor approval may still count/);
+    policyWithdrawalConfirmed = true;
     await applyRegistry(db, config);
+    assert.equal(await voteStatus(acknowledgedVote), "dismissed");
+    assert.deepEqual(withdrawalWrites, [13, 14, 10]);
     const liveApprovalPr = await pull(11);
     const preparedAfterApproval = await complete(liveApprovalPr, 98);
     await db.pool.query(
@@ -1028,7 +1213,7 @@ test(
     );
     assert.equal(await voteStatus(preparedAfterApproval), "dismissed");
     assert.equal((await decision(preparedAfterApproval)).status, "blocked");
-    assert.deepEqual(voteWrites, [8, 9, 10]);
+    assert.deepEqual(voteWrites, [8, 9, 10, 13, 14]);
     const readyForBoth = await pull(12);
     const liveApprovedReview = await complete(readyForBoth, 99);
     await processMergeTriage(db);
@@ -1044,7 +1229,7 @@ test(
       status: "merged",
       action: "merged",
     });
-    assert.deepEqual(voteWrites, [8, 9, 10, 12]);
+    assert.deepEqual(voteWrites, [8, 9, 10, 13, 14, 12]);
     assert.equal(writes, 1);
 
     config.repositories.project.mergePolicy = {
@@ -1066,6 +1251,41 @@ test(
       updateRepositoryMergePolicy(db, repo.id, { version: 4, policy }),
       /registry file/,
     );
+    const githubArmed = await pull(15);
+    const githubNew = await pull(16);
+    const oldSchedule = await complete(githubArmed, 99);
+    const newRequest = await complete(githubNew, 99);
+    await db.pool.query(
+      "update reviews set merge_action='writing',merge_write_stage='armed' where public_id=$1",
+      [oldSchedule],
+    );
+    checks = { state: "blocked", reason: "github_schedule_owner_unbound" };
+    const beforeGithub = schedule.mock.callCount();
+    const cancelOldSchedule = t.mock.method(
+      ForgejoInteractions.prototype,
+      "cancelMerge",
+      async (request: ForgeMergeRequest) => {
+        assert.equal(request.number, 15);
+        assert.equal(request.reviewId, oldSchedule);
+        assert.equal(request.headSha, headSha);
+        assert.equal(request.writeStage, "armed");
+        return "cancelled";
+      },
+    );
+    await processMergeTriage(restart);
+    assert.equal(cancelOldSchedule.mock.callCount(), 1);
+    assert.deepEqual(await decision(oldSchedule), {
+      status: "stale",
+      action: "refused",
+    });
+    assert.deepEqual(await decision(newRequest), {
+      status: "blocked",
+      action: null,
+    });
+    assert.equal(await deadline(githubNew), null);
+    assert.equal(schedule.mock.callCount(), beforeGithub);
+    cancelOldSchedule.mock.restore();
+    checks = { state: "ready", reason: "provider_ready" };
     const live = await complete(second, 95);
     // Restart after the durable intent, before any provider mutation was attempted.
     await db.pool.query(
