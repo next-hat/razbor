@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { parse } from "lossless-json";
 import { z } from "zod";
@@ -839,6 +840,9 @@ export class GitlabForge implements Forge {
     if (!publication || !run) throw new ForgeOperationError("invalid-response");
     sha.parse(head);
     const bot = await this.identity();
+    const originalBot = publication.progress.bulk?.botId;
+    if (originalBot && originalBot !== bot.id)
+      throw new ForgeOperationError("permission", true);
     const metadata = `<!-- razbor-gitlab:${run}:${head}:${event}:`;
     const pendingBody = `${body}\n\n${metadata}pending -->`;
     const completeBody = `${body}\n\n${metadata}complete -->`;
@@ -867,7 +871,7 @@ export class GitlabForge implements Forge {
         revision: publication.revision ?? current,
         requireReady: publication.requireReady,
       };
-      let drafts = await this.drafts(n);
+      const drafts = await this.drafts(n);
       if (
         drafts.some(
           (item) =>
@@ -927,6 +931,7 @@ export class GitlabForge implements Forge {
         }
         if (
           remote.author_id !== bot.id ||
+          (progress[entry.key]?.id && progress[entry.key].id !== remote.id) ||
           remote.note !== entry.body ||
           remote.position?.head_sha !== head ||
           remote.position.new_path !== entry.comment.path ||
@@ -941,29 +946,6 @@ export class GitlabForge implements Forge {
         progress[entry.key] = { id: remote.id };
         await publication.save(progress);
       }
-      // Bulk publication affects every draft belonging to this identity. Re-read
-      // immediately before publishing and reject any unowned concurrent draft.
-      drafts = await this.drafts(n);
-      if (
-        drafts.length !== expected.length ||
-        drafts.some(
-          (item) =>
-            !expected.some(
-              (entry) =>
-                progress[entry.key]?.id === item.id &&
-                entry.body === item.note &&
-                item.author_id === bot.id &&
-                item.position?.head_sha === head &&
-                item.position.base_sha === current.mergeBase &&
-                item.position.start_sha === current.startSha &&
-                item.position.new_path === entry.comment.path &&
-                matchesCommentRange(item.position, entry.comment),
-            ),
-        )
-      )
-        throw new ForgeOperationError("invalid-response");
-      progress.bulk = { writing: true };
-      await publication.save(progress);
       let sent = false;
       /** Bracket the unconditioned bulk write with observations from the same bounded provider session. */
       const write = async (): Promise<
@@ -989,6 +971,18 @@ export class GitlabForge implements Forge {
           }
         }
         await reviewRevision(this, n, head, guard);
+        // GitLab publishes every draft under this identity. Check the complete
+        // set again after every provider preflight, including exact positions.
+        const fresh = await this.drafts(n);
+        if (
+          fresh.length !== drafts.length ||
+          drafts.some(
+            (owned) => !fresh.some((item) => isDeepStrictEqual(item, owned)),
+          )
+        )
+          throw new ForgeOperationError("invalid-response");
+        progress.bulk = { writing: true, botId: bot.id };
+        await publication.save(progress);
         sent = true;
         await this.transport.request(
           `${this.changeRoute(n)}/draft_notes/bulk_publish`,
@@ -1040,27 +1034,37 @@ export class GitlabForge implements Forge {
             ((!error.uncertain && error.status === undefined) ||
               [401, 403, 404, 405].includes(error.status ?? 0)))
         ) {
-          progress.bulk = {};
-          await publication.save(progress);
+          if (progress.bulk?.writing) {
+            progress.bulk = {};
+            await publication.save(progress);
+          }
           throw error;
         }
         throw new ForgeOperationError("unavailable", true);
       }
-      progress.bulk = { submitted: true, confirmation };
+      progress.bulk = { submitted: true, confirmation, botId: bot.id };
       await publication.save(progress);
       summaries = (await this.comments(n)).filter(
         (item) => item.user.id === bot.id && item.body.includes(metadata),
       );
     }
     const confirmation = progress.bulk?.confirmation ?? "response-unconfirmed";
-    const finalBody =
+    const warning =
       confirmation === "confirmed"
-        ? completeBody
-        : `**GitLab verdict unconfirmed.** ${unconfirmedReasons[confirmation]}\n\n${body}\n\n${metadata}unconfirmed -->`;
+        ? undefined
+        : `**GitLab verdict unconfirmed.** ${unconfirmedReasons[confirmation]}`;
+    const unconfirmedFooter = `${body}\n\n${metadata}unconfirmed -->`;
+    const finalBody = warning
+      ? [warning, publication.unconfirmedBody, unconfirmedFooter]
+          .filter(Boolean)
+          .join("\n\n")
+      : completeBody;
     const summary = summaries[0];
     if (
       summaries.length !== 1 ||
-      (summary?.body !== pendingBody && summary?.body !== finalBody)
+      (summary?.body !== pendingBody &&
+        summary?.body !== finalBody &&
+        !(warning && summary?.body === `${warning}\n\n${unconfirmedFooter}`))
     )
       throw new ForgeOperationError("unsupported", true);
     const remaining = await this.drafts(n);
@@ -1108,7 +1112,7 @@ export class GitlabForge implements Forge {
         throw new ForgeOperationError("invalid-response", true);
     }
     progress.summary = { id: summary.id };
-    progress.bulk = { id: summary.id, confirmation };
+    progress.bulk = { id: summary.id, confirmation, botId: bot.id };
     await publication.save(progress);
     return summary.id;
   }

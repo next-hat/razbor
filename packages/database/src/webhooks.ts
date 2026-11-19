@@ -199,6 +199,7 @@ function callback(hook: typeof repositoryWebhooks.$inferSelect) {
  * Locate one bot-owned published review for a saved run. Empty Forgejo follow-up
  * bodies are recovered through every frozen inline comment; partial or ambiguous
  * matches cannot authorize another publication after an uncertain write.
+ * Finding history may also inspect notes from an unconfirmed GitLab submission.
  */
 async function publishedReview(
   api: Forge,
@@ -208,12 +209,15 @@ async function publishedReview(
   head: string,
   reviewId: string,
   publication: Publication | null | undefined,
+  includeUnconfirmedNotes = false,
 ) {
   const candidates = remoteReviews.filter(
     (remote) =>
       remote.user.id === bot &&
       remote.commit_id === head &&
-      !["PENDING", "UNCONFIRMED"].includes(remote.state),
+      remote.state !== "PENDING" &&
+      (remote.state !== "UNCONFIRMED" ||
+        (includeUnconfirmedNotes && api.type === "gitlab")),
   );
   const marked = candidates.filter(
     (remote) =>
@@ -363,9 +367,12 @@ async function previousFindings(
       review.headSha,
       review.publicId,
       publication,
+      true,
     );
     if (!remote) continue;
+    const confirmed = remote.state !== "UNCONFIRMED";
     if (
+      confirmed &&
       publication?.state === "published" &&
       !publication.stale &&
       !publication.rearmed
@@ -376,6 +383,7 @@ async function previousFindings(
     // only inline findings and must not become another main comment.
     if (
       !recapReviewId &&
+      confirmed &&
       !publication?.stale &&
       publication?.mode === "review" &&
       publication.remoteId === remote.id &&
@@ -383,17 +391,37 @@ async function previousFindings(
     )
       recapReviewId = remote.id;
     if (!review.result?.findings.length) continue;
-    for (const finding of review.result.findings)
-      publishedKeys.add(findingKey(finding));
+    if (confirmed)
+      for (const finding of review.result.findings)
+        publishedKeys.add(findingKey(finding));
     const comments = await api.reviewComments(number, remote.id);
     for (const comment of comments) {
-      if (comment.user?.id !== bot || comment.resolved) continue;
+      if (comment.user?.id !== bot) continue;
+      // An unconfirmed verdict proves nothing about the rest of the report.
+      // Count only its bot-owned inline root with the exact frozen anchor and draft marker.
+      if (
+        !confirmed &&
+        (comment.commit_id !== review.headSha ||
+          comments.find((item) => item.threadId === comment.threadId)?.id !==
+            comment.id ||
+          !publication?.reviewPayload?.comments.some(
+            (saved, index) =>
+              saved.path === comment.path &&
+              saved.lineStart === comment.lineStart &&
+              saved.lineEnd === comment.lineEnd &&
+              comment.body ===
+                `${saved.body}\n\n<!-- razbor-gitlab-draft:${review.publicId}:${index}:${review.headSha} -->`,
+          ))
+      )
+        continue;
       const finding = review.result.findings.find((f) =>
         comment.body.includes(
           `<!-- razbor:${review.publicId}:${findingKey(f)} -->`,
         ),
       );
       if (finding) {
+        if (!confirmed) publishedKeys.add(findingKey(finding));
+        if (comment.resolved) continue;
         const id = `${remote.id}:${comment.id}`;
         targets.set(id, { reviewId: remote.id, comment });
         previous.push({
@@ -1524,16 +1552,12 @@ const nativeRecoveryPending = sql<boolean>`coalesce(${dispatchOutbox.publication
   or ${dispatchOutbox.publication} #>> '{providerProgress,bulk,id}' is not null
 ), false)`;
 
-/**
- * Serialize one review's acknowledgement or final publication, reconciling
- * remote markers before writes and preserving uncertain outcomes for later
- * recovery. Provider credential failures defer only this review's interaction.
- */
-export async function processInteraction(database: Database, reviewId: string) {
+/** Resolve an active review's owning repository and outbox key before taking its interaction lock. */
+async function interactionScope(database: Database, reviewId: string) {
   const [scope] = await database.db
     .select({
       repositoryId: repositories.publicId,
-      change: reviewTriggers.change,
+      reviewId: reviews.id,
     })
     .from(reviewTriggers)
     .innerJoin(reviews, eq(reviewTriggers.reviewId, reviews.id))
@@ -1541,9 +1565,121 @@ export async function processInteraction(database: Database, reviewId: string) {
     .where(
       and(eq(reviews.publicId, reviewId), eq(repositories.status, "active")),
     );
+  return scope;
+}
+
+const abandonedGitlabBulk =
+  "An operator stopped reconciliation of an unconfirmed GitLab bulk publication. The verdict was not resent.";
+
+/**
+ * Stop retries for one ambiguous GitLab bulk at an operator's request. Reconcile
+ * visible submissions normally; otherwise remove only this run's owned drafts.
+ * Preserve the bulk fence across every provider and database failure.
+ */
+export async function abandonGitlabPublication(
+  database: Database,
+  reviewId: string,
+  originalBotId?: string,
+) {
+  publicIdSchema("review").parse(reviewId);
+  const scope = await interactionScope(database, reviewId);
+  if (!scope) return "ineligible";
+  const result = await interactionLock(
+    database,
+    `repository:${scope.repositoryId}`,
+    async (client) => {
+      const row = await context(database, scope.repositoryId);
+      if (
+        row.repo.status !== "active" ||
+        row.forge.type !== "gitlab" ||
+        !row.hook.botId
+      )
+        return "ineligible";
+      const entry = await publicationView(database, reviewId);
+      const publication = entry?.publication;
+      if (
+        publication?.state === "unconfirmed" &&
+        publication.error === abandonedGitlabBulk
+      )
+        return "abandoned";
+      const operations = publication?.providerProgress;
+      const bulk = operations?.bulk;
+      if (
+        !entry ||
+        !publication?.reviewPayload ||
+        publication.mode !== "review" ||
+        !["publishing", "uncertain", "failed"].includes(publication.state) ||
+        !bulk?.writing ||
+        bulk.submitted ||
+        bulk.id ||
+        bulk.confirmation ||
+        publication.remoteId ||
+        operations?.summary ||
+        publication.inlineIds?.length
+      )
+        return "ineligible";
+      const api = await adapter(database, row, 30000, true);
+      const bot = await api.identity();
+      if (
+        bot.id !== row.hook.botId ||
+        (bulk.botId && bot.id !== bulk.botId) ||
+        (originalBotId !== undefined && bot.id !== originalBotId) ||
+        !api.discardPendingReview
+      )
+        return "ineligible";
+      const number = entry.change.number;
+      const marker = `<!-- razbor-gitlab:${reviewId}:${entry.change.headSha}:${publication.reviewPayload.event}:`;
+      /** A visible summary takes precedence over abandonment, including one that appears during draft cleanup. */
+      const hasSummary = async () =>
+        (await api.comments(number, { complete: true })).some(
+          (note) =>
+            note.user.id === bot.id &&
+            ["pending", "complete", "unconfirmed"].some((state) =>
+              note.body.endsWith(`${marker}${state} -->`),
+            ),
+        );
+      if (await hasSummary()) return "submitted";
+      // Legacy checkpoints did not record the owner. A rotated token cannot see
+      // that owner's drafts, so an empty list cannot establish their absence.
+      if (!bulk.botId && !originalBotId) return "ineligible";
+      const db = drizzle(client);
+      /** Retain the original bulk fence while recording draft IDs recovered during cleanup. */
+      const save = async (value: Publication) => {
+        await db
+          .update(dispatchOutbox)
+          .set({ publication: value })
+          .where(eq(dispatchOutbox.reviewId, scope.reviewId));
+      };
+      const drafts = { ...operations };
+      delete drafts.bulk;
+      await api.discardPendingReview(number, reviewId, drafts, async (next) => {
+        publication.providerProgress = { ...next, bulk };
+        await save(publication);
+      });
+      if (await hasSummary()) return "submitted";
+      await save({
+        ...publication,
+        state: "unconfirmed",
+        writing: false,
+        error: abandonedGitlabBulk,
+      });
+      return "abandoned";
+    },
+  );
+  return result ?? "busy";
+}
+
+/**
+ * Serialize one review's acknowledgement or final publication, reconciling
+ * remote markers before writes and preserving uncertain outcomes for later
+ * recovery. Provider credential failures defer only this review's interaction.
+ */
+export async function processInteraction(database: Database, reviewId: string) {
+  const scope = await interactionScope(database, reviewId);
   if (!scope) return;
   const lock = `repository:${scope.repositoryId}`;
   await interactionLock(database, lock, async (lockClient) => {
+    const interactionDb = drizzle(lockClient);
     const [entry] = await database.db
       .select({
         review: reviews,
@@ -1672,7 +1808,9 @@ export async function processInteraction(database: Database, reviewId: string) {
         });
         return;
       }
-      await database.db
+      // The final GitLab checkpoint can run under the submission lock. Persist it
+      // on the same connection before sending the POST.
+      await interactionDb
         .update(dispatchOutbox)
         .set(next)
         .where(eq(dispatchOutbox.id, outbox.id));
@@ -2457,6 +2595,8 @@ export async function processInteraction(database: Database, reviewId: string) {
         stale: false,
         mode: recapOnly ? "recap" : "review",
         writing: !recapOnly,
+        ...(api.type === "gitlab" &&
+          !recapOnly && { providerProgress: progress.providerProgress ?? {} }),
         reviewPayload: payload,
         error: undefined,
       };
@@ -2483,8 +2623,7 @@ export async function processInteraction(database: Database, reviewId: string) {
         );
         if (!lock.rows[0].locked) throw new ForgeOperationError("unavailable");
         try {
-          const db = drizzle(lockClient);
-          const [hook] = await db
+          const [hook] = await interactionDb
             .select({ enabled: repositoryWebhooks.enabled })
             .from(repositoryWebhooks)
             .innerJoin(
@@ -2501,7 +2640,7 @@ export async function processInteraction(database: Database, reviewId: string) {
             );
           if (!hook?.enabled) throw new ForgeOperationError("permission");
           if (trigger.origin === "automatic" || progress.rearmed) {
-            const [session] = await sessionQuery(db);
+            const [session] = await sessionQuery(interactionDb);
             if (!sessionAllowsReview(session))
               throw new ForgeOperationError("invalid-response");
           }
@@ -2543,6 +2682,7 @@ export async function processInteraction(database: Database, reviewId: string) {
         {
           progress: progress.providerProgress ?? {},
           revision: trigger.change,
+          unconfirmedBody: payload.recapReviewId ? payload.body : undefined,
           requireReady: trigger.origin === "automatic" || !!progress.rearmed,
           submit: submitUnderPolicy,
           save: saveProviderProgress,

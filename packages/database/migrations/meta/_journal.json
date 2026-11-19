@@ -225,6 +225,13 @@
       "when": 1790000000031,
       "tag": "0031_deferred_open_deliveries",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790000000032,
+      "tag": "0032_gitlab_session_boundaries",
+      "breakpoints": true
     }
   ]
 }

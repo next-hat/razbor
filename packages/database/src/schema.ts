@@ -1095,6 +1095,8 @@ export const webhookDeliveries = pgTable(
       .references(() => repositoryWebhooks.id),
     deliveryId: text("delivery_id").notNull(),
     closedCommandId: text("closed_command_id"),
+    boundaryNumber: integer("boundary_number"),
+    boundaryAt: timestamp("boundary_at", { withTimezone: true }),
     pendingOpen: jsonb("pending_open").$type<
       Exclude<ForgeWebhook, { kind: "ping" | "push" | "comment" }> & {
         hookUpdatedAt: string;
@@ -1110,6 +1112,9 @@ export const webhookDeliveries = pgTable(
   },
   (t) => [
     uniqueIndex("delivery_identity").on(t.webhookId, t.deliveryId),
+    index("delivery_session_boundary")
+      .on(t.webhookId, t.boundaryNumber, t.boundaryAt)
+      .where(sql`${t.boundaryNumber} is not null`),
     index("delivery_due_open")
       .on(t.openRetryAfter)
       .where(sql`${t.openRetryAfter} is not null`),

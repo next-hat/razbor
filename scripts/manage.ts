@@ -13,6 +13,7 @@ import {
   revokeToken,
   ownedWorkspaces,
   applyWebhookSettings,
+  abandonGitlabPublication,
   RunnerInputError,
 } from "@razbor/database";
 import { migrate, migrateEmbeddings } from "@razbor/database/migrate";
@@ -238,6 +239,26 @@ async function main() {
       case "repository":
         await repositoryCommand(database, command, args);
         break;
+      case "review": {
+        if (
+          command !== "abandon-gitlab-publication" ||
+          !(
+            args.length === 1 ||
+            (args.length === 3 &&
+              args[1] === "--original-bot-id" &&
+              /^[1-9]\d*$/.test(args[2]))
+          )
+        )
+          throw new Error("unknown administrative command");
+        const outcome = await abandonGitlabPublication(
+          database,
+          args[0],
+          args[2],
+        );
+        console.log(JSON.stringify({ reviewId: args[0], outcome }));
+        if (outcome !== "abandoned") process.exitCode = 1;
+        break;
+      }
       case "index":
         await indexCommand(database, command, args);
         break;

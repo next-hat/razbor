@@ -125,8 +125,36 @@ changes, it also checks the bot's approval permission before sending and the
 returned reviewer state immediately afterward. GitLab cannot rule out a change
 and reversal between these observations. If the response is lost or Razbor
 cannot verify the outcome, the console and reconciled summary show the verdict
-as **unconfirmed**. Recovery verifies the marked notes without sending another
+as **unconfirmed**. An unconfirmed follow-up keeps the full result in its own
+summary, including findings without inline anchors. Later reviews recognize
+verified inline notes and avoid posting them again. Recovery never resends the
 bulk request. [GitLab Draft Notes API](https://docs.gitlab.com/api/draft_notes/#publish-all-pending-draft-notes)
+
+If a worker stopped at the bulk POST and reconciliation cannot find the summary,
+inspect the MR and its drafts using the original bot account. To stop retrying
+that review, substitute its review ID in the command below.
+
+```sh
+docker compose run --rm manage review abandon-gitlab-publication rev_ABCDEFGHIJKLMNOP
+```
+
+Older submissions may lack a saved bot ID. If GitLab has no visible summary,
+verify which bot submitted the original review, restore that bot's credential,
+and append `--original-bot-id <numeric-user-id>` to the command. The command
+checks the supplied ID against the authenticated GitLab account.
+
+An `abandoned` outcome removes identifiable unpublished drafts owned by that
+review and records the verdict as unconfirmed. A visible marked summary yields
+`submitted` and the dispatcher continues normal reconciliation. An `ineligible`
+result means the command found no ambiguous GitLab bulk to abandon or could
+not confirm its owning identity. A `busy` result means another interaction is
+running for that repository. The command never posts a verdict. GitLab may
+still complete an earlier request after the operator stops reconciliation.
+
+Before submitting, Razbor lists the bot's drafts again and checks their IDs,
+text and positions against the reviewed findings. GitLab publishes all the bot's
+drafts on the MR and accepts no expected draft list. Give Razbor its own bot
+identity when other tools would otherwise write drafts under that account.
 
 If a review becomes stale after a GitLab draft creation was interrupted, Razbor
 checks the bot's complete draft list. For a create without a returned ID, it
@@ -229,7 +257,9 @@ For fully automatic reviews, Razbor reads the target repository’s current
 visibility and the PR author from the forge. On a public repository it compares
 the author's login to explicit entries in `permitted_senders` case-insensitively.
 The `*` entry cannot authorize a public PR author. A permitted user can still
-request a review of a contributor’s PR with `/agentic_review`.
+request a review of a contributor’s PR with `/agentic_review`. When the forge
+reports private or internal visibility, fully automatic mode covers ready PRs
+from any author, including contributors outside the sender list.
 
 GitHub sends `pull_request` actions, including `synchronize` and
 `ready_for_review`. Retargeting a PR to another base branch also triggers a

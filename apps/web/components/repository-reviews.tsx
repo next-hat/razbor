@@ -155,7 +155,7 @@ export function RepositoryReviews({
               <EmptyTitle>No reviews yet</EmptyTitle>
               <EmptyDescription>
                 {reviewTriggerMode === "automatic" ? (
-                  "Open a pull request that is ready for review. Razbor queues a review automatically."
+                  "Open a pull request that is ready for review. On public repositories, Razbor queues automatic reviews only for authors named in the permitted senders list."
                 ) : isAdmin && reviewCommand ? (
                   <>
                     Comment <code>{reviewCommand}</code> on a pull request to

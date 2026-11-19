@@ -233,6 +233,7 @@ test("current change reads use the target repository, immutable fork revisions a
   let summaryBody = "";
   let interruptSummaryRead = false;
   let cleanupDraft: { id: number; note: string; author_id: number } | undefined;
+  let introduceDraftOnApprovalRead = false;
   t.mock.method(globalThis, "fetch", async (input: URL, init: RequestInit) => {
     assert.equal(input.origin, origin);
     const url = input.pathname;
@@ -281,8 +282,15 @@ test("current change reads use the target repository, immutable fork revisions a
       return Response.json([]);
     if (url.endsWith("/merge_requests/12/draft_notes"))
       return Response.json(cleanupDraft ? [cleanupDraft] : []);
-    if (url.endsWith("/merge_requests/12/approvals"))
+    if (url.endsWith("/merge_requests/12/approvals")) {
+      if (introduceDraftOnApprovalRead)
+        cleanupDraft = {
+          id: 22,
+          note: "Another workflow's draft",
+          author_id: 5,
+        };
       return Response.json({ user_can_approve: bulkOutcome !== "downgraded" });
+    }
     if (url.endsWith("/merge_requests/12/reviewers"))
       return Response.json([
         {
@@ -373,10 +381,17 @@ test("current change reads use the target repository, immutable fork revisions a
             progress: {},
             revision: { ...change, baseSha: expectedBase },
             requireReady: true,
-            /** Convert the MR after GitLab saves its intention to submit the native verdict. */
+            /** Change readiness before GitLab's guarded preflight. */
+            submit:
+              type === "gitlab"
+                ? (write) => {
+                    draft = true;
+                    return write();
+                  }
+                : undefined,
+            /** Record whether the adapter classified this as a possible remote submission. */
             async save(progress) {
               bulkWriting = !!progress.bulk?.writing;
-              if (bulkWriting) draft = true;
             },
           },
         ),
@@ -392,6 +407,50 @@ test("current change reads use the target repository, immutable fork revisions a
     await rejectsPublication(base);
     assert.equal(draft, true);
     if (type === "gitlab") {
+      let preflight: ForgePublicationProgress = {};
+      const interrupted = new Error("worker stopped before native submission");
+      /** Retry the same frozen review with the durable state from its previous preflight. */
+      const submitWith = (interrupt = false) =>
+        forge.postReview(
+          12,
+          head,
+          "<!-- razbor:rev_abcdefghijklmnop:result -->",
+          [],
+          "REQUEST_CHANGES",
+          {
+            revision: change,
+            progress: preflight,
+            requireReady: true,
+            submit: interrupt
+              ? async () => {
+                  throw interrupted;
+                }
+              : undefined,
+            async save(checkpoint) {
+              preflight = structuredClone(checkpoint);
+            },
+          },
+        );
+      draft = false;
+      await assert.rejects(submitWith(true), interrupted);
+      assert.equal(structuredClone(preflight).bulk, undefined);
+      introduceDraftOnApprovalRead = true;
+      await assert.rejects(
+        submitWith(),
+        (error: unknown) =>
+          error instanceof ForgeOperationError &&
+          error.reason === "invalid-response" &&
+          !error.uncertain,
+      );
+      assert.equal(bulkPosts, 0);
+      assert.equal(structuredClone(preflight).bulk, undefined);
+      assert.equal(cleanupDraft?.id, 22);
+      cleanupDraft = undefined;
+      introduceDraftOnApprovalRead = false;
+      await assert.rejects(submitWith()); // This fixture interrupts the first post-submit summary read.
+      assert.equal(preflight.bulk?.submitted, true);
+      assert.equal(await submitWith(), "17");
+      assert.equal(bulkPosts, 1);
       // Recover the notes for each submission with only the evidence captured around its own POST.
       for (const outcome of [
         "accepted",
@@ -431,6 +490,7 @@ test("current change reads use the target repository, immutable fork revisions a
           saved.bulk.submitted,
           outcome === "lost" ? undefined : true,
         );
+        assert.equal(saved.bulk.botId, "5");
         draft = true;
         outdatedDiff = false;
         assert.equal(await publish(), "17");

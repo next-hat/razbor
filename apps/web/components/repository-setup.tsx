@@ -531,7 +531,7 @@ export function RepositorySetup({
           <AlertTitle>Your first review</AlertTitle>
           <AlertDescription>
             {repo?.reviewTriggerMode === "automatic" ? (
-              "Once the webhook is ready, open a pull or merge request that is ready for review. Razbor queues a review and reviews subsequent source changes automatically."
+              "Once the webhook is ready, Razbor reviews ready pull or merge requests and subsequent source changes. On public repositories, the author must be named in the permitted senders list."
             ) : repo?.reviewCommand ? (
               <>
                 Open a pull or merge request and comment{" "}

@@ -50,12 +50,16 @@ databases. They exercise source-only and indexed policy decisions with simulated
 attempts and controlled results. The GitLab fork fixture opens an MR before its
 diff refs exist. It checks that the dispatcher recovers the first review after
 a restart, retries source and readiness changes, and ends old opt-ins while a diff
-is pending. Disabling and re-enabling the webhook revokes the deferred delivery.
+is pending. Webhook settings edits revoke deferred work and retain the timestamp
+that prevents a pre-reopen command from activating a new continuous session.
 The delayed-delivery check inspects the queued head before sending another update.
 The public PR check uses different authors in the signed event and the forge response.
 Publication checks cover webhook disablement and opt-in revocation before submission,
 recovery after a lost response, unconfirmed GitLab verdicts, and reuse of a saved
-result after draft cleanup.
+result after draft cleanup. The GitLab fixture also checks that unconfirmed
+follow-ups show unanchored findings, that later reviews suppress verified inline
+duplicates, and that the management CLI can abandon an ambiguous bulk without
+resubmitting it or deleting another user's draft.
 The status-comment fixture covers masked 404s, deletion during an active review,
 and recovery after a bot rotation through restored credentials or manual removal.
 These checks do not need model credentials.

@@ -75,6 +75,8 @@ export type ForgePublicationProgress = Record<
   {
     id?: string;
     writing?: boolean;
+    /** GitLab identity that owned the draft set when the bulk submission was fenced. */
+    botId?: string;
     submitted?: boolean;
     /** The first complete draft listing that found an uncertain create absent during cleanup. */
     missingSince?: number;
@@ -89,6 +91,8 @@ export type ForgePublicationProgress = Record<
 
 export type ForgeReviewPublication = {
   progress: ForgePublicationProgress;
+  /** Full frozen result when the provider cannot confirm a follow-up verdict or update its earlier recap. */
+  unconfirmedBody?: string;
   /** Persisted review snapshot to verify before submitting a native review. */
   revision?: ForgeChange;
   /** Automatic reviews must still be ready when the provider receives the review. */

@@ -427,6 +427,13 @@ export async function acceptReviewTrigger(
           : receipt.createdAt;
       if (!reset || reset < boundary) reset = boundary;
       if (closed || (since && since <= reset)) since = null;
+      if (forge === "gitlab" && closed && !session) {
+        // No PR row exists yet to retain this verified closure.
+        await tx
+          .update(webhookDeliveries)
+          .set({ boundaryNumber: event.number, boundaryAt: boundary })
+          .where(eq(webhookDeliveries.id, receipt.id));
+      }
     }
     if (observation.waitingForDiff && event.kind !== "comment") {
       // GitLab verified the MR is open but has no current diff. Invalidate the
@@ -494,28 +501,21 @@ export async function acceptReviewTrigger(
       !observation.conversation &&
       active.reviewTriggerMode === "opt_in_continuous";
     if (activating && forge === "gitlab") {
-      // A close/reopen can arrive before the first PR snapshot exists. Its
-      // durable receipt still fences a delayed command that beats the retry.
-      const [pending] = await tx
-        .select({
-          boundary: sql<
-            string | null
-          >`max(coalesce((${webhookDeliveries.pendingOpen}->>'occurredAt')::timestamptz,
-            ${webhookDeliveries.createdAt}))::text`,
-        })
+      // A verified close/reopen can precede the first PR snapshot. Its time
+      // belongs to the MR even if a settings edit revoked the delivery retry.
+      const [latest] = await tx
+        .select({ boundary: webhookDeliveries.boundaryAt })
         .from(webhookDeliveries)
         .where(
           and(
             eq(webhookDeliveries.webhookId, hook.id),
-            sql`${webhookDeliveries.openRetryAfter} is not null`,
-            sql`${webhookDeliveries.pendingOpen}->>'number' = ${String(event.number)}`,
-            sql`${webhookDeliveries.pendingOpen}->>'kind' in ('closed', 'reopened')`,
-            sql`${webhookDeliveries.pendingOpen}->>'hookUpdatedAt' = ${hook.updatedAt.toISOString()}`,
+            eq(webhookDeliveries.boundaryNumber, event.number),
           ),
-        );
-      if (pending.boundary) {
-        const boundary = new Date(pending.boundary);
-        if (!reset || reset < boundary) reset = boundary;
+        )
+        .orderBy(desc(webhookDeliveries.boundaryAt))
+        .limit(1);
+      if (latest?.boundary) {
+        if (!reset || reset < latest.boundary) reset = latest.boundary;
         if (since && since <= reset) since = null;
       }
     }

@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import { test } from "node:test";
+import { promisify } from "node:util";
 
 import {
   acceptWebhook,
+  abandonGitlabPublication,
   applyWebhookSettings,
   beginAttempt,
   connectDatabase,
@@ -13,6 +16,7 @@ import {
   listRepositories,
   listReviews,
   pendingDispatches,
+  preparePublication,
   processDeferredOpen,
   processInteraction,
   publicationView,
@@ -520,6 +524,9 @@ test(
         }
       | undefined;
     let bulkRequests = 0;
+    const discussions: unknown[] = [];
+    const diff =
+      "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -0,0 +1 @@\n+changed\n";
     let hideDeletion = true;
     let hookUrl: string | undefined;
     let origin = "";
@@ -575,7 +582,8 @@ test(
         return send({});
       }
       if (path.endsWith("/draft_notes/bulk_publish")) bulkRequests++;
-      if (path.endsWith("/discussions")) return send([]);
+      if (path.endsWith("/discussions")) return send(discussions);
+      if (path.endsWith("/raw_diffs")) return res.end(diff);
       if (path.endsWith("/notes/52") && req.method === "PUT" && summaryNote) {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk);
@@ -585,7 +593,8 @@ test(
       if (path.endsWith("/notes"))
         return send(
           req.method === "GET"
-            ? summaryNote
+            ? summaryNote &&
+              Number(new URL(req.url!, origin).searchParams.get("page")) <= 1
               ? [summaryNote]
               : []
             : { id: 51 },
@@ -719,14 +728,24 @@ test(
       start = "4".repeat(40);
       diffReady = false;
       /** Deliver one signed lifecycle observation for this MR and diff version. */
-      function deliver(id: string, action: string, ready = false) {
+      function deliver(
+        id: string,
+        action: string,
+        ready = false,
+        occurredAt?: string,
+      ) {
         return acceptWebhook(
           database,
           hook!.id,
           Buffer.from(
             JSON.stringify({
               ...payload,
-              object_attributes: { ...payload.object_attributes, iid, action },
+              object_attributes: {
+                ...payload.object_attributes,
+                iid,
+                action,
+                actioned_at: occurredAt,
+              },
               ...(ready && {
                 changes: { draft: { previous: true, current: false } },
               }),
@@ -775,15 +794,34 @@ test(
       );
       assert.equal(unchanged.start_sha, "4".repeat(40));
       // Resume a closed MR after a draft creation lost its response, before any native submission.
+      const anchored = {
+        severity: "high" as const,
+        path: "file.ts",
+        lineStart: 1,
+        lineEnd: 1,
+        title: "Missing retry",
+        body: "The request can be dropped.",
+        failureScenario: "A network timeout loses the request.",
+        suggestion: "Retry a failed request.",
+      };
+      const unanchored = {
+        ...anchored,
+        path: "other.ts",
+        title: "Missing timeout",
+        failureScenario: "A stalled request blocks shutdown.",
+      };
+      const result = {
+        summary: "Saved result",
+        findings: [anchored, unanchored],
+      };
+      const [inline] = preparePublication(result, diff, review.id).comments;
+      assert.ok(inline);
       await finishAttempt(
         database,
         review.id,
         reservation.attemptId,
         "fixture",
-        {
-          summary: "Saved result",
-          findings: [],
-        },
+        result,
       );
       await database.pool.query(
         "update dispatch_outbox set acknowledged_at = now(), publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
@@ -839,13 +877,32 @@ test(
       assert.equal(restored?.state, "pending");
       assert.equal(restored?.rearmed, true);
       // A lost native response can establish the submitted notes without proving the original verdict.
-      const summary = `Saved result\n\n<!-- razbor:${review.id}:result -->`;
+      const marker = `<!-- razbor:${review.id}:result -->`;
+      const summary = `Saved result: ${unanchored.title}\n\n<!-- razbor:${review.id}:recap -->`;
       summaryNote = {
         id: 52,
         author: { id: 9, username: "razbor" },
         created_at: "2026-01-01T00:00:00Z",
-        body: `${summary}\n\n<!-- razbor-gitlab:${review.id}:${head}:REQUEST_CHANGES:pending -->`,
+        body: `${marker}\n\n<!-- razbor-gitlab:${review.id}:${head}:REQUEST_CHANGES:pending -->`,
       };
+      discussions.push({
+        id: "thread-61",
+        notes: [
+          {
+            ...summaryNote,
+            id: 61,
+            body: `${inline.body}\n\n<!-- razbor-gitlab-draft:${review.id}:0:${head} -->`,
+            position: {
+              new_path: inline.path,
+              old_path: inline.path,
+              new_line: inline.lineEnd,
+              head_sha: head,
+              base_sha: base,
+              start_sha: target,
+            },
+          },
+        ],
+      });
       await database.pool.query(
         "update dispatch_outbox set publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
         [
@@ -855,13 +912,18 @@ test(
             writing: true,
             reviewPayload: {
               body: summary,
-              comments: [],
+              comments: [inline],
               event: "REQUEST_CHANGES",
+              recapReviewId: "51",
             },
             providerProgress: { bulk: { writing: true } },
           }),
           review.id,
         ],
+      );
+      assert.equal(
+        await abandonGitlabPublication(database, review.id),
+        "submitted",
       );
       await processInteraction(database, review.id);
       const recovered = (await publicationView(database, review.id))
@@ -873,9 +935,9 @@ test(
         "response-unconfirmed",
       );
       assert.match(summaryNote.body, /GitLab verdict unconfirmed/);
+      assert.ok(summaryNote.body.includes(unanchored.title));
       await processInteraction(database, review.id);
       assert.equal(bulkRequests, 0);
-      summaryNote = undefined;
       // A ready transition with no source change signal also survives GitLab's pending diff.
       diffReady = false;
       start = "6".repeat(40);
@@ -888,6 +950,127 @@ test(
         "select start_sha from pull_requests where number = 27",
       );
       assert.equal(ready.start_sha, start);
+      const [followup] = await listReviews(database);
+      const nextAttempt = await beginAttempt(
+        database,
+        followup.id,
+        "fixture",
+        30000,
+      );
+      if (nextAttempt.kind !== "started")
+        throw new Error("expected the follow-up review to start");
+      assert.deepEqual(
+        nextAttempt.source.previousFindings?.map((f) => [
+          f.id,
+          f.finding.title,
+        ]),
+        [["52:61", anchored.title]],
+      );
+      await finishAttempt(
+        database,
+        followup.id,
+        nextAttempt.attemptId,
+        "fixture",
+        {
+          ...result,
+          findingChecks: [
+            {
+              id: "52:61",
+              status: "open",
+              evidence: "The request still lacks a retry.",
+            },
+          ],
+        },
+      );
+      await processInteraction(database, followup.id);
+      const frozen = (await publicationView(database, followup.id))?.publication
+        ?.reviewPayload;
+      assert.ok(frozen);
+      assert.deepEqual(frozen.comments, []);
+      assert.equal(frozen.recapReviewId, undefined);
+      assert.ok(frozen.body.includes(unanchored.title));
+      summaryNote = undefined;
+      discussions.length = 0;
+
+      // A worker can stop between recording the bulk fence and sending the POST.
+      // Only explicit operator recovery may clear this run's drafts and stop retries.
+      assert.equal(
+        await abandonGitlabPublication(database, followup.id),
+        "ineligible",
+      );
+      await database.pool.query(
+        "update dispatch_outbox set publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
+        [
+          JSON.stringify({
+            state: "uncertain",
+            mode: "review",
+            writing: true,
+            reviewPayload: { ...frozen, comments: [inline] },
+            providerProgress: {
+              "draft-0": { id: "41" },
+              bulk: { writing: true },
+            },
+          }),
+          followup.id,
+        ],
+      );
+      draftNote = {
+        id: 41,
+        author_id: 8,
+        note: `${inline.body}\n\n<!-- razbor-gitlab-draft:${followup.id}:0:${head} -->`,
+      };
+      assert.equal(
+        await abandonGitlabPublication(database, followup.id),
+        "ineligible",
+      );
+      assert.equal(
+        await abandonGitlabPublication(database, followup.id, "8"),
+        "ineligible",
+      );
+      await assert.rejects(
+        abandonGitlabPublication(database, followup.id, "9"),
+      );
+      assert.ok(draftNote);
+      assert.equal(
+        (await publicationView(database, followup.id))?.publication
+          ?.providerProgress?.bulk.writing,
+        true,
+      );
+      draftNote.author_id = 9;
+      const priorBulkRequests = bulkRequests;
+      const { stdout } = await promisify(execFile)(
+        process.execPath,
+        [
+          "--import=tsx",
+          "scripts/manage.ts",
+          "review",
+          "abandon-gitlab-publication",
+          followup.id,
+          "--original-bot-id",
+          "9",
+        ],
+        {
+          env: {
+            PATH: process.env.PATH,
+            RAZBOR_DATABASE_URL: fixture.url,
+          },
+        },
+      );
+      assert.deepEqual(JSON.parse(stdout), {
+        reviewId: followup.id,
+        outcome: "abandoned",
+      });
+      assert.equal(draftNote, undefined);
+      assert.equal(
+        await abandonGitlabPublication(database, followup.id),
+        "abandoned",
+      );
+      await processInteraction(database, followup.id);
+      assert.equal(
+        (await publicationView(database, followup.id))?.publication?.state,
+        "unconfirmed",
+      );
+      assert.equal(bulkRequests, priorBulkRequests);
 
       // A close can be delivered after the MR has already reopened. Clear the
       // opt-in before a source update can see a usable diff and beat the retry.
@@ -918,8 +1101,26 @@ test(
       // the first known reopen can run once but cannot opt the new session in.
       iid = 28;
       diffReady = false;
-      assert.equal(await deliver("mr-first-reopen", "reopen"), 202);
+      const resetTime = "2026-01-01T00:00:00.000Z";
+      assert.equal(
+        await deliver("mr-first-reopen", "reopen", false, resetTime),
+        202,
+      );
+      // The sender is still permitted after the settings edit. Revocation
+      // consumes the original deferred work without erasing its verified reset.
+      config.repositories.project.webhook!.permitted_senders.push("bob");
+      await applyWebhookSettings(database, config);
+      await processDeferredOpen(database);
+      const {
+        rows: [receipt],
+      } = await database.pool.query(
+        "select pending_open, open_retry_after, boundary_at from webhook_deliveries where delivery_id = 'mr-first-reopen'",
+      );
+      assert.equal(receipt.pending_open, null);
+      assert.equal(receipt.open_retry_after, null);
+      assert.equal(receipt.boundary_at.toISOString(), resetTime);
       diffReady = true;
+      const priorReviews = (await listReviews(database)).length;
       const delayedCommand = Buffer.from(
         JSON.stringify({
           object_kind: "note",
@@ -949,7 +1150,8 @@ test(
         "select continuous_review_since, review_session_reset_at from pull_requests where number = 28",
       );
       assert.equal(first.continuous_review_since, null);
-      assert.ok(first.review_session_reset_at);
+      assert.equal(first.review_session_reset_at.toISOString(), resetTime);
+      assert.equal((await listReviews(database)).length, priorReviews + 1);
     } finally {
       delete process.env.RAZBOR_TEST_MR_SECRET;
       await new Promise<void>((resolve) => server.close(() => resolve()));
