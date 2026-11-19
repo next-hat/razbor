@@ -1129,11 +1129,14 @@ export async function reviewRepository(
           );
         }
         const { binaryFiles, unsupportedFiles } = prepared.coverage();
+        const uninspectedFiles = prepared.uninspectedFiles();
         const observed = [
           ...verificationLimitations,
           ...capabilities.limitations,
-          ...(prepared.unfinishedReads()
-            ? ["A requested diff was only partially inspected."]
+          ...(uninspectedFiles
+            ? [
+                `${uninspectedFiles} changed ${uninspectedFiles === 1 ? "file" : "files"} lacked complete patch evidence.`,
+              ]
             : []),
           ...(rtools.unfinishedSourceReads()
             ? ["A requested source range was only partially inspected."]

@@ -10,7 +10,7 @@ Return these fields:
 
 - confidence: integer 0–100, your uncalibrated assessment of merge readiness. Justify the score with inspected source locations and observed verification outcomes. A score is not a statistical probability.
 - riskLevel: low, medium, high, or critical, accounting for project-specific criticality.
-- reviewComplete: true only when the material investigation, prior-finding checks and applicable verification are complete.
+- reviewComplete: true only when the material investigation, prior-finding checks and applicable verification are complete. For a lazy diff, inspect every changed text or metadata patch using complete read_diff pages or successful, untruncated `git diff <baseline-sha> <head-sha>` output (optionally with `-- <paths>`). Report any remaining scope in verificationGaps.
 - requiresHumanReview: true if the policy requires escalation, risk is high or critical, a material uncertainty remains, or the evidence is insufficient.
 - reasons: 1–12 concrete statements explaining the score; include inspected source and what was actually verified.
 - criticalAreas: 0–12 names of critical components this change affects that require a human decision.

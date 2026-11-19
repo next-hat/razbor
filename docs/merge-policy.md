@@ -49,7 +49,13 @@ Source patterns are case-sensitive and relative to the repository root. Within o
 
 ## How a decision is made
 
-The model receives the saved policy and allowlist in both indexed and source-only reviews. Confidence is an **uncalibrated model assessment of merge readiness**. A score of 95 is not a 95% probability of correctness. Repository managers can inspect the detailed assessment evidence, commands and verification gaps on the review. Members see the score, risk and service-generated decision reasons. Forge escalation comments use service-generated reasons and the verified reviewer names. A complete, low-risk review still needs a matching policy version and revisions, no actionable or outstanding findings, and provider permission to merge. New code reviews include a structured assessment. Historical results without one cannot authorize merging.
+The model receives the saved policy and allowlist in both indexed and source-only reviews. Confidence is an **uncalibrated model assessment of merge readiness**. A score of 95 is not a 95% probability of correctness. Repository managers can inspect the detailed assessment evidence, commands and verification gaps on the review. Members see the score, risk and service-generated decision reasons. Forge escalation comments use service-generated reasons and the verified reviewer names. A complete, low-risk review still needs a matching policy version and revisions, no actionable or outstanding findings, and provider permission to merge.
+
+For automatic approval or merge, the harness must have supplied the complete patch for every changed text file and metadata-only change. Inline diffs, completed `read_diff` pages and matching untruncated Git output for the reviewed commits count. A file list, a head-only source read or a partial patch leaves a verification gap and routes the PR to human review.
+
+New code reviews include a structured assessment. Historical results without one cannot authorize merging.
+
+If you ran an earlier Phase 3 preview, disable automation before upgrading, then re-enable it and request fresh reviews. The policy version change invalidates assessments recorded before patch coverage was enforced.
 
 The server reconciles published findings, including open and uncertain findings from earlier runs, before checking the forge. High or critical risk, affected critical areas, incomplete investigation, and an explicit request for human review all require a human. Markdown can explain project criticality. The server owns authorization and enforces the saved structured policy and provider protections.
 

@@ -189,7 +189,6 @@ export class PreparedDiff {
     { selection: number[]; position: Position }
   >();
   private readonly supplied = new Map<number, number>();
-  private readonly requested = new Set<number>();
   private readonly completeExecPatches = new Set<string>();
   readCalls = 0;
   returnedBytes = 0;
@@ -286,15 +285,15 @@ export class PreparedDiff {
       this.completeExecPatches.add(patchIdentity(patch));
   }
 
-  /** Count requested text patches whose complete contents have yet to reach the reviewer. */
-  unfinishedReads() {
-    return [...this.requested].filter((index) => {
+  /** Counts supported changes whose full patch was absent from both diff delivery and pinned Git output. */
+  uninspectedFiles() {
+    return this.files.filter((file, index) => {
       const patch = this.patches[index];
       return (
-        (this.files[index].content === "text" ||
-          this.files[index].content === "metadata") &&
+        (file.content === "text" || file.content === "metadata") &&
         (this.supplied.get(index) ?? 0) < patch.length &&
-        !this.completeExecPatches.has(patchIdentity(patch))
+        (!this.completeExecPatches.size ||
+          !this.completeExecPatches.has(patchIdentity(patch)))
       );
     }).length;
   }
@@ -601,7 +600,6 @@ export class PreparedDiff {
     }
     const result = JSON.stringify(envelope(cursor));
     this.signal?.throwIfAborted();
-    for (const index of selection) this.requested.add(index);
     for (const [index, end] of updates) this.markSupplied(index, end);
     this.recordRead(Buffer.byteLength(result));
     return result;

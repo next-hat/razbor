@@ -8,6 +8,7 @@ import pino, { type Logger } from "pino";
 
 import {
   capabilityLimitsSchema,
+  evaluateMergeDecision,
   mergePolicySchema,
   type MergeAssessment,
 } from "@razbor/contracts";
@@ -517,31 +518,118 @@ for (const indexed of [false, true]) {
   );
 }
 
-test("an exec inspection of the pinned lazy diff retains the complete assessment", async (t) => {
-  const f = await fixture(t, "openai", [
-    () => ({
-      call: {
-        id: "inspect",
-        argv: ["git", "diff", f.files.base, f.files.head],
-      },
-    }),
-    (payload) => {
-      assert.match(
-        JSON.stringify(toolBlocks("openai", payload)),
-        /new implementation/,
-      );
+for (const inspection of [
+  "manifest only",
+  "one head file",
+  "one read_diff patch",
+  "both read_diff patches",
+  "one pinned exec patch",
+  "both pinned exec patches",
+] as const) {
+  test("lazy merge assessment after inspecting " + inspection, async (t) => {
+    const complete = inspection.startsWith("both");
+    const steps: ((payload: Payload) => Reply)[] = [];
+    if (inspection !== "manifest only") {
+      steps.push(() => {
+        if (inspection === "one head file")
+          return {
+            call: {
+              id: "inspect",
+              name: "read_file",
+              args: { path: "source.ts", startLine: 1, endLine: 2 },
+            },
+          };
+        if (inspection.includes("read_diff"))
+          return {
+            call: {
+              id: "inspect",
+              name: "read_diff",
+              args: {
+                paths: complete ? ["source.ts", "related.ts"] : ["source.ts"],
+              },
+            },
+          };
+        return {
+          call: {
+            id: "inspect",
+            argv: [
+              "git",
+              "diff",
+              f.files.base,
+              f.files.head,
+              ...(complete ? [] : ["--", "source.ts"]),
+            ],
+          },
+        };
+      });
+    }
+    steps.push((payload) => {
+      const blocks = toolBlocks("openai", payload);
+      if (inspection === "manifest only") {
+        assert.equal(blocks.length, 0);
+        assert.match(JSON.stringify(payload.input), /related\.ts/);
+        assert.doesNotMatch(
+          JSON.stringify(payload.input),
+          /new implementation|new related behavior/,
+        );
+      } else {
+        const observed = String(blocks.at(-1)?.output);
+        assert.match(observed, /new implementation/);
+        assert.equal(observed.includes("new related behavior"), complete);
+      }
       return {
         text: JSON.stringify({ ...result, mergeAssessment: readyAssessment }),
       };
-    },
-  ]);
-  const returned = await f.review({
-    initialDiffMaxBytes: 0,
-    mergePolicy: { version: 1, policy: mergePolicySchema.parse({}) },
+    });
+    const f = await fixture(t, "openai", steps);
+    await f.files.write("related.ts", "new related behavior\n");
+    f.files.head = await f.files.commit();
+    const snapshot = {
+      version: 1,
+      policy: mergePolicySchema.parse({
+        enabled: true,
+        dryRun: false,
+        autoApprove: true,
+      }),
+    };
+    const returned = await f.review({
+      initialDiffMaxBytes: 0,
+      mergePolicy: snapshot,
+    });
+    const assessment = returned.mergeAssessment;
+    assert.ok(assessment);
+    if (complete) assert.deepEqual(assessment, readyAssessment);
+    else {
+      assert.equal(assessment.reviewComplete, false);
+      assert.equal(assessment.requiresHumanReview, true);
+      const gap =
+        inspection === "manifest only" || inspection === "one head file"
+          ? /2 changed files.*patch/
+          : /1 changed file.*patch/;
+      assert.match(assessment.verificationGaps.join(" "), gap);
+    }
+    if (inspection === "both pinned exec patches")
+      assert.match(returned.summary, /optional diff delivery/);
+    const decision = evaluateMergeDecision({
+      result: returned,
+      snapshot,
+      currentPolicyVersion: 1,
+      reviewStatus: "completed",
+      outstandingFindings: 0,
+      revisionCurrent: true,
+      open: true,
+      draft: false,
+      defaultBranch: "main",
+      baseBranch: "main",
+      humanEscalated: false,
+      provider: { guarded: true, checks: "passing", restrictions: "satisfied" },
+    });
+    assert.equal(
+      decision.status,
+      complete ? "auto_merge_eligible" : "human_review_required",
+    );
   });
-  assert.match(returned.summary, /optional diff delivery/);
-  assert.deepEqual(returned.mergeAssessment, readyAssessment);
-});
+}
 
 test("binary content and truncated exec evidence still downgrade a complete assessment", async (t) => {
   const f = await fixture(t, "openai", [
@@ -678,7 +766,7 @@ for (const scenario of [
     );
     f.files.head = await f.files.commit();
     const returned = await f.review({
-      initialDiffMaxBytes: 0,
+      initialDiffMaxBytes: diff ? 0 : 24_000,
       capabilities: {
         instructions: [],
         skills: [],
