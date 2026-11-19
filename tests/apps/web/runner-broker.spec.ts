@@ -302,6 +302,28 @@ test(
         ),
         { status: 401 },
       );
+      await t.test(
+        "a live source grant survives the previous 30-second proxy cutoff",
+        async (t) => {
+          const timeout = AbortSignal.timeout.bind(AbortSignal);
+          t.mock.method(AbortSignal, "timeout", (ms: number) =>
+            ms === 30000
+              ? AbortSignal.abort(
+                  new Error("fixture transfer exceeded 30 seconds"),
+                )
+              : timeout(ms),
+          );
+          const response = await broker.source(
+            plain.attemptId,
+            plain.capabilityToken,
+            jsonRequest({}),
+          );
+          assert.equal(
+            await response.text(),
+            `fixture pack ${plain.attemptId}`,
+          );
+        },
+      );
       await assert.rejects(
         broker.mcp(plain.attemptId, plain.capabilityToken, jsonRequest({})),
         { status: 403 },

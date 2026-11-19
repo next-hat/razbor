@@ -72,6 +72,8 @@ export class IndexWorkspace extends OwnedWorkspace {
   private async closeBackend() {
     const backend = this.backend;
     if (backend) {
+      // close() aborts the client even when daemon shutdown cannot be confirmed.
+      this.backendInitialized = false;
       await backend.close();
       this.backend = undefined;
     }
@@ -254,7 +256,6 @@ export class IndexWorkspace extends OwnedWorkspace {
             "graph_bootstrap",
             this.memory.startup_ms + this.memory.index_ms,
           );
-          this.backendInitialized = true;
           this.backend = new MemoryBackend(
             this.memory,
             this.source.repository,
@@ -263,6 +264,7 @@ export class IndexWorkspace extends OwnedWorkspace {
             true,
           );
           indexedAt = await this.backend.start(active);
+          this.backendInitialized = true;
         } else {
           updatePhase("graph_readiness", this.memory.index_ms);
           await this.backend.validateSource(active);

@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, writeFile, lstat, realpath, rm } from "node:fs/promises";
+import { constants, createReadStream } from "node:fs";
+import {
+  access,
+  mkdir,
+  writeFile,
+  lstat,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -164,6 +171,7 @@ export class MemoryBackend {
         chunk.subarray(-8192),
       ]).subarray(-8192);
     });
+    await access(this.config.executable, constants.X_OK);
     await this.client.connect(transport, {
       signal: initSignal,
       timeout: this.config.startup_ms,
@@ -463,6 +471,9 @@ export class MemoryBackend {
    * time and output.
    */
   private async command(args: string[], signal?: AbortSignal) {
+    // A failed access check identifies the bundle. A spawn error can also
+    // refer to a missing checkout even when Node reports the executable path.
+    await access(this.config.executable, constants.X_OK);
     return (
       await exec(this.config.executable, args, {
         env: this.env,

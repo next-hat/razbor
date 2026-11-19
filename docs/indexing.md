@@ -204,7 +204,7 @@ The example uses `memory.mode = "full"`; `fast` and `moderate` are also availabl
 
 | Setting or limit             | Default or maximum                                  |
 | ---------------------------- | --------------------------------------------------- |
-| `service.sync_ms`            | Git synchronization: 60000 ms.                      |
+| `service.sync_ms`            | Git synchronization and pack transfer, 60000 ms.    |
 | `memory.index_ms`            | Graph preparation: 90000 ms.                        |
 | `memory.query_ms`            | Graph queries: 15000 ms.                            |
 | `embeddings.request_ms`      | Embedding requests: 60000 ms.                       |
@@ -214,6 +214,12 @@ The example uses `memory.mode = "full"`; `fast` and `moderate` are also availabl
 | Document-search input        | 480 UTF-8 bytes before model prefix and 512 tokens. |
 | Source file                  | 1000000 bytes.                                      |
 | Source reads per preparation | 100000000 bytes, including rereads.                 |
+
+Both source-only and indexed reviews transfer the Git objects reachable from
+the pinned base and head. If a large pack times out during generation or
+transfer, increase `service.sync_ms` on the source service, up to 300000 ms.
+Each pack is limited to 512 MiB, and the review attempt deadline also bounds
+the handoff.
 
 The Nanocl template allows five minutes for graph preparation and one hour for
 embeddings, with four embedding CPU threads. Total preparation, including source

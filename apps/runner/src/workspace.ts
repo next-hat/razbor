@@ -74,11 +74,11 @@ async function importPack(
   repository: string,
   file: string,
   signal: AbortSignal,
+  timeoutMs: number,
   log: typeof logger,
   secrets: readonly string[],
 ) {
   const start = performance.now();
-  const timeoutMs = 30000;
   const timeout = AbortSignal.timeout(timeoutMs);
   const active = AbortSignal.any([signal, timeout]);
   let stderr = Buffer.alloc(0);
@@ -188,17 +188,17 @@ export type RemoteSource = { url: string; token: string };
 
 /**
  * Download an authenticated source pack without redirects, enforcing object format, a
- * 30-second deadline, and a 512 MiB transfer limit.
+ * runner deadline, and a 512 MiB transfer limit.
  */
 async function downloadPack(
   source: RemoteSource,
   file: string,
   signal: AbortSignal,
+  timeoutMs: number,
   log: typeof logger,
   secrets: readonly string[],
 ) {
   const start = performance.now();
-  const timeoutMs = 30000;
   const timeout = AbortSignal.timeout(timeoutMs);
   const active = AbortSignal.any([signal, timeout]);
   let response: Response | undefined;
@@ -263,7 +263,15 @@ export async function prepareWorkspace(
   });
   const secrets = [source.token, c.apiKey ?? ""];
   const pack = path.join(w.root, "objects.pack");
-  const format = await downloadPack(source, pack, signal, log, secrets);
+  const timeoutMs = c.runner.timeout_ms;
+  const format = await downloadPack(
+    source,
+    pack,
+    signal,
+    timeoutMs,
+    log,
+    secrets,
+  );
   let baseline: string;
   let operation = "init";
   const start = performance.now();
@@ -275,7 +283,7 @@ export async function prepareWorkspace(
       signal,
     );
     operation = "index-pack";
-    await importPack(w.repository, pack, signal, log, secrets);
+    await importPack(w.repository, pack, signal, timeoutMs, log, secrets);
     operation = "verify-revisions";
     await rm(pack);
     for (const sha of [job.baseSha, job.headSha])

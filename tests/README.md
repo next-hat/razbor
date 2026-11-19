@@ -132,7 +132,8 @@ pnpm run test:broker
 The broker suite uses pg-boss and enrolled runner sessions, with a controlled
 loopback source service. It checks indexed and source-only assignments across a
 repository setting change, source forwarding, attempt tokens, the private index
-MCP endpoint and independent durable memory, without a model endpoint. Database
+MCP endpoint and independent durable memory, without a model endpoint. A source
+transfer with a live grant remains valid past the former 30-second cutoff. Database
 regressions cover file ownership, legacy defaults, attempt snapshots and index
 token authorization. A setup regression disables and re-enables indexing before
 an active preparation publishes its result, and accepts only the revision the
@@ -187,7 +188,9 @@ service against local bare Git repositories. The source-only case needs Git, Doc
 checkout path and checks attempt authorization, lease expiry and removal. It also
 checks that stale Git policies and invalid or symlinked index directories cannot
 block source preparation or cause cleanup to delete unrelated files. The fixture
-runs without a graph binary, vector extension or embedding endpoint. A controlled
+runs without a graph binary, vector extension or embedding endpoint. It checks
+the configured timeout for pack generation and transfer, and the runner timeout
+for downloading and importing that pack. A controlled
 barrier verifies that a queued source transfer must pass authorization at
 dispatch. Each barrier fails if its request ends early. Condition polling
 shares a deadline with the underlying HTTP fetch. A stalled predicate exercises
@@ -206,9 +209,13 @@ read and execute permission denials. After read permission returns on the same
 executable, the test checks that requests during the digest retry cooldown
 receive a retryable response. Removing and restoring the fixture's bundle
 verifies the outage diagnostic and automatic recovery of queued setup. A
-separate case restores the bundle immediately after a failed process launch
-and checks that persistent indexing resumes automatically. A missing checkout
-exercises the same OS error and must still produce a setup error.
+separate case restores the bundle after the indexer confirms it is inaccessible
+and checks that persistent indexing resumes automatically. A checkout restored
+immediately after a failed spawn must still produce a setup error.
+Another case keeps the bundle offline through daemon cleanup. After restoration,
+the reaper confirms shutdown, starts a fresh graph and indexes the expected commit.
+The indexed integration test allows five minutes for these launches and the
+watcher refreshes.
 It also exercises fetching, refresh, pinned graph access,
 revocation, dirty checkouts, divergence recovery and cleanup. The concurrent
 refresh check waits for the stored workspace state before querying the graph.

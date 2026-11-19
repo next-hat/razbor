@@ -150,7 +150,7 @@ export class ReviewWorkspace extends OwnedWorkspace {
       const active = AbortSignal.any([
         signal,
         this.stop.signal,
-        AbortSignal.timeout(30000),
+        AbortSignal.timeout(this.config.service.sync_ms),
       ]);
       active.throwIfAborted();
       await this.validateStorage();
@@ -191,7 +191,7 @@ export class ReviewWorkspace extends OwnedWorkspace {
           env: gitEnvironment,
           stdio: ["pipe", "pipe", "ignore"],
           signal: active,
-          timeout: 30000,
+          timeout: this.config.service.sync_ms,
         },
       );
       const done = new Promise<void>((resolve, reject) => {

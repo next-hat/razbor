@@ -969,11 +969,7 @@ export class RunnerBroker {
       {
         redirect: "error",
         cache: "no-store",
-        signal: AbortSignal.any([
-          request.signal,
-          attempt.controller.signal,
-          AbortSignal.timeout(30000),
-        ]),
+        signal: AbortSignal.any([request.signal, attempt.controller.signal]),
         headers: { authorization: `Bearer ${attempt.binding!.token}` },
       },
     );

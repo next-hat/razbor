@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import type { ChildProcess } from "node:child_process";
+import childProcess, {
+  type ChildProcess,
+  type SpawnOptions,
+} from "node:child_process";
 import { test } from "node:test";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { channel } from "node:diagnostics_channel";
 import { EventEmitter, once } from "node:events";
 import fs from "node:fs";
@@ -49,6 +52,7 @@ import {
   beginAttempt,
 } from "@razbor/database";
 import { resultText } from "@razbor/harness/mcp";
+import { logger } from "@razbor/harness/logger";
 import { indexerConfigSchema } from "@razbor/indexer/config";
 import { IndexService } from "@razbor/indexer/service";
 import { Tokens, tokenHash } from "@razbor/indexer/tokens";
@@ -75,7 +79,7 @@ test(
     skip: executable
       ? false
       : "set CBM_EXECUTABLE to the provisioned v0.11.0 portable binary",
-    timeout: 240000,
+    timeout: 300000,
   },
   async (t) => {
     assert.ok(
@@ -138,6 +142,10 @@ test(
             indexing: { owner: "local-indexer", persistent: true },
           },
           recovery: {
+            git: repo,
+            indexing: { owner: "local-indexer", persistent: true },
+          },
+          cleanup: {
             git: repo,
             indexing: { owner: "local-indexer", persistent: true },
           },
@@ -385,7 +393,7 @@ test(
         },
       );
       await t.test(
-        "a restored bundle retries its failed launch while a missing checkout stays failed",
+        "a restored bundle retries while a checkout restored after a failed spawn stays failed",
         async (t) => {
           const launchId = await resolveRepository(database, "launch");
           const launch = workspaces.find((w) => w.repositoryId === launchId);
@@ -405,12 +413,13 @@ test(
           const checkout = path.join(onDemand.root, "repository");
           const parked = path.join(onDemand.root, "parked");
           let moved = false;
+          let checkoutRestored = false;
           let hidden = false;
           let restored = false;
           const children = channel("child_process");
-          /** Restore the fixture's bundle as soon as the OS rejects its actual spawn, before the capability recheck. */
+          /** Restore the checkout on the child's real ENOENT, before cleanup and the capability recheck. */
           function observeSpawn(message: unknown) {
-            if (!hidden || restored) return;
+            if (!moved || checkoutRestored) return;
             (message as { process: ChildProcess }).process.once(
               "error",
               (error: NodeJS.ErrnoException) => {
@@ -419,13 +428,29 @@ test(
                   error.path === bundle &&
                   error.syscall === `spawn ${bundle}`
                 ) {
-                  fs.symlinkSync(path.dirname(executable!), bundleDirectory);
-                  restored = true;
+                  fs.renameSync(parked, checkout);
+                  checkoutRestored = true;
                 }
               },
             );
           }
           children.subscribe(observeSpawn);
+          // The workspace reports the originating failure before daemon cleanup.
+          // Restore the bundle then, so the service's later probe sees it healthy.
+          const warn = logger.warn;
+          t.mock.method(logger, "warn", (...args: unknown[]) => {
+            const [fields, message] = args;
+            if (
+              hidden &&
+              !restored &&
+              message === "workspace index preparation failed" &&
+              (fields as { workspaceId?: string })?.workspaceId === launch.id
+            ) {
+              fs.symlinkSync(path.dirname(executable!), bundleDirectory);
+              restored = true;
+            }
+            return Reflect.apply(warn, logger, args);
+          });
           const write = fs.promises.writeFile;
           const interrupt = t.mock.method(
             fs.promises,
@@ -454,7 +479,8 @@ test(
             interrupt.mock.restore();
             syncBuiltinESMExports();
             children.unsubscribe(observeSpawn);
-            if (moved) await fs.promises.rename(parked, checkout);
+            if (moved && !checkoutRestored)
+              await fs.promises.rename(parked, checkout);
             if (hidden && !restored)
               await symlink(path.dirname(executable!), bundleDirectory);
           });
@@ -469,7 +495,7 @@ test(
             (await missingCheckout.json()).error,
             /index operation failed/,
           );
-          assert.ok(moved);
+          assert.ok(checkoutRestored);
           assert.equal(
             (await getRepository(database, onDemand.repositoryId))?.setupState,
             "error",
@@ -909,6 +935,90 @@ test(
           binding.headSha === second
         );
       }, 60000);
+      await t.test(
+        "restoring the bundle retries unconfirmed daemon cleanup before starting a fresh graph",
+        async (t) => {
+          const repositoryId = await resolveRepository(database, "cleanup");
+          const workspace = workspaces.find(
+            (item) => item.repositoryId === repositoryId,
+          );
+          assert.ok(workspace);
+          const state = path.join(workspace.root, "state");
+          const runtime =
+            "/tmp/rdm-" +
+            createHash("sha256").update(state).digest("hex").slice(0, 20);
+          const marker = path.join(runtime, "retained-by-fixture");
+          const write = fs.promises.writeFile;
+          let launches = 0;
+          let hidden = false;
+          const interrupt = t.mock.method(
+            fs.promises,
+            "writeFile",
+            async (...args: Parameters<typeof write>) => {
+              await write(...args);
+              if (args[0] !== path.join(state, "cache/config.json")) return;
+              if (++launches === 1) {
+                await write(marker, "retain until shutdown is confirmed");
+                await unlink(bundleDirectory);
+                hidden = true;
+              } else {
+                await assert.rejects(access(marker), { code: "ENOENT" });
+              }
+            },
+          );
+          syncBuiltinESMExports();
+          try {
+            const initial = await request(
+              `/repositories/${workspace.repositoryId}/index`,
+              "POST",
+              admin,
+              { prepare: true },
+            );
+            assert.equal(initial.status, 503);
+            assert.equal(
+              initial.headers.get("x-razbor-error-code"),
+              codebaseMemoryUnavailableCode,
+            );
+            await initial.body?.cancel();
+            assert.equal(
+              (await getRepository(database, workspace.repositoryId))
+                ?.setupError,
+              codebaseMemoryUnavailableMessage,
+            );
+            assert.equal(
+              await readFile(marker, "utf8"),
+              "retain until shutdown is confirmed",
+            );
+            await symlink(path.dirname(executable), bundleDirectory);
+            hidden = false;
+            // Only the reaper can retry this initial request after the bundle returns.
+            await eventually(async () => {
+              const repository = await getRepository(
+                database,
+                workspace.repositoryId,
+              );
+              if (repository?.setupState === "error")
+                assert.equal(
+                  repository.setupError,
+                  codebaseMemoryUnavailableMessage,
+                );
+              return repository?.setupState === "ready";
+            }, 90000);
+            assert.equal(launches, 2);
+            assert.equal(
+              (
+                await ownedWorkspaces(database, "local-indexer", workspace.id)
+              )[0]?.headSha,
+              second,
+            );
+          } finally {
+            interrupt.mock.restore();
+            syncBuiltinESMExports();
+            if (hidden)
+              await symlink(path.dirname(executable), bundleDirectory);
+          }
+        },
+      );
       assert.equal(
         (await request(`/tokens/${issued.id}`, "DELETE", admin)).status,
         200,
@@ -1012,6 +1122,7 @@ test(
           host: "127.0.0.1",
           port: 0,
           data_root: path.join(root, "source"),
+          sync_ms: 45000,
           management_token: { env: "UNUSED_FIXTURE_ADMIN" },
         },
       });
@@ -1226,6 +1337,7 @@ test(
       const runner = {
         ...runnerConfigSchema.parse({
           storage: { root: runnerRoot, runtime_root: process.cwd() },
+          runner: { timeout_ms: 55000 },
           capabilities: { base_instructions: true },
         }),
         hostRoot: runnerRoot,
@@ -1233,19 +1345,49 @@ test(
         network: "fixture",
       };
       const checkout = await createWorkspace(runner, first.attemptId);
-      await prepareWorkspace(
-        runner,
-        checkout,
-        {
-          version: 1,
-          reviewId: first.reviewId,
-          ...repo,
-          submittedAt: new Date().toISOString(),
-        },
-        AbortSignal.timeout(10000),
-        {
-          url: `http://127.0.0.1:${port}/reviews/${first.attemptId}/source`,
-          token: lease.token,
+      await t.test(
+        "source pack production, download and strict import use their configured timeouts",
+        async (t) => {
+          const timers = t.mock.method(AbortSignal, "timeout");
+          const spawns = t.mock.method(childProcess, "spawn");
+          syncBuiltinESMExports();
+          t.after(() => {
+            spawns.mock.restore();
+            syncBuiltinESMExports();
+          });
+          await prepareWorkspace(
+            runner,
+            checkout,
+            {
+              version: 1,
+              reviewId: first.reviewId,
+              ...repo,
+              submittedAt: new Date().toISOString(),
+            },
+            AbortSignal.timeout(10000),
+            {
+              url: `http://127.0.0.1:${port}/reviews/${first.attemptId}/source`,
+              token: lease.token,
+            },
+          );
+          // Observe the real handoff without waiting for a large pack to consume either deadline.
+          const budgets = timers.mock.calls.map((call) => call.arguments[0]);
+          assert.ok(
+            budgets.includes(config.service.sync_ms),
+            "source stream deadline",
+          );
+          assert.equal(
+            budgets.filter((ms) => ms === runner.runner.timeout_ms).length,
+            2,
+            "download and import deadlines",
+          );
+          const pack = spawns.mock.calls.find((call) =>
+            call.arguments[1]?.includes("pack-objects"),
+          );
+          assert.equal(
+            (pack?.arguments[2] as SpawnOptions | undefined)?.timeout,
+            config.service.sync_ms,
+          );
         },
       );
       assert.equal(

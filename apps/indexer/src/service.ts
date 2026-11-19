@@ -657,11 +657,8 @@ export class IndexService {
     });
   }
 
-  /** Retain a bundle launch failure even if the file becomes executable again before cleanup ends. */
-  private async graphPreparationFailure(
-    cause: unknown,
-    workspace?: IndexWorkspace,
-  ) {
+  /** Retain direct filesystem evidence of an inaccessible bundle after it recovers. */
+  private async graphPreparationFailure(cause: unknown) {
     const unavailable = await this.codebaseMemoryFailure();
     if (unavailable) return unavailable;
     const executable = this.config.memory?.executable;
@@ -672,26 +669,15 @@ export class IndexService {
         : cause
     ) as NodeJS.ErrnoException | undefined;
     if (
-      !executable ||
-      !bundleAccessUnavailable(error) ||
-      error?.path !== executable
+      executable &&
+      bundleAccessUnavailable(error) &&
+      error?.path === executable &&
+      (error.syscall === "lstat" ||
+        error.syscall === "open" ||
+        error.syscall === "access")
     )
-      return cause;
-    if (error.syscall === "lstat" || error.syscall === "open")
       return new CodebaseMemoryUnavailable(true);
-    if (!workspace || error.syscall !== `spawn ${executable}`) return cause;
-
-    // Node reports the executable path for a missing or inaccessible cwd as
-    // well. The trailing /. requires a searchable directory even if the
-    // checkout path has since been replaced by a regular file.
-    const cwdAvailable = await access(
-      `${workspace.source.repository}/.`,
-      constants.X_OK,
-    ).then(
-      () => true,
-      () => false,
-    );
-    return cwdAvailable ? new CodebaseMemoryUnavailable(true) : cause;
+    return cause;
   }
 
   /**
@@ -808,7 +794,7 @@ export class IndexService {
             (phase === "graph_bootstrap" || phase === "graph_readiness") &&
             !(cause instanceof SynchronizationError) &&
             !this.stop.signal.aborted
-              ? await this.graphPreparationFailure(cause, workspace)
+              ? await this.graphPreparationFailure(cause)
               : cause;
           try {
             await repositoryIndexSetup(
