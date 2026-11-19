@@ -99,6 +99,8 @@ The console re-review fixture resolves two occurrences from the same PR across s
 
 The runner finalization fixture temporarily removes a Git object before a file read, restores it, and retries. It checks that complete pages for the requested path and revision clear the failure, and that a different path, revision or range leaves it outstanding.
 
+The GitLab schedule fixtures change the pipeline and merge restrictions on an existing bot-owned schedule. The adapter, dispatcher and console tests check the current decision, continued tracking of the schedule and the absence of a second submission.
+
 ## Autonomous review harness
 
 Run the focused agent-loop, budget, context, relay and evaluation regressions:

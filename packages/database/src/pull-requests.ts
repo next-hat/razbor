@@ -192,6 +192,13 @@ function currentMergeView(
 
   // A change in review authority cannot cancel an already-issued provider request.
   const action = review?.mergeAction;
+  // A confirmed schedule with a current guard failure records the guard first
+  // and its ownership separately. A prior fence alone cannot establish either.
+  const confirmedSchedule =
+    action === "scheduled" &&
+    decision?.reasons
+      .slice(1)
+      .some(({ code }) => code === "provider_scheduled");
   const terminalProgress =
     decision?.status === "review_in_progress" &&
     review?.status !== "queued" &&
@@ -202,7 +209,7 @@ function currentMergeView(
       terminalProgress ||
       !decision ||
       decision.status === "stale" ||
-      decision.status === "blocked" ||
+      (decision.status === "blocked" && !confirmedSchedule) ||
       pr.humanEscalated) &&
     (action === "writing" || action === "scheduled" || action === "uncertain")
       ? action

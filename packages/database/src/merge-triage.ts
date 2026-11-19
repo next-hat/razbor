@@ -73,16 +73,36 @@ function reason(
 
 /** Map verified provider capability and protection observations into the shared engine's facts. */
 function providerFacts(state: ForgeMergeState): MergeDecisionInput["provider"] {
-  const pending = state.state === "awaiting_checks";
-  const guarded = ["ready", "scheduled", "merged", "awaiting_checks"].includes(
-    state.state,
-  );
+  const readiness = state.guardState ?? state.state;
+  const pending = readiness === "awaiting_checks";
+  const passing = ["ready", "scheduled", "merged"].includes(readiness);
   return {
-    guarded,
-    checks: pending ? "pending" : guarded ? "passing" : "unknown",
-    restrictions: pending ? "pending" : guarded ? "satisfied" : "blocked",
+    guarded: passing || pending || state.state === "scheduled",
+    checks: pending
+      ? "pending"
+      : passing
+        ? "passing"
+        : state.reason === "pipeline_failed"
+          ? "failed"
+          : "unknown",
+    restrictions: pending ? "pending" : passing ? "satisfied" : "blocked",
     reason: forgeMergeReason(state.reason),
     merged: state.state === "merged",
+  };
+}
+
+/** Report the current blocking condition alongside the confirmed ownership of the native schedule. */
+function scheduledGuardDecision(
+  status: "blocked" | "awaiting_checks",
+  guardReason: string,
+): MergeDecision {
+  return {
+    status,
+    reasons: [guardReason, "provider_scheduled"].map((code) => ({
+      code,
+      message: forgeMergeReason(code),
+    })),
+    reviewers: [],
   };
 }
 
@@ -159,24 +179,25 @@ async function writeGuardedMerge(
           stage = next;
         }
         const result = await api.scheduleMerge(request, resumeOnly, checkpoint);
+        const action = typeof result === "string" ? result : result.state;
+        let recorded = decision;
+        if (typeof result !== "string")
+          recorded = scheduledGuardDecision(result.guardState, result.reason);
+        else if (result === "merged")
+          recorded = reason(
+            "merged",
+            "provider_merged",
+            "The provider confirmed the reviewed revision was merged.",
+          );
         await tx
           .update(reviews)
-          .set({
-            mergeAction: result,
-            mergeDecision:
-              result === "merged"
-                ? reason(
-                    "merged",
-                    "provider_merged",
-                    "The provider confirmed the reviewed revision was merged.",
-                  )
-                : decision,
-          })
+          .set({ mergeAction: action, mergeDecision: recorded })
           .where(eq(reviews.id, review.id));
-        return true;
+        return recorded;
       },
     );
-    if (sent || stage !== "prepared") return;
+    if (sent) return sent;
+    if (stage !== "prepared") return;
     await database.db
       .update(reviews)
       .set({
@@ -721,9 +742,11 @@ async function triagePullRequest(database: Database, prId: string) {
           fenced &&
           review.mergeWriteStage !== "prepared" &&
           review.mergeWriteStage !== "creating_check"
-        )
+        ) {
           action = "scheduled";
-        else if (
+          if (state.guardState && decision.status === state.guardState)
+            decision = scheduledGuardDecision(state.guardState, state.reason);
+        } else if (
           state.state === "scheduled" ||
           ((state.resume || state.nativeArmed) && !fenced)
         )
@@ -940,8 +963,8 @@ async function triagePullRequest(database: Database, prId: string) {
       },
     );
     if (!saved || deferComment) return;
-    if (send && request && client)
-      await writeGuardedMerge(
+    if (send && request && client) {
+      const recorded = await writeGuardedMerge(
         database,
         repo,
         pr,
@@ -951,6 +974,8 @@ async function triagePullRequest(database: Database, prId: string) {
         !!state?.resume,
         client.bot.id,
       );
+      if (recorded) decision = recorded;
+    }
     if ((human || reportDryRun || pr.escalationComment) && snapshot) {
       const remote = await provider();
       await syncEscalation(
@@ -989,7 +1014,7 @@ async function triagePullRequest(database: Database, prId: string) {
   } catch (error) {
     if (!fenced) await deferProviderFailure(error);
     if (
-      !fenced &&
+      (!fenced || review.mergeAction === "scheduled") &&
       (decision.reasons[0]?.code === "guard_unavailable" ||
         (onlyHistoricalChecks && !input.outstandingFindingsAudited))
     )
@@ -1004,7 +1029,12 @@ async function triagePullRequest(database: Database, prId: string) {
               "Provider identity, finding history or merge requirements could not be verified.",
             ),
           })
-          .where(eq(reviews.id, review.id));
+          .where(
+            and(
+              eq(reviews.id, review.id),
+              sql`${reviews.mergeAction} is not distinct from ${review.mergeAction}`,
+            ),
+          );
       });
     logger.warn(
       {

@@ -55,6 +55,9 @@ export function MergeBadge({
       {action && decision !== "stale" && decision !== "human_review_required"
         ? actionLabels[action]
         : decisionLabels[decision]}
+      {action === "scheduled" &&
+        (decision === "blocked" || decision === "awaiting_checks") &&
+        ` · ${decisionLabels[decision]}`}
     </Badge>
   );
 }

@@ -345,6 +345,13 @@ test("both queue surfaces put human escalation before intervention, verification
   }
   const unresolved = triagePr(6, "blocked");
   unresolved.merge!.action = "scheduled";
+  const pendingSchedule = triagePr(7, "awaiting_checks");
+  pendingSchedule.merge!.action = "scheduled";
+  const scheduled = renderToStaticMarkup(
+    createElement(TriageQueue, { pullRequests: [unresolved, pendingSchedule] }),
+  );
+  assert.match(scheduled, /Merge scheduled · Blocked/);
+  assert.match(scheduled, /Merge scheduled · Awaiting checks/);
   unresolved.merge!.decision.reasons = [
     {
       code: "unresolved_provider_merge",

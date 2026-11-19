@@ -4,6 +4,8 @@ import {
   ForgeOperationError,
   type ForgeMergeRequest,
   type ForgeMergeCheckpoint,
+  type ForgeMergeResult,
+  type ForgeMergeState,
 } from "@forge-adapters/src/interactions.js";
 import {
   commitSha,
@@ -228,13 +230,24 @@ export async function inspectGitlabMerge(
     head.parent_ids[0] !== branch.commit.id
   )
     return mergeState("blocked", "direct_child_required");
-  if (mr.merge_when_pipeline_succeeds)
-    return mr.merge_user?.id === actor.id ||
-      (mr.merge_user === null && request.writeStage === "acknowledged")
-      ? mergeState("scheduled", "provider_scheduled")
-      : mergeState("blocked", "existing_schedule");
+  const scheduled = mr.merge_when_pipeline_succeeds;
+  if (
+    scheduled &&
+    mr.merge_user?.id !== actor.id &&
+    !(mr.merge_user === null && request.writeStage === "acknowledged")
+  )
+    return mergeState("blocked", "existing_schedule");
+  /** Preserve ownership of the observed schedule while reporting its current unmet requirement. */
+  function unmetGuard(
+    guardState: NonNullable<ForgeMergeState["guardState"]>,
+    reason: Parameters<typeof mergeState>[1],
+  ): ForgeMergeState {
+    return scheduled
+      ? { ...mergeState("scheduled", reason), guardState }
+      : mergeState(guardState, reason);
+  }
   if (mr.has_conflicts || !mr.blocking_discussions_resolved)
-    return mergeState("blocked", "merge_restrictions");
+    return unmetGuard("blocked", "merge_restrictions");
   if (
     !mr.head_pipeline ||
     mr.head_pipeline.sha !== mr.sha ||
@@ -247,14 +260,16 @@ export async function inspectGitlabMerge(
       "scheduled",
     ].includes(mr.head_pipeline.status)
   )
-    return mergeState("awaiting_checks", "pipeline_pending");
+    return unmetGuard("awaiting_checks", "pipeline_pending");
   if (mr.head_pipeline.status !== "success")
-    return mergeState("blocked", "pipeline_failed");
+    return unmetGuard("blocked", "pipeline_failed");
   if (pendingGitlabMergeStatus(mr.detailed_merge_status))
-    return mergeState("awaiting_checks", "pipeline_pending");
+    return unmetGuard("awaiting_checks", "pipeline_pending");
   if (mr.detailed_merge_status !== "mergeable")
-    return mergeState("blocked", "merge_restrictions");
-  return mergeState("ready", "provider_ready");
+    return unmetGuard("blocked", "merge_restrictions");
+  return scheduled
+    ? mergeState("scheduled", "provider_scheduled")
+    : mergeState("ready", "provider_ready");
 }
 
 /** Submit the SHA-guarded native operation and require positive, revision-bound readback. */
@@ -263,7 +278,7 @@ export async function scheduleGitlabMerge(
   projectRoute: string,
   request: ForgeMergeRequest,
   checkpoint?: ForgeMergeCheckpoint,
-): Promise<"scheduled" | "merged"> {
+): Promise<ForgeMergeResult> {
   if (request.writeStage && request.writeStage !== "prepared")
     throw new ForgeOperationError("unsupported", true);
   const state = await inspectGitlabMerge(transport, projectRoute, request);
@@ -311,6 +326,12 @@ export async function scheduleGitlabMerge(
       projectRoute,
       observedRequest,
     );
+    if (observed.state === "scheduled" && observed.guardState)
+      return {
+        state: observed.state,
+        guardState: observed.guardState,
+        reason: observed.reason,
+      };
     if (observed.state === "scheduled" || observed.state === "merged")
       return observed.state;
   } catch {

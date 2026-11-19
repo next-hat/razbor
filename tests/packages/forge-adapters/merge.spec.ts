@@ -367,6 +367,7 @@ function gitlabFixture(t: TestContext) {
     loseResponse: false,
     rejection: undefined as Response | undefined,
     nullMergeUser: false,
+    pipelineAfterPut: undefined as string | undefined,
     base: baseSha,
     version: "19.4.0-ee",
   };
@@ -398,6 +399,8 @@ function gitlabFixture(t: TestContext) {
       if (flags.rejection) return flags.rejection;
       mr.merge_when_pipeline_succeeds = true;
       mr.merge_user = flags.nullMergeUser ? null : { id: 2 };
+      if (flags.pipelineAfterPut)
+        mr.head_pipeline.status = flags.pipelineAfterPut;
       if (flags.loseResponse) throw new Error("response lost");
       return mr;
     }
@@ -455,6 +458,50 @@ test("GitLab verifies a same-SHA successful pipeline and native restrictions bef
   assert.deepEqual(f.mutations, [
     { sha: headSha, auto_merge: true, squash: true },
   ]);
+  const healthy = { ...f.mr };
+  for (const [change, guardState, reason] of [
+    [
+      { head_pipeline: { sha: headSha, status: "running" } },
+      "awaiting_checks",
+      "pipeline_pending",
+    ],
+    [{ head_pipeline: null }, "awaiting_checks", "pipeline_pending"],
+    [
+      { head_pipeline: { sha: baseSha, status: "success" } },
+      "awaiting_checks",
+      "pipeline_pending",
+    ],
+    [
+      { head_pipeline: { sha: headSha, status: "failed" } },
+      "blocked",
+      "pipeline_failed",
+    ],
+    [{ has_conflicts: true }, "blocked", "merge_restrictions"],
+    [{ blocking_discussions_resolved: false }, "blocked", "merge_restrictions"],
+    [
+      { detailed_merge_status: "not_approved" },
+      "blocked",
+      "merge_restrictions",
+    ],
+    [
+      { detailed_merge_status: "ci_still_running" },
+      "awaiting_checks",
+      "pipeline_pending",
+    ],
+  ] as const) {
+    Object.assign(f.mr, healthy, change);
+    assert.deepEqual(await f.api.inspectMerge(request), {
+      state: "scheduled",
+      guardState,
+      reason,
+    });
+    await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
+  }
+  Object.assign(f.mr, healthy);
+  assert.deepEqual(await f.api.inspectMerge(request), {
+    state: "scheduled",
+    reason: "provider_scheduled",
+  });
   f.mr.merge_user = { id: 3 };
   assert.equal((await f.api.inspectMerge(request)).reason, "existing_schedule");
   assert.equal(await f.api.cancelMerge(request), "unsupported");
@@ -552,18 +599,23 @@ test("GitLab binds an unattributed schedule to a positive PUT receipt and preser
   const f = gitlabFixture(t);
   const stages: ForgeMergeWriteStage[] = [];
   f.flags.nullMergeUser = true;
-  assert.equal(
+  f.flags.pipelineAfterPut = "failed";
+  const failedSchedule = {
+    state: "scheduled",
+    guardState: "blocked",
+    reason: "pipeline_failed",
+  };
+  assert.deepEqual(
     await f.api.scheduleMerge(request, false, async (stage) => {
       stages.push(stage);
     }),
-    "scheduled",
+    failedSchedule,
   );
   assert.deepEqual(stages, ["submitting", "acknowledged"]);
   assert.equal((await f.api.inspectMerge(request)).reason, "existing_schedule");
-  assert.equal(
-    (await f.api.inspectMerge({ ...request, writeStage: "acknowledged" }))
-      .state,
-    "scheduled",
+  assert.deepEqual(
+    await f.api.inspectMerge({ ...request, writeStage: "acknowledged" }),
+    failedSchedule,
   );
   f.mr.merge_user = { id: 3 };
   assert.equal(
@@ -572,6 +624,8 @@ test("GitLab binds an unattributed schedule to a positive PUT receipt and preser
     "existing_schedule",
   );
   f.mr.merge_when_pipeline_succeeds = false;
+  f.mr.head_pipeline.status = "success";
+  f.flags.pipelineAfterPut = undefined;
   f.flags.loseResponse = true;
   stages.length = 0;
   await assert.rejects(

@@ -70,6 +70,8 @@ export type ForgeMergeState = {
   state:
     "ready" | "awaiting_checks" | "blocked" | "stale" | "scheduled" | "merged";
   reason: string;
+  /** An owned native schedule is active, but its current pipeline or merge restrictions prevent merging. */
+  guardState?: "awaiting_checks" | "blocked";
   /** An acknowledged, owned schedule can resume publication of its missing revision check. */
   resume?: boolean;
   /** An exact pending App check and this App's active native request were both observed. */
@@ -79,6 +81,16 @@ export type ForgeMergeState = {
   /** The provider permanently merged this PR with another revision or destination. */
   terminal?: boolean;
 };
+
+/** A confirmed native operation, including any unmet guard already observed during submission readback. */
+export type ForgeMergeResult =
+  | "scheduled"
+  | "merged"
+  | {
+      state: "scheduled";
+      guardState: NonNullable<ForgeMergeState["guardState"]>;
+      reason: string;
+    };
 
 export type InlineComment = {
   path: string;
@@ -332,7 +344,7 @@ export interface Forge {
     request: ForgeMergeRequest,
     resumeOnly?: boolean,
     checkpoint?: ForgeMergeCheckpoint,
-  ): Promise<"scheduled" | "merged">;
+  ): Promise<ForgeMergeResult>;
   /** Retire an owned authorization only where the provider offers a race-safe cancellation. */
   cancelMerge(
     request: ForgeMergeRequest,

@@ -679,6 +679,16 @@ test(
           await checkpoint("acknowledged");
           return "merged";
         }
+        if (request.number === 19) {
+          await checkpoint("submitting");
+          writes++;
+          await checkpoint("acknowledged");
+          return {
+            state: "scheduled",
+            guardState: "awaiting_checks",
+            reason: "pipeline_pending",
+          } as const;
+        }
         if (nextRateLimit !== undefined) {
           const retryAt = nextRateLimit;
           nextRateLimit = undefined;
@@ -1511,6 +1521,7 @@ test(
       ...policy,
       dryRun: false,
       minimumConfidence: 80,
+      requirePassingChecks: false,
     };
     await applyRegistry(db, config);
     await processMergeTriage(db);
@@ -1669,6 +1680,18 @@ test(
     });
     await due(second);
     await processMergeTriage(restart);
+    assert.equal(writes, 2);
+    checks = {
+      state: "scheduled",
+      guardState: "awaiting_checks",
+      reason: "pipeline_pending",
+    };
+    await due(second);
+    await processMergeTriage(restart);
+    assert.deepEqual(await decision(live), {
+      status: "awaiting_checks",
+      action: "scheduled",
+    });
     assert.equal(writes, 2);
     checks = { state: "merged", reason: "verified" };
     await due(second);
@@ -1829,6 +1852,68 @@ test(
     assert.equal(cancelPreview.mock.callCount(), 2);
     assert.equal((await decision(afterDenial)).status, "awaiting_checks");
     assert.equal(writes, 3);
+
+    // GitLab accepted this operation, but its PUT readback already saw pending native CI.
+    // Provider requirements remain binding even with optional policy checks disabled.
+    const scheduledPr = await pull(19);
+    const scheduledReview = await complete(scheduledPr, 95);
+    checks = { state: "ready", reason: "provider_ready" };
+    await processMergeTriage(db);
+    for (const [guardState, reason] of [
+      ["awaiting_checks", "pipeline_pending"],
+      ["blocked", "pipeline_failed"],
+      ["blocked", "merge_restrictions"],
+    ] as const) {
+      if (reason !== "pipeline_pending") {
+        checks = { state: "scheduled", guardState, reason };
+        await due(scheduledPr);
+        await processMergeTriage(restart);
+      }
+      assert.deepEqual(await decision(scheduledReview), {
+        status: guardState,
+        action: "scheduled",
+      });
+      const listed = (await listPullRequests(db, [repo.id])).find(
+        (pr) => pr.id === scheduledPr,
+      )?.merge;
+      assert.equal(listed?.action, "scheduled");
+      assert.equal(listed.decision.status, guardState);
+      assert.deepEqual(
+        listed.decision.reasons.map((item) => item.code),
+        [reason, "provider_scheduled"],
+      );
+      assert.ok(await deadline(scheduledPr));
+    }
+    pauseInspection = async (request) => {
+      if (request.number === 19) throw new ForgeOperationError("unavailable");
+    };
+    await due(scheduledPr);
+    await processMergeTriage(restart);
+    pauseInspection = undefined;
+    assert.deepEqual(await decision(scheduledReview), {
+      status: "blocked",
+      action: "scheduled",
+    });
+    const unconfirmed = (await listPullRequests(db, [repo.id])).find(
+      (entry) => entry.id === scheduledPr,
+    )?.merge;
+    assert.equal(
+      unconfirmed?.decision.reasons[0].code,
+      "unresolved_provider_merge",
+    );
+    checks = { state: "scheduled", reason: "provider_scheduled" };
+    await due(scheduledPr);
+    await processMergeTriage(restart);
+    assert.deepEqual(await decision(scheduledReview), {
+      status: "auto_merge_eligible",
+      action: "scheduled",
+    });
+    assert.equal(
+      schedule.mock.calls.filter((call) => call.arguments[0].number === 19)
+        .length,
+      1,
+    );
+    assert.equal(writes, 4);
 
     // Ten older PRs share a busy repository. The unrelated repository must get
     // a dispatch slot in this same batch, even if its own review queue is empty.
