@@ -44,7 +44,60 @@ function coversLines(pages: LineRange[], range: LineRange) {
 
 export class RepositoryTools {
   private readonly sourceReads = new Map<string, SourceReads>();
+  private readonly failedReads = new Map<string, LineRange[]>();
   private readonly completeExecSources = new Set<string>();
+
+  /** Remember an identifiable failed request on this pinned comparison. Malformed requests cannot be reconciled. */
+  recordFailedRead(input: unknown) {
+    const parsed = readFileArguments.safeParse(input);
+    if (!parsed.success) return false;
+    const { path, revision, startLine, endLine } = parsed.data;
+    const start = startLine ?? 1;
+    const end = endLine ?? start + 399;
+    if (end < start) return false;
+    const key = JSON.stringify([path, revision ?? "head"]);
+    const ranges = this.failedReads.get(key) ?? [];
+    ranges.push({ start, end });
+    this.failedReads.set(key, ranges);
+    return true;
+  }
+
+  /** Remove only lines accounted for by an intact page or confirmed absence at the same pinned path and revision. */
+  observeSourceRead(
+    read: { path: string; revision: string } & (
+      | { state: "absent" }
+      | {
+          state: "available";
+          startLine: number;
+          endLine: number;
+          totalLines: number;
+        }
+    ),
+  ) {
+    const key = JSON.stringify([read.path, read.revision]);
+    const ranges = this.failedReads.get(key);
+    if (!ranges) return;
+    const remaining: LineRange[] = [];
+    if (read.state === "available") {
+      for (const { start, end } of ranges) {
+        // EOF proves any lines beyond the blob are absent. Within the file,
+        // preserve the portions of each failed range on either side of this page.
+        const last = Math.min(end, read.totalLines);
+        const beforeEnd = Math.min(last, read.startLine - 1);
+        if (start <= beforeEnd) remaining.push({ start, end: beforeEnd });
+        const afterStart = Math.max(start, read.endLine + 1);
+        if (afterStart <= last)
+          remaining.push({ start: afterStart, end: last });
+      }
+    }
+    if (remaining.length) this.failedReads.set(key, remaining);
+    else this.failedReads.delete(key);
+  }
+
+  /** Whether any valid failed file request still lacks its requested source evidence. */
+  hasFailedReads() {
+    return this.failedReads.size > 0;
+  }
 
   /** Match a complete command result against immutable file contents, independent of path aliases. */
   observeExec(stdout: string) {

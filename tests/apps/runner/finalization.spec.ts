@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { renameSync } from "node:fs";
 import { access, mkdir, rename } from "node:fs/promises";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
@@ -13,6 +14,7 @@ import {
   type MergeAssessment,
 } from "@razbor/contracts";
 import { reviewRepository, type ReviewConfig } from "@razbor/harness";
+import { git } from "@razbor/harness/git";
 import { RemoteMemory } from "@razbor/harness/mcp";
 import { runnerConfigSchema } from "@razbor/runner/config";
 import { ModelRelay } from "@razbor/runner/relay";
@@ -41,6 +43,18 @@ const result = {
   summary: "No actionable findings in inspected source; no tests executed.",
   findings: [],
 };
+
+/** Locate a loose object in a fresh disposable Git fixture so a provider step can interrupt a read. */
+async function fixtureObjectPath(repository: string, revision: string) {
+  const oid = await git(repository, ["rev-parse", revision]);
+  return path.join(
+    repository,
+    ".git",
+    "objects",
+    oid.slice(0, 2),
+    oid.slice(2),
+  );
+}
 
 /** Encodes deterministic native provider replies without invoking an external service. */
 function nativeResponse(
@@ -699,6 +713,7 @@ test("binary content and truncated exec evidence still downgrade a complete asse
 });
 
 test("failed verification is retained even when the model claims full merge readiness", async (t) => {
+  const missing = { path: "missing.ts" };
   const f = await fixture(t, "openai", [
     () => ({
       call: {
@@ -723,11 +738,33 @@ test("failed verification is retained even when the model claims full merge read
       call: { id: "retry", name: "read_diff", args: { paths: ["source.ts"] } },
     }),
     () => {
+      renameSync(tree, tree + ".offline");
+      return { call: { id: "unavailable", name: "read_file", args: missing } };
+    },
+    (payload) => {
+      assert.match(
+        String(toolBlocks("openai", payload).at(-1)?.output),
+        /\(failed;.*Tool error:/s,
+      );
+      renameSync(tree + ".offline", tree);
+      return {
+        call: { id: "retry-missing", name: "read_file", args: missing },
+      };
+    },
+    (payload) => {
+      assert.match(
+        String(toolBlocks("openai", payload).at(-1)?.output),
+        /"state":"absent"/,
+      );
       return {
         text: JSON.stringify({ ...result, mergeAssessment: readyAssessment }),
       };
     },
   ]);
+  const tree = await fixtureObjectPath(
+    f.files.repository,
+    f.files.head + "^{tree}",
+  );
   const returned = await f.review({
     initialDiffMaxBytes: 0,
     mergePolicy: { version: 1, policy: mergePolicySchema.parse({}) },
@@ -736,7 +773,7 @@ test("failed verification is retained even when the model claims full merge read
   assert.equal(returned.mergeAssessment?.requiresHumanReview, true);
   assert.doesNotMatch(
     returned.mergeAssessment!.verificationGaps.join(" "),
-    /read_diff tool failed/,
+    /read_(?:diff|file) tool failed/,
   );
   assert.match(
     returned.mergeAssessment!.verificationGaps.join(" "),
@@ -754,21 +791,33 @@ for (const scenario of [
 ] as const) {
   test("merge assessment coverage for " + scenario, async (t) => {
     const diff = scenario.includes("diff");
-    const steps: ((payload: Payload) => Reply)[] = [
-      () => ({
+    const retrySource = !diff && !scenario.includes("by exec");
+    const args = {
+      path: "source.ts",
+      startLine: 1,
+      endLine: scenario === "short source" ? 20 : 800,
+    };
+    const steps: ((payload: Payload) => Reply)[] = [];
+    let blob: string;
+    if (retrySource)
+      steps.push(() => {
+        // Interrupt only the first read of this disposable repository's pinned blob.
+        renameSync(blob, blob + ".offline");
+        return { call: { name: "read_file", id: "interrupted", args } };
+      });
+    steps.push((payload) => {
+      if (retrySource) {
+        const observation = toolBlocks("openai", payload).at(-1);
+        assert.equal(observation?.call_id, "interrupted");
+        assert.match(String(observation.output), /\(failed;.*Tool error:/s);
+        renameSync(blob + ".offline", blob);
+      }
+      return {
         call: diff
           ? { name: "read_diff", id: "page", args: { paths: ["source.ts"] } }
-          : {
-              name: "read_file",
-              id: "page",
-              args: {
-                path: "source.ts",
-                startLine: 1,
-                endLine: scenario === "short source" ? 20 : 800,
-              },
-            },
-      }),
-    ];
+          : { name: "read_file", id: "page", args },
+      };
+    });
     if (scenario === "finished source")
       steps.push(() => ({
         call: {
@@ -781,6 +830,19 @@ for (const scenario of [
       steps.push(() => ({
         call: { id: "unrelated", argv: ["git", "status", "--short"] },
       }));
+    if (scenario === "partial source")
+      for (const [id, other] of Object.entries({
+        "other-file": { path: "related.ts", startLine: 401, endLine: 800 },
+        "other-revision": {
+          path: "source.ts",
+          revision: "baseline",
+          startLine: 401,
+          endLine: 800,
+        },
+        "other-range": { path: "source.ts", startLine: 801, endLine: 900 },
+        "absent-file": { path: "missing.ts" },
+      }))
+        steps.push(() => ({ call: { name: "read_file", id, args: other } }));
     if (scenario.includes("by exec"))
       steps.push(() => ({
         call: {
@@ -791,10 +853,18 @@ for (const scenario of [
         },
       }));
     steps.push((payload) => {
-      const block = toolBlocks("openai", payload).find(
-        (b) => b.call_id === "page" && b.type === "function_call_output",
+      const outputs = new Map(
+        toolBlocks("openai", payload)
+          .filter((item) => item.type === "function_call_output")
+          .map((item) => [item.call_id, String(item.output)]),
       );
-      const observed = String(block?.output);
+      const observed = outputs.get("page") ?? "";
+      if (scenario === "partial source") {
+        assert.match(outputs.get("other-file") ?? "", /"endLine":800,/);
+        assert.match(outputs.get("other-revision") ?? "", /"endLine":800,/);
+        assert.match(outputs.get("other-range") ?? "", /"endLine":900,/);
+        assert.match(outputs.get("absent-file") ?? "", /"state":"absent"/);
+      }
       if (diff) assert.match(observed, /"remaining":true/);
       else
         assert.match(
@@ -806,11 +876,20 @@ for (const scenario of [
       };
     });
     const f = await fixture(t, "openai", steps);
-    await f.files.write(
-      "source.ts",
-      Array.from({ length: 900 }, (_, i) => "line " + i).join("\n") + "\n",
-    );
+    const content =
+      Array.from({ length: 900 }, (_, i) => "line " + i).join("\n") + "\n";
+    if (scenario === "partial source") {
+      await f.files.write("related.ts", content + "another file\n");
+      await f.files.write("source.ts", content + "older revision\n");
+      f.files.base = await f.files.commit();
+    }
+    await f.files.write("source.ts", content);
     f.files.head = await f.files.commit();
+    if (retrySource)
+      blob = await fixtureObjectPath(
+        f.files.repository,
+        f.files.head + ":source.ts",
+      );
     const returned = await f.review({
       initialDiffMaxBytes: diff ? 0 : 24_000,
       capabilities: {
@@ -825,5 +904,11 @@ for (const scenario of [
       returned.mergeAssessment?.reviewComplete,
       !scenario.startsWith("partial"),
     );
+    if (retrySource) {
+      const gaps = returned.mergeAssessment!.verificationGaps.join(" ");
+      if (scenario === "partial source")
+        assert.match(gaps, /read_file tool failed/);
+      else assert.deepEqual(returned.mergeAssessment, readyAssessment);
+    }
   });
 }

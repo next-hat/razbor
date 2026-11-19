@@ -734,6 +734,8 @@ export async function reviewRepository(
       const toolStarted = performance.now();
       let result: string;
       let failed = false;
+      let sourceRead:
+        Parameters<typeof rtools.observeSourceRead>[0] | undefined;
       let execution: Pick<
         NonNullable<ReviewProgress["tool"]>,
         "exitCode" | "timedOut" | "cancelled"
@@ -769,6 +771,8 @@ export async function reviewRepository(
           // A read of a nonexistent path is a useful negative observation; a refused blob read is a gap.
           failed =
             source.state === "unavailable" || source.state === "unsupported";
+          if (source.state === "available" || source.state === "absent")
+            sourceRead = source;
         } else if (call.name === "read_diff")
           result = prepared.read(call.arguments);
         else {
@@ -786,10 +790,16 @@ export async function reviewRepository(
           : toolError(error);
       }
       config.signal?.throwIfAborted();
-      if (failed) failedTools.add(toolName);
-      // A valid diff retry recovers the operation. The final per-file evidence
-      // check still blocks partial coverage, including missed continuation pages.
-      else if (call.name === "read_diff") failedTools.delete("read_diff");
+      if (failed) {
+        if (
+          toolName !== "read_file" ||
+          !rtools.recordFailedRead(call.arguments)
+        )
+          failedTools.add(toolName);
+      } else if (call.name === "read_diff") {
+        // Diff coverage still blocks missed continuation pages after a valid retry.
+        failedTools.delete("read_diff");
+      }
       const evidenceId = `tool-${toolNumber}`;
       /** Serializes one correlated observation so headroom includes JSON escaping. */
       const messageFor = (value: string) => ({
@@ -833,7 +843,7 @@ export async function reviewRepository(
         }
         result = bounded;
         message = messageFor(result);
-      }
+      } else if (sourceRead) rtools.observeSourceRead(sourceRead);
       evidenceIds.add(evidenceId);
       if (call.name === "read_diff") reportContext();
       progress(
@@ -1135,6 +1145,7 @@ export async function reviewRepository(
         }
         const { binaryFiles, unsupportedFiles } = prepared.coverage();
         const uninspectedFiles = prepared.uninspectedFiles();
+        if (rtools.hasFailedReads()) failedTools.add("read_file");
         const observed = [
           ...verificationLimitations,
           ...capabilities.limitations,

@@ -97,6 +97,8 @@ The triage fixture switches an eligible preview to a development HTTP URL on For
 
 The console re-review fixture resolves two occurrences from the same PR across separate admission snapshots. It checks that an occurrence outside the current snapshot still blocks the merge decision and that a prior resolution is rechecked after the PR revision changes. The publication fixture resolves a thread while posting a new occurrence from the same review.
 
+The runner finalization fixture temporarily removes a Git object before a file read, restores it, and retries. It checks that complete pages for the requested path and revision clear the failure, and that a different path, revision or range leaves it outstanding.
+
 ## Autonomous review harness
 
 Run the focused agent-loop, budget, context, relay and evaluation regressions:
