@@ -193,8 +193,7 @@ the result does not appear.
 
 **Overview** shows open pull requests waiting for human review. **Pull requests**
 lets you search open and closed requests, inspect findings, and open earlier review
-runs. Opening either page or choosing **Refresh** checks the forge for current
-requests. An automated review does not remove a request from the human queue.
+runs. Both pages open the saved snapshot. Choose **Refresh** to discover open requests and reconcile closures for requests already tracked as open. A request that opened and closed before Razbor saw either event is absent from this list. An automated review does not remove a request from the human queue.
 
 ## Stop and restart
 

@@ -7,6 +7,8 @@ export {
 
 export * from "@database/src/reviews.js";
 
+export { processMergeTriage } from "@database/src/merge-triage.js";
+
 export * from "@database/src/pull-requests.js";
 
 export * from "@database/src/metrics.js";

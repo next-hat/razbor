@@ -19,6 +19,8 @@ import type { Forge } from "@forge-adapters/src/interactions.js";
 
 export type * from "@forge-adapters/src/types.js";
 
+export { forgeMergeReason } from "@forge-adapters/src/merge.js";
+
 export { approvedUrl, ForgeReadError } from "@forge-adapters/src/http.js";
 
 export {
@@ -87,7 +89,14 @@ export { verifyForgejoRegistration } from "@forge-adapters/src/forgejo/index.js"
 
 export type {
   Forge,
+  ForgeActor,
+  ForgeApprovalResult,
+  ForgeApprovalRetirement,
   ForgeChange,
+  ForgeMergeCheckpoint,
+  ForgeMergeRequest,
+  ForgeMergeWriteStage,
+  ForgeMergeState,
   ForgePullRequest,
   ForgeReviewComment,
   ForgePublicationProgress,

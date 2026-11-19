@@ -8,15 +8,21 @@ import {
   providerId,
   repositoryPath,
 } from "@forge-adapters/src/http.js";
+import {
+  resolveReviewer,
+  mergeRequestSchema,
+  mergeState,
+} from "@forge-adapters/src/merge.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
 import {
   ForgeOperationError,
   ForgeWebhookError,
-  removeIfPresent,
+  removeTemporaryStatus,
   reviewRevision,
   verifyStatusComment,
   type Forge,
   type ForgeChange,
+  type ForgeMergeRequest,
   type ForgePullRequest,
   type ForgeReviewPublication,
   type ForgeWebhook,
@@ -213,7 +219,10 @@ export class ForgejoInteractions implements Forge {
     "push",
   ];
 
-  readonly capabilities = { resolveThreads: false };
+  readonly capabilities = {
+    resolveThreads: false,
+    guardedMerge: "unsupported" as const,
+  };
 
   private readonly route: string;
 
@@ -231,6 +240,87 @@ export class ForgejoInteractions implements Forge {
     if (connection.type !== "forgejo")
       throw new ForgeOperationError("unsupported");
     this.route = `repos/${repositoryPath(selector)}`;
+  }
+
+  /** Resolve an exact Forgejo user login before rendering a provider mention. */
+  reviewerLogin(username: string) {
+    return resolveReviewer(username, async (name) => {
+      const account = z
+        .object({
+          id,
+          login: z.string(),
+          prohibit_login: z.boolean().optional(),
+        })
+        .parse(await this.request(`users/${name}`));
+      if (
+        account.prohibit_login ||
+        account.login.toLowerCase() !== username.toLowerCase()
+      )
+        return undefined;
+      // The username endpoint also returns organizations. The ID search specifically filters to individual accounts.
+      // Active status is private to the account or site admin in Forgejo 15.
+      const people = z
+        .object({
+          ok: z.literal(true),
+          data: z.array(z.object({ id, login: z.string() })).max(1),
+        })
+        .parse(await this.request(`users/search?uid=${account.id}&limit=1`));
+      return people.data[0]?.id === account.id
+        ? people.data[0].login
+        : undefined;
+    });
+  }
+
+  /** The PR API cannot establish that voting will not release a pending native merge. */
+  async inspectApproval() {
+    return mergeState("blocked", "approval_unsupported");
+  }
+
+  /** A Forgejo review commit is recorded even when the current PR head has already changed. */
+  async approveReview(): Promise<"unsupported"> {
+    return "unsupported";
+  }
+
+  /** Forgejo cannot verify or retire a recorded approval under the supported API. */
+  async retireApproval(): Promise<"unconfirmed"> {
+    return "unconfirmed";
+  }
+
+  /** Both inspected Forgejo releases persist a PR ID without its reviewed head in scheduled merges. */
+  async inspectMerge(request: ForgeMergeRequest) {
+    mergeRequestSchema.parse(request);
+    const pr = z
+      .object({
+        number,
+        merged: z.boolean(),
+        state: z.string(),
+        head: z.object({ sha }),
+        base: z.object({ sha, ref: z.string(), repo_id: id }),
+      })
+      .parse(await this.request(`${this.route}/pulls/${request.number}`));
+    if (
+      pr.number !== request.number ||
+      pr.base.repo_id !== request.externalRepositoryId ||
+      pr.head.sha !== request.headSha ||
+      pr.base.ref !== request.baseBranch
+    )
+      return mergeState("stale", "revision_changed");
+    if (pr.merged) return mergeState("merged", "provider_merged");
+    if (pr.base.sha !== request.baseSha)
+      return mergeState("stale", "revision_changed");
+    return mergeState("blocked", "forgejo_schedule_does_not_pin_reviewed_head");
+  }
+
+  /** Refuse a scheduling API that discards head_commit_id when merge_when_checks_succeed is set. */
+  async scheduleMerge(request: ForgeMergeRequest): Promise<never> {
+    mergeRequestSchema.parse(request);
+    throw new ForgeOperationError("unsupported");
+  }
+
+  /** This adapter never creates an unguarded native Forgejo schedule to retire. */
+  async cancelMerge(request: ForgeMergeRequest): Promise<"absent"> {
+    mergeRequestSchema.parse(request);
+    return "absent";
   }
 
   /** Verify the original bytes and delivery identity before normalizing Forgejo events. */
@@ -666,8 +756,9 @@ export class ForgejoInteractions implements Forge {
     botId: string,
     marker: string,
   ) {
-    await removeIfPresent(
+    await removeTemporaryStatus(
       commentId,
+      marker,
       async () => {
         await this.request(
           await this.statusRoute(n, commentId, botId, marker),

@@ -4,6 +4,79 @@ import pg from "pg";
 import { PgBoss } from "pg-boss";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate as runMigrations } from "drizzle-orm/node-postgres/migrator";
+import { readMigrationFiles } from "drizzle-orm/migrator";
+
+/**
+ * Fill the GitLab boundary migration missing from the two published merge-policy
+ * preview histories. Drizzle normally runs only migrations above its last timestamp.
+ * The caller holds the migrator lock. Exact installed hashes identify these branches.
+ */
+async function reconcileMergePreview(
+  client: pg.Client,
+  migrationsFolder: string,
+) {
+  const table = await client.query(
+    "select to_regclass('drizzle.__drizzle_migrations') as installed",
+  );
+  if (!table.rows[0].installed) return;
+  const history = await client.query<{ hash: string; created_at: string }>(
+    "select hash, created_at from drizzle.__drizzle_migrations where created_at in (1790000000031,1790000000032,1790000000034)",
+  );
+  const original = history.rows.some(
+    (row) =>
+      row.created_at === "1790000000031" &&
+      row.hash ===
+        "7708f6b258ac9c27160054b61e554311e97110557368b43f2475f208d96d7dbd",
+  );
+  const policyHash =
+    "9de4684b72728e55f6795ea906a1664c0e753a0dd786cb796a9459d869e1a51c";
+  const boundaryHash =
+    "7d712b4f6b4633bd26adb8dad343ec24f23325855a96b8c5121f8ff428e18e43";
+  const restacked = history.rows.some(
+    (row) => row.created_at === "1790000000034" && row.hash === policyHash,
+  );
+  const at32 = history.rows.filter((row) => row.created_at === "1790000000032");
+  if (
+    at32.some(
+      (row) =>
+        row.hash !== boundaryHash &&
+        !(
+          original &&
+          row.hash ===
+            "e68728741aae93814e4cf6bc79f1e38834139d010688ab9b3fef14f66d4169e0"
+        ),
+    )
+  )
+    throw new Error("Unrecognized migration history at 0032");
+  if (
+    at32.some((row) => row.hash === boundaryHash) ||
+    (!original && !restacked)
+  )
+    return;
+
+  const migrations = readMigrationFiles({ migrationsFolder });
+  // The first preview lacks the deferred-open columns used by GitLab boundaries.
+  // Its published policy transition installs precisely those prerequisites.
+  const missing =
+    original && !restacked ? [policyHash, boundaryHash] : [boundaryHash];
+  await client.query("begin");
+  try {
+    for (const hash of missing) {
+      const entry = migrations.find((migration) => migration.hash === hash);
+      if (!entry) throw new Error("Published preview migration SQL is missing");
+      for (const statement of entry.sql) await client.query(statement);
+      // Preserve every original journal row, including a preview-only hash at 0032.
+      await client.query(
+        "insert into drizzle.__drizzle_migrations (created_at, hash) values ($1, $2)",
+        [entry.folderMillis, entry.hash],
+      );
+    }
+    await client.query("commit");
+  } catch (error) {
+    await client.query("rollback");
+    throw error;
+  }
+}
 
 /**
  * Apply review and pg-boss migrations under one database advisory lock. Queue
@@ -20,11 +93,11 @@ export async function migrate(url: string) {
   await client.connect();
   try {
     await client.query("select pg_advisory_lock(748321, 1)");
-    await runMigrations(drizzle(client), {
-      migrationsFolder: fileURLToPath(
-        new URL("../migrations", import.meta.url),
-      ),
-    });
+    const migrationsFolder = fileURLToPath(
+      new URL("../migrations", import.meta.url),
+    );
+    await reconcileMergePreview(client, migrationsFolder);
+    await runMigrations(drizzle(client), { migrationsFolder });
     await migrateQueue(client);
   } finally {
     await client.end();

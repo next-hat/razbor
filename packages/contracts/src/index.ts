@@ -2,6 +2,11 @@ import { z } from "zod";
 
 import type { ReviewEvaluation } from "@contracts/src/evaluation.js";
 import { publicIdSchema } from "@contracts/src/ids.js";
+import {
+  mergeAssessmentSchema,
+  mergePolicySnapshotSchema,
+  type MergeDecision,
+} from "@contracts/src/merge-policy.js";
 import { memoryCapabilitySchema } from "@contracts/src/memory.js";
 import {
   mcpServerSnapshotSchema,
@@ -17,6 +22,8 @@ import {
 } from "@contracts/src/skills.js";
 
 export * from "@contracts/src/skills.js";
+
+export * from "@contracts/src/merge-policy.js";
 
 export * from "@contracts/src/review-budget.js";
 
@@ -82,6 +89,8 @@ export const providerReferenceSchema = z
   .regex(/^[!-~]+$/);
 
 export const reviewResultSchema = z.object({
+  // Persisted reviews and conversational replies may predate policy assessments.
+  mergeAssessment: mergeAssessmentSchema.optional(),
   mode: z.enum(["review", "conversation"]).optional(),
   // Optional so saved reviews from before change summaries remain readable.
   prSummary: z
@@ -163,7 +172,8 @@ export const reviewConversationSchema = z
     reviewId: publicIdSchema("review"),
     originalBase: z.string(),
     originalHead: z.string(),
-    originalReview: reviewResultSchema,
+    // Keep policy-only evidence out of the reply prompt and its shared context budget.
+    originalReview: reviewResultSchema.omit({ mergeAssessment: true }),
     title: z.string().max(65536),
     target: z
       .object({
@@ -204,7 +214,8 @@ export function validateFindingChecks(
       result.mode !== "conversation" ||
       !result.summary.trim() ||
       result.findings.length ||
-      result.findingChecks !== undefined
+      result.findingChecks !== undefined ||
+      result.mergeAssessment !== undefined
     )
       throw new Error("Invalid conversational response");
     return;
@@ -266,6 +277,7 @@ export const queueJobSchema = reviewRequestSchema
     version: z.literal(1),
     reviewId: publicIdSchema("review"),
     submittedAt: z.string().datetime(),
+    mergePolicy: mergePolicySnapshotSchema.optional(),
     previousFindings: previousFindingsSchema.optional(),
     conversation: reviewConversationSchema.optional(),
     guidance: reviewGuidanceSnapshotSchema.optional(),
@@ -364,6 +376,13 @@ export type ReviewJobView = {
   headSha?: string;
   changeTitle?: string;
   evaluation?: ReviewEvaluation;
+  /** Captured decision and execution state for this historical run. */
+  mergeDecision?: MergeDecision;
+  mergeAction?:
+    "dry_run" | "writing" | "scheduled" | "merged" | "uncertain" | "refused";
+  mergePolicyVersion?: number;
+  pullRequestId?: string;
+  minimumConfidence?: number;
   waitingForRunner?: boolean;
   submittedAt: string;
   startedAt?: string;
@@ -472,6 +491,7 @@ export const agentJobSchema = z.object({
     .max(1000000)
     .default(80000),
   capabilities: preparedCapabilitiesSchema.optional(),
+  mergePolicy: mergePolicySnapshotSchema.optional(),
   previousFindings: previousFindingsSchema.optional(),
   conversation: reviewConversationSchema.optional(),
 });

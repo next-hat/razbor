@@ -150,6 +150,9 @@ export async function startGithubAppSetup(request: Request) {
       setup_on_update: true,
       default_permissions: {
         contents: "read",
+        administration: "read",
+        checks: "read",
+        statuses: "read",
         pull_requests: "write",
         issues: "write",
       },

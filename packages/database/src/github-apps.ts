@@ -215,6 +215,7 @@ export async function resolveGithubInstallationToken(
     },
     reference.installation_id,
     reference.repository_id,
+    remotes === undefined ? "server" : "source",
   );
   return token;
 }
@@ -246,7 +247,7 @@ export async function getRepositoryGithubApp(
   return {
     id: app.publicId,
     slug: app.slug,
-    bot: await githubAppBot(database, app),
+    bot: { ...(await githubAppBot(database, app)), appId: app.externalId },
     callbackUrl: `${app.callbackBase}/webhooks/github-app/${app.publicId}`,
     appUrl: app.appUrl,
   };

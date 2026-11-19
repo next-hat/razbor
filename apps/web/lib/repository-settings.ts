@@ -3,6 +3,7 @@ export const repositorySettingsSections = [
   { path: "", label: "General" },
   { path: "reviewer", label: "Reviewer" },
   { path: "guidance", label: "Guidance & skills" },
+  { path: "merge-policy", label: "Merge Policy" },
   { path: "mcp", label: "MCP access" },
   { path: "index", label: "Index" },
   { path: "webhook", label: "Webhook" },

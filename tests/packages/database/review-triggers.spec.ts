@@ -5,6 +5,9 @@ import { createServer } from "node:http";
 import { test } from "node:test";
 import { promisify } from "node:util";
 
+import { eq } from "drizzle-orm";
+
+import { mergePolicySchema } from "@razbor/contracts";
 import {
   acceptWebhook,
   abandonGitlabPublication,
@@ -19,6 +22,8 @@ import {
   preparePublication,
   processDeferredOpen,
   processInteraction,
+  processMergeTriage,
+  triageOutstanding,
   publicationView,
   listPullRequests,
   submitReview,
@@ -26,6 +31,8 @@ import {
   webhookView,
 } from "@razbor/database";
 import { applyRegistry, registrySchema } from "@razbor/database/registry";
+import { reviews } from "@razbor/database/schema";
+import { createForge, ForgejoInteractions } from "@razbor/forge-adapters";
 
 import { databaseFixture } from "@tests/packages/database/fixture.js";
 
@@ -41,7 +48,7 @@ function barrier() {
 test(
   "signed PR events persist opt-in, deduplicate revisions, and coalesce racing deliveries without a runner",
   { timeout: 90000 },
-  async () => {
+  async (t) => {
     const fixture = await databaseFixture();
     let database = connectDatabase(fixture.url);
     const secret = "a".repeat(64);
@@ -53,6 +60,7 @@ test(
     const base = "a".repeat(40);
     let head = "b".repeat(40);
     let draft = false;
+    let detailedBranches = true;
     let closed = false;
     let origin = "";
     let requestId = 0;
@@ -71,14 +79,16 @@ test(
     >();
     const mutations: string[] = [];
     const observedPulls = new Set<number>();
-    const observed = barrier();
-    const release = barrier();
+    let observed = barrier();
+    let release = barrier();
+    let listDraft = true;
+    let untrackedTitle = "Review lifecycle";
     let pauseRead = false;
     const concurrentDetail = barrier();
     const releaseRefresh = barrier();
     let refreshReads: number[] | undefined;
     let omitDetailDraft = false;
-    let staleListing = false;
+    let staleListing: "branch" | "head" | undefined;
     let unavailableDetail: number | undefined;
     const server = createServer(async (req, res) => {
       const path = new URL(req.url!, "http://localhost").pathname;
@@ -108,19 +118,32 @@ test(
       const pull = /\/pulls\/(\d+)$/.exec(path);
       /** Return the provider's current PR fields for both listing and detail reads. */
       function pullResponse(number: number, detail: boolean) {
+        const stale = number === 25 && !detail ? staleListing : undefined;
         return {
           number,
           state: closed ? "closed" : "open",
           merged: false,
-          draft: number === 25 && detail && omitDetailDraft ? undefined : draft,
-          title: "Review lifecycle",
+          draft:
+            (!detail && !listDraft) ||
+            (number === 25 && detail && omitDetailDraft)
+              ? undefined
+              : draft,
+          title: number === 26 ? untrackedTitle : "Review lifecycle",
           user: prAuthor,
           html_url: origin + "/team/project/pulls/" + number,
-          base: { sha: base, ref: "main" },
+          base: {
+            sha: base,
+            ref:
+              stale === "branch"
+                ? "release"
+                : !detail || detailedBranches
+                  ? "main"
+                  : undefined,
+            repo_id: 1,
+          },
           head: {
-            sha:
-              number === 25 && !detail && staleListing ? "e".repeat(40) : head,
-            ref: "fork-feature",
+            sha: stale === "head" ? "e".repeat(40) : head,
+            ref: !detail || detailedBranches ? "fork-feature" : undefined,
           },
           merge_base: base,
           updated_at: commandTime.toISOString(),
@@ -497,9 +520,285 @@ test(
       const priorCount = (await history()).length;
       await lifecycle("edited", 22);
       assert.equal((await history()).length, priorCount + 1);
+      // A listing can catch a draft transition before the webhook arrives. A later
+      // ready event must still start exactly one review in fully automatic mode.
+      draft = true;
+      await lifecycle("opened", 23);
+      /** Read the draft evidence and admission generation of a saved PR. */
+      const draftFence = async (number: number) =>
+        (
+          await database.pool.query(
+            "select draft, trigger_generation from pull_requests where number=$1",
+            [number],
+          )
+        ).rows[0];
+      const beforeReady = await draftFence(23);
+      assert.equal(beforeReady.draft, true);
+      draft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.deepEqual(await draftFence(23), beforeReady);
+      await lifecycle("edited", 23);
+      assert.equal((await history()).length, priorCount + 2);
+      /** Read both fences, branch names, and SHAs for this provider PR. */
+      async function savedBranches() {
+        return (
+          await database.pool.query(
+            "select head_branch,base_branch,head_sha,base_sha,trigger_generation,merge_revision from pull_requests where number=23",
+          )
+        ).rows[0];
+      }
+      const originalBranches = await savedBranches();
+      detailedBranches = false;
+      await lifecycle("synchronized", 23);
+      assert.deepEqual(await savedBranches(), originalBranches);
+      const openChanges = ForgejoInteractions.prototype.openChanges;
+      let listedBase: string | undefined;
+      const partialListing = t.mock.method(
+        ForgejoInteractions.prototype,
+        "openChanges",
+        async function (this: ForgejoInteractions) {
+          return (await openChanges.call(this)).map((p) => ({
+            ...p,
+            headBranch: undefined,
+            baseBranch: p.number === 23 ? listedBase : undefined,
+          }));
+        },
+      );
+      try {
+        assert.deepEqual(
+          (await syncPullRequests(database, [repo.id])).failures,
+          [],
+        );
+        assert.deepEqual(await savedBranches(), originalBranches);
+        // Both branches point at the same commit. Only the listing reports the retarget.
+        listedBase = "release";
+        assert.deepEqual(
+          (await syncPullRequests(database, [repo.id])).failures,
+          [],
+        );
+        assert.deepEqual(await savedBranches(), {
+          ...originalBranches,
+          base_branch: listedBase,
+          trigger_generation: originalBranches.trigger_generation + 1,
+          merge_revision: originalBranches.merge_revision + 1,
+        });
+      } finally {
+        partialListing.mock.restore();
+      }
+      detailedBranches = true;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.deepEqual(await savedBranches(), {
+        ...originalBranches,
+        trigger_generation: originalBranches.trigger_generation + 2,
+        merge_revision: originalBranches.merge_revision + 2,
+      });
+      await lifecycle("edited", 23);
+      assert.equal((await history()).length, priorCount + 2);
+      observed = barrier();
+      release = barrier();
+      pauseRead = true;
+      const beforeDraftRefresh = lifecycle("synchronized", 23);
+      await Promise.race([
+        observed.promise,
+        beforeDraftRefresh.then((status) => {
+          throw new Error(
+            `Delivery returned HTTP ${status} before reading the PR`,
+          );
+        }),
+      ]);
+      draft = true;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      const refreshed = (await listPullRequests(database, [repo.id])).find(
+        (pr) => pr.number === 23,
+      );
+      assert.equal(refreshed?.merge?.decision.status, "stale");
+      assert.equal(refreshed?.merge?.confidence, undefined);
+      release.resolve();
+      await beforeDraftRefresh;
+      listDraft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      const draftAfterRefresh = await database.pool.query(
+        "select draft from pull_requests where number=23",
+      );
+      assert.equal(
+        draftAfterRefresh.rows[0].draft,
+        true,
+        "an older webhook or a listing without draft information must not restore readiness",
+      );
+      listDraft = true;
+      draft = false;
+      // A completed automatic result may already have had its ready transition
+      // refreshed. The signed edit replaces the stale merge review just once.
+      config.repositories.project.mergePolicy = mergePolicySchema.parse({
+        enabled: true,
+      });
+      await applyRegistry(database, config);
+      await lifecycle("opened", 27);
+      const [priorReadyReview] = await history();
+      const readyAttempt = await beginAttempt(
+        database,
+        priorReadyReview.id,
+        "fixture",
+        30000,
+      );
+      assert.equal(readyAttempt.kind, "started");
+      await finishAttempt(
+        database,
+        priorReadyReview.id,
+        readyAttempt.attemptId,
+        "fixture",
+        {
+          summary: "Completed the prior ready revision",
+          findings: [],
+        },
+      );
+      draft = true;
+      await lifecycle("edited", 27);
+      draft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      const beforeReadyWebhook = (await history()).length;
+      const refreshedRevision = (
+        await database.pool.query(
+          "select draft, merge_revision from pull_requests where number=27",
+        )
+      ).rows[0];
+      assert.equal(refreshedRevision.draft, false);
+      assert.notEqual(
+        readyAttempt.source.mergeRevision,
+        refreshedRevision.merge_revision,
+      );
+      assert.equal(await lifecycle("edited", 27), 202);
+      assert.equal((await history()).length, beforeReadyWebhook + 1);
+      const [replacementReadyReview] = await history();
+      const captured = (
+        await database.pool.query(
+          "select (source->>'mergeRevision')::int as revision from reviews where public_id=$1",
+          [replacementReadyReview.id],
+        )
+      ).rows[0];
+      assert.equal(captured.revision, refreshedRevision.merge_revision);
+      await lifecycle("edited", 27);
+      assert.equal((await history()).length, beforeReadyWebhook + 1);
+      delete config.repositories.project.mergePolicy;
+      await applyRegistry(database, config);
+      head = "6".repeat(40);
+      await lifecycle("opened", 124);
+      const [oldAutomatic] = await history();
+      await command(301, author, 124);
+      const [oldAuthority] = await history();
+      const olderAttempt = await beginAttempt(
+        database,
+        oldAuthority.id,
+        "fixture",
+        30000,
+      );
+      assert.equal(olderAttempt.kind, "started");
+      await finishAttempt(
+        database,
+        oldAuthority.id,
+        olderAttempt.attemptId,
+        "fixture",
+        {
+          summary: "Prior review",
+          findings: [],
+        },
+      );
+      await database.pool.query(
+        "update reviews set merge_action='uncertain' where public_id=$1",
+        [oldAuthority.id],
+      );
+      head = "7".repeat(40);
+      assert.equal(await lifecycle("synchronized", 124, "replacement"), 202);
+      assert.equal(await lifecycle("synchronized", 124, "replacement"), 202);
+      const afterPush = await history();
+      assert.equal(afterPush[0].headSha, head);
+      assert.notEqual(afterPush[0].id, oldAutomatic.id);
+      assert.equal(
+        afterPush.find((r) => r.id === oldAutomatic.id)?.status,
+        "failed",
+      );
+      assert.equal(await command(302, author, 124), 202);
+      assert.equal(await command(302, author, 124), 202);
+      const afterCommand = await history();
+      assert.equal(afterCommand.length, afterPush.length + 1);
+      assert.equal(afterCommand[0].headSha, head);
+      for (const unavailable of [true, false]) {
+        unavailableDetail = unavailable ? 124 : undefined;
+        await database.pool.query(
+          "update pull_requests set merge_after=timestamp '2000-01-01' where number=124",
+        );
+        await processMergeTriage(database);
+        const stored = await database.pool.query(
+          "select merge_action, merge_decision->'reasons'->0->>'code' as reason from reviews where public_id=$1",
+          [afterCommand[0].id],
+        );
+        assert.deepEqual(stored.rows[0], {
+          merge_action: null,
+          reason: "prior_write_uncertain",
+        });
+      }
+      assert.equal(
+        (
+          await database.pool.query(
+            "select merge_action from reviews where public_id=$1",
+            [oldAuthority.id],
+          )
+        ).rows[0].merge_action,
+        "uncertain",
+      );
       const { rows } = await database.pool.query(
         "select origin, comment_id from review_triggers",
       );
+      await lifecycle("opened", 125);
+      const [oldSuccess] = await history();
+      const good = await beginAttempt(
+        database,
+        oldSuccess.id,
+        "fixture",
+        30000,
+      );
+      assert.equal(good.kind, "started");
+      await finishAttempt(database, oldSuccess.id, good.attemptId, "fixture", {
+        summary: "Clean",
+        findings: [],
+      });
+      assert.equal(await command(303, author, 125), 202);
+      const [manualFailure] = await history();
+      const failed = await beginAttempt(
+        database,
+        manualFailure.id,
+        "fixture",
+        30000,
+      );
+      assert.equal(failed.kind, "started");
+      await finishAttempt(
+        database,
+        manualFailure.id,
+        failed.attemptId,
+        "fixture",
+        undefined,
+        true,
+      );
+      assert.equal(await lifecycle("synchronized", 125), 202);
+      const [retry] = await history();
+      assert.notEqual(retry.id, manualFailure.id);
+      assert.notEqual(retry.id, oldSuccess.id);
+      assert.equal(retry.status, "queued");
       assert.ok(
         rows
           .filter((row) => row.origin === "automatic")
@@ -571,7 +870,20 @@ test(
         ).rows[0].draft;
       assert.equal(await savedDraft(24), false);
       assert.equal(await savedDraft(25), false);
-      staleListing = true;
+      // A same-SHA retarget cannot borrow draft readiness from the previous destination.
+      staleListing = "branch";
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.equal(await savedDraft(25), null);
+      staleListing = undefined;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.equal(await savedDraft(25), false);
+      staleListing = "head";
       observedPulls.add(26);
       unavailableDetail = 24;
       assert.deepEqual((await syncPullRequests(database, [repo.id])).failures, [
@@ -594,6 +906,25 @@ test(
           (item) => item.number === 26,
         ),
       );
+      // PR 26 was discovered only through the listing. A missing draft flag
+      // can reuse its saved readiness only while its revision and title match.
+      const listedReady = await draftFence(26);
+      assert.equal(listedReady.draft, false);
+      listDraft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.deepEqual(await draftFence(26), listedReady);
+      untrackedTitle = "WIP: Review lifecycle";
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.deepEqual(await draftFence(26), {
+        draft: null,
+        trigger_generation: listedReady.trigger_generation + 1,
+      });
     } finally {
       release.resolve();
       delete process.env.RAZBOR_TEST_TRIGGER_SECRET;
@@ -1124,24 +1455,21 @@ test(
         created_at: "2026-01-01T00:00:00Z",
         body: `${marker}\n\n<!-- razbor-gitlab:${review.id}:${head}:REQUEST_CHANGES:pending -->`,
       };
-      discussions.push({
-        id: "thread-61",
-        notes: [
-          {
-            ...summaryNote,
-            id: 61,
-            body: `${inline.body}\n\n<!-- razbor-gitlab-draft:${review.id}:0:${head} -->`,
-            position: {
-              new_path: inline.path,
-              old_path: inline.path,
-              new_line: inline.lineEnd,
-              head_sha: head,
-              base_sha: base,
-              start_sha: target,
-            },
-          },
-        ],
-      });
+      const submittedNote = {
+        ...summaryNote,
+        id: 61,
+        body: `${inline.body}\n\n<!-- razbor-gitlab-draft:${review.id}:0:${head} -->`,
+        resolved: false,
+        position: {
+          new_path: inline.path,
+          old_path: inline.path,
+          new_line: inline.lineEnd,
+          head_sha: head,
+          base_sha: base,
+          start_sha: target,
+        },
+      };
+      discussions.push({ id: "thread-61", notes: [submittedNote] });
       await database.pool.query(
         "update dispatch_outbox set publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
         [
@@ -1205,6 +1533,38 @@ test(
         ]),
         [["52:61", anchored.title]],
       );
+      // The exact submitted GitLab root can discharge its own finding. An
+      // unconfirmed verdict cannot clear the unanchored finding or a wrong-head note.
+      const [savedReview] = await database.db
+        .select()
+        .from(reviews)
+        .where(eq(reviews.publicId, followup.id));
+      const adapter = createForge(
+        {
+          type: "gitlab",
+          apiUrl: origin + "/api/v4",
+          webUrl: origin,
+          allowHttp: true,
+        },
+        "team/project",
+      );
+      /** Read the remaining findings using the live discussions and the frozen review payload. */
+      const outstanding = () =>
+        triageOutstanding(
+          database,
+          savedReview.repositoryId,
+          iid,
+          "9",
+          adapter,
+          savedReview,
+        );
+      assert.equal(await outstanding(), 2);
+      submittedNote.resolved = true;
+      assert.equal(await outstanding(), 1);
+      submittedNote.position.head_sha = base;
+      assert.equal(await outstanding(), 2);
+      submittedNote.position.head_sha = head;
+      submittedNote.resolved = false;
       // A draft update changes only GitLab's diff refs. The MR returns to its
       // reviewed revision without a ready webhook and the list omits diff_refs.
       const reviewedBase = base;

@@ -24,7 +24,7 @@
     "test:broker": "node --import=tsx --test --test-isolation=none tests/apps/web/runner-broker.spec.ts",
     "test:indexer": "node --import=tsx --test tests/apps/indexer/*.spec.ts",
     "smoke:capabilities": "node --import=tsx --test tests/apps/runner/capability-smoke.spec.ts",
-    "test": "pnpm run test:capabilities && node --import=tsx --test tests/packages/database/registry.spec.ts",
+    "test": "pnpm run test:capabilities && node --import=tsx --test tests/packages/database/registry.spec.ts tests/packages/contracts/merge-policy.spec.ts",
     "test:coverage": "c8 pnpm test",
     "manage": "node --import=tsx scripts/manage.ts",
     "db:migrate": "node --import=tsx scripts/manage.ts database migrate",
@@ -34,7 +34,9 @@
     "test:comments": "node --import=tsx --test tests/packages/database/comment-flow.spec.ts tests/packages/database/review-triggers.spec.ts",
     "test:presentation": "TSX_TSCONFIG_PATH=tests/apps/web/tsconfig.json node --import=tsx --test tests/packages/contracts/presentation.spec.ts tests/packages/forge-adapters/presentation.spec.ts tests/apps/web/presentation.spec.ts",
     "test:release": "node --import=tsx --test tests/scripts/publish-images.spec.ts",
-    "test:review": "node --import=tsx --test --test-isolation=none tests/packages/harness/autonomous.spec.ts tests/packages/harness/budgets.spec.ts tests/packages/harness/context.spec.ts tests/apps/runner/model-budget.spec.ts tests/apps/runner/finalization.spec.ts tests/apps/runner/progress.spec.ts tests/scripts/evaluate.spec.ts"
+    "test:review": "node --import=tsx --test --test-isolation=none tests/packages/harness/autonomous.spec.ts tests/packages/harness/budgets.spec.ts tests/packages/harness/context.spec.ts tests/apps/runner/model-budget.spec.ts tests/apps/runner/finalization.spec.ts tests/apps/runner/progress.spec.ts tests/scripts/evaluate.spec.ts",
+    "test:triage": "node --import=tsx --test tests/packages/database/merge-triage.spec.ts",
+    "test:merge-providers": "node --import=tsx --test tests/packages/forge-adapters/merge.spec.ts"
   },
   "dependencies": {
     "ajv": "8.20.0",

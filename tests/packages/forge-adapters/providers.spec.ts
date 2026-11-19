@@ -670,6 +670,7 @@ test("bounded configured provider reads: paths, exact IDs, auth, errors and redi
 
 test("status writes verify the exact top-level owner, marker, ID and PR on all three APIs", async () => {
   const marker = "<!-- razbor:rev_abcdefghijklmnop:status -->";
+  const escalationMarker = "<!-- razbor:pr_abcdefghijklmnop:escalation -->";
   const queued = `Queued\n\n${marker}`;
   const running = `Running\n\n${marker}`;
   const writes: string[] = [];
@@ -824,6 +825,18 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
         await rejectWrite();
         discussion = false;
       }
+      body = `Human review required\n\n${escalationMarker}`;
+      await rejectWrite();
+      await assert.rejects(
+        forge.deleteStatusComment(12, "91", "5", escalationMarker),
+        ForgeOperationError,
+      );
+      const resolved = `Reviewed by a maintainer\n\n${escalationMarker}`;
+      await forge.editStatusComment(12, "91", "5", escalationMarker, resolved);
+      assert.equal(body, resolved);
+      assert.deepEqual(writes, [provider === "gitlab" ? "PUT" : "PATCH"]);
+      writes.length = 0;
+      body = queued;
       await forge.editStatusComment(12, "91", "5", marker, running);
       assert.equal(body, running);
       loseDelete = true;

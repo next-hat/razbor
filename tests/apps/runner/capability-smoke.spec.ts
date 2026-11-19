@@ -159,6 +159,18 @@ test(
                   type: "output_text",
                   text: JSON.stringify({
                     summary: "Fixture tools verified",
+                    mergeAssessment: {
+                      confidence: 10,
+                      riskLevel: "high",
+                      reviewComplete: true,
+                      requiresHumanReview: true,
+                      reasons: [
+                        "The inspected addition function now subtracts.",
+                      ],
+                      criticalAreas: [],
+                      verificationGaps: [],
+                      suggestedReviewers: [],
+                    },
                     findings: [
                       {
                         severity: "high",

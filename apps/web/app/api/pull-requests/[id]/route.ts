@@ -1,5 +1,9 @@
 import { publicIdSchema } from "@razbor/contracts";
-import { getPullRequest, submitReview } from "@razbor/database";
+import {
+  getPullRequest,
+  RepositoryManagementError,
+  submitReview,
+} from "@razbor/database";
 
 import { canManageResource } from "@web/lib/auth.js";
 import {
@@ -55,6 +59,11 @@ export async function POST(
       headers: { "Cache-Control": "no-store", Location: accepted.statusUrl },
     });
   } catch (error) {
+    if (error instanceof RepositoryManagementError)
+      return Response.json(
+        { error: error.message },
+        { status: error.status, headers: { "Cache-Control": "no-store" } },
+      );
     return (
       authErrorResponse(error) ??
       Response.json(

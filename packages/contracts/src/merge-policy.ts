@@ -1,0 +1,746 @@
+import { z } from "zod";
+
+import type { JobStatus, ReviewResult } from "@contracts/src/index.js";
+
+export const MAX_POLICY_BYTES = 32768;
+
+export const MAX_ESCALATION_MENTIONS = 3;
+
+export const reviewerUsernameSchema = z
+  .string()
+  .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/)
+  .refine(
+    (name) =>
+      !["all", "here", "everyone", "channel"].includes(name.toLowerCase()),
+    "Use an individual reviewer username.",
+  );
+
+// PostgreSQL JSONB rejects zero bytes and isolated UTF-16 surrogate halves.
+const textValue = z
+  .string()
+  .refine(
+    (value) => !value.includes("\0") && !/[\uD800-\uDFFF]/u.test(value),
+    "Use valid Unicode text without null characters.",
+  );
+
+const description = textValue.trim().min(1).max(800);
+
+const reviewerSchema = z.strictObject({
+  username: reviewerUsernameSchema,
+  label: textValue.trim().min(1).max(100).optional(),
+  responsibilities: description,
+  pathPatterns: z.array(textValue.trim().min(1).max(256)).max(16).optional(),
+  riskCategories: z.array(textValue.trim().min(1).max(100)).max(16).optional(),
+});
+
+const policyMarkdown = textValue
+  .max(MAX_POLICY_BYTES)
+  .refine(
+    (value) => new TextEncoder().encode(value).length <= MAX_POLICY_BYTES,
+    "Merge Policy must fit within 32 KiB of UTF-8 text.",
+  );
+
+const humanReviewers = z
+  .array(reviewerSchema)
+  .max(24)
+  .refine(
+    (items) =>
+      new Set(items.map((item) => item.username.toLowerCase())).size ===
+      items.length,
+    "Each reviewer must have a distinct username.",
+  );
+
+export const mergePolicySchema = z.strictObject({
+  enabled: z.boolean().default(false),
+  dryRun: z.boolean().default(true),
+  autoApprove: z.boolean().default(false),
+  minimumConfidence: z.number().int().min(0).max(100).default(90),
+  mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash"),
+  requirePassingChecks: z.boolean().default(true),
+  defaultBranchOnly: z.boolean().default(true),
+  policyMarkdown: policyMarkdown.default(""),
+  humanReviewers: humanReviewers.default([]),
+});
+
+export type MergePolicy = z.infer<typeof mergePolicySchema>;
+
+export const mergePolicySnapshotSchema = z.strictObject({
+  version: z.number().int().positive().safe(),
+  // Older complete snapshots predate native approval and never authorize it.
+  policy: mergePolicySchema.required().extend({
+    autoApprove: mergePolicySchema.shape.autoApprove,
+  }),
+});
+
+export type MergePolicySnapshot = z.infer<typeof mergePolicySnapshotSchema>;
+
+export const mergeRiskSchema = z.enum(["low", "medium", "high", "critical"]);
+
+export const mergeAssessmentSchema = z.strictObject({
+  confidence: z.number().int().min(0).max(100),
+  riskLevel: mergeRiskSchema,
+  reviewComplete: z.boolean(),
+  requiresHumanReview: z.boolean(),
+  reasons: z.array(description).min(1).max(12),
+  criticalAreas: z.array(description).max(12),
+  verificationGaps: z.array(description).max(12),
+  // Preserve old assessment feedback; only legal, configured IDs can become candidates.
+  suggestedReviewers: z.array(textValue.trim().min(1).max(100)).max(24),
+  // The harness derives these from the pinned comparison and the saved policy.
+  pathOwners: z.array(reviewerUsernameSchema).max(24).optional(),
+});
+
+export type MergeAssessment = z.infer<typeof mergeAssessmentSchema>;
+
+export const mergeDecisionStatusSchema = z.enum([
+  "auto_merge_eligible",
+  "human_review_required",
+  "awaiting_checks",
+  "blocked",
+  "review_in_progress",
+  "stale",
+  "merged",
+]);
+
+export type MergeDecisionStatus = z.infer<typeof mergeDecisionStatusSchema>;
+
+export type MergeDecision = {
+  status: MergeDecisionStatus;
+  reasons: { code: string; message: string }[];
+  reviewers: string[];
+};
+
+export type ReviewApprovalStatus =
+  "approved" | "uncertain" | "unavailable" | "dismissed";
+
+export type MergeDecisionInput = {
+  snapshot?: MergePolicySnapshot | null;
+  currentPolicyVersion: number;
+  reviewStatus: JobStatus;
+  result?: ReviewResult | null;
+  /** Count of unresolved historical findings. */
+  outstandingFindings: number;
+  /** The server has reconciled all saved finding checks against current provider evidence. */
+  outstandingFindingsAudited?: boolean;
+  /** Includes base, head, target branch and identity of the latest authorized review. */
+  revisionCurrent: boolean;
+  open: boolean;
+  draft: boolean;
+  baseBranch?: string | null;
+  defaultBranch?: string | null;
+  humanEscalated: boolean;
+  provider: {
+    guarded: boolean;
+    checks: "passing" | "pending" | "failed" | "unknown";
+    restrictions: "satisfied" | "pending" | "blocked" | "unknown";
+    merged?: boolean;
+    reason?: string;
+  };
+};
+
+/** Match a sequence with a zero-or-more wildcard. Only the latest wildcard can need another element. */
+function matchSequence(
+  pattern: string | readonly string[],
+  value: string | readonly string[],
+  wildcard: string,
+  matches: (part: string, actual: string) => boolean,
+): boolean {
+  let term = 0;
+  let position = 0;
+  let lastWildcard = -1;
+  let wildcardEnd = 0;
+  while (position < value.length) {
+    if (pattern[term] === wildcard) {
+      lastWildcard = term++;
+      wildcardEnd = position;
+    } else if (
+      term < pattern.length &&
+      matches(pattern[term], value[position])
+    ) {
+      term++;
+      position++;
+    } else if (lastWildcard >= 0) {
+      term = lastWildcard + 1;
+      position = ++wildcardEnd;
+    } else return false;
+  }
+  while (pattern[term] === wildcard) term++;
+  return term === pattern.length;
+}
+
+/** Match one case-sensitive Git path component, including names beginning with a dot. */
+function matchPathComponent(pattern: string, value: string): boolean {
+  if (!pattern.includes("*") && !pattern.includes("?"))
+    return pattern === value;
+  const codePoints = pattern.includes("?") && /[\uD800-\uDBFF]/.test(value);
+  return matchSequence(
+    codePoints ? Array.from(pattern) : pattern,
+    codePoints ? Array.from(value) : value,
+    "*",
+    (part, actual) => part === "?" || part === actual,
+  );
+}
+
+/** Match root-relative policy patterns against both sides of the pinned changes supplied by the harness. */
+export function matchPathOwners(
+  policy: MergePolicy,
+  changedPaths: readonly string[],
+): string[] {
+  if (
+    !policy.humanReviewers.some((candidate) => candidate.pathPatterns?.length)
+  )
+    return [];
+  const paths = changedPaths
+    .map((path) => path.split("/"))
+    .filter((parts) =>
+      parts.every((part) => part && part !== "." && part !== ".."),
+    );
+  return policy.humanReviewers
+    .filter((candidate) =>
+      candidate.pathPatterns?.some((glob) => {
+        const parts = glob.replace(/^(?:\.\/|\/)/, "").split("/");
+        // A trailing slash or globstar covers files beneath the directory.
+        if (parts.at(-1) === "") parts[parts.length - 1] = "**";
+        if (parts.at(-1) === "**") parts.push("*");
+        return paths.some((path) =>
+          matchSequence(parts, path, "**", matchPathComponent),
+        );
+      }),
+    )
+    .map((candidate) => candidate.username);
+}
+
+/** Match a configured category as a literal word or phrase in critical-area descriptions. */
+function mentionsCategory(areas: readonly string[], category: string): boolean {
+  const literal = category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const phrase = new RegExp(
+    `(?:^|[^\\p{L}\\p{N}_])${literal}(?![\\p{L}\\p{N}_])`,
+    "iu",
+  );
+  return areas.some((area) => phrase.test(area));
+}
+
+/** Rank path owners first, then configured model or risk matches; retain a general reviewer for unmatched changes. */
+export function selectMergeReviewers(
+  policy: MergePolicy,
+  assessment?: MergeAssessment,
+): string[] {
+  const suggestions = new Set(
+    assessment?.suggestedReviewers
+      .filter((name) => reviewerUsernameSchema.safeParse(name).success)
+      .map((name) => name.toLowerCase()),
+  );
+  const owners = new Set(
+    assessment?.pathOwners?.map((name) => name.toLowerCase()),
+  );
+  const areas = assessment
+    ? [...assessment.criticalAreas, assessment.riskLevel]
+    : [];
+  const matches = new Set<string>();
+  for (const candidate of policy.humanReviewers)
+    if (owners.has(candidate.username.toLowerCase()))
+      matches.add(candidate.username);
+  for (const candidate of policy.humanReviewers)
+    if (
+      suggestions.has(candidate.username.toLowerCase()) ||
+      candidate.riskCategories?.some((category) =>
+        mentionsCategory(areas, category),
+      )
+    )
+      matches.add(candidate.username);
+  if (matches.size) return [...matches];
+  const fallback =
+    policy.humanReviewers.find(
+      (candidate) =>
+        !candidate.pathPatterns?.length && !candidate.riskCategories?.length,
+    ) ?? policy.humanReviewers[0];
+  return fallback ? [fallback.username] : [];
+}
+
+const humanReasons = {
+  approval_retirement_pending:
+    "An earlier Razbor approval may still count on the forge. Wait for its withdrawal and obtain a human review before merging.",
+  missing_policy_snapshot: "This review has no saved merge policy.",
+  missing_assessment: "This review has no merge readiness assessment.",
+  confidence_below_threshold:
+    "Merge confidence is below the repository threshold.",
+  incomplete_review: "The reviewer could not complete the investigation.",
+  explicit_human_review: "The reviewer requested human review.",
+  high_risk: "The review identified high or critical risk.",
+  critical_area: "The change affects an area that requires human review.",
+  verification_gap: "Some required verification remains incomplete.",
+  actionable_findings: "The review reported actionable findings.",
+  outstanding_findings:
+    "Prior finding reconciliation has unresolved or uncertain findings.",
+  previously_escalated:
+    "This pull request was escalated to the provider's human-controlled merge workflow.",
+};
+
+/** Expose the score and readiness signals while keeping detailed notes and reviewer identities private. */
+export function publicMergeAssessment(
+  assessment: MergeAssessment,
+): MergeAssessment {
+  return {
+    confidence: assessment.confidence,
+    riskLevel: assessment.riskLevel,
+    reviewComplete: assessment.reviewComplete,
+    requiresHumanReview: assessment.requiresHumanReview,
+    reasons: [
+      "Detailed assessment notes are available to repository managers.",
+    ],
+    criticalAreas: assessment.criticalAreas.length
+      ? [humanReasons.critical_area]
+      : [],
+    verificationGaps: assessment.verificationGaps.length
+      ? [humanReasons.verification_gap]
+      : [],
+    suggestedReviewers: [],
+  };
+}
+
+/** Evaluate trusted review, policy and provider facts without side effects. Missing or indeterminate evidence never confers eligibility. */
+export function evaluateMergeDecision(
+  input: MergeDecisionInput,
+): MergeDecision {
+  const { result, provider } = input;
+  const parsed = mergePolicySnapshotSchema.safeParse(input.snapshot);
+  const snapshot = parsed.success ? parsed.data : undefined;
+  /** Make a single-gate result without notifying reviewers for operational states. */
+  const decision = (
+    status: MergeDecisionStatus,
+    code: string,
+    message: string,
+  ): MergeDecision => ({
+    status,
+    reasons: [{ code, message }],
+    reviewers: [],
+  });
+  if (provider.merged === true)
+    return decision(
+      "merged",
+      "provider_merged",
+      "The provider confirms this pull request was merged.",
+    );
+  if (input.snapshot && !snapshot)
+    return decision(
+      "blocked",
+      "invalid_policy_snapshot",
+      "The saved policy is invalid.",
+    );
+  if (
+    !input.revisionCurrent ||
+    (snapshot && snapshot.version !== input.currentPolicyVersion)
+  ) {
+    return decision(
+      "stale",
+      "review_superseded",
+      "The review revisions or saved policy are no longer current.",
+    );
+  }
+  if (!input.open || input.draft !== false)
+    return decision(
+      "blocked",
+      "change_not_ready",
+      "The pull request must be open and ready for review.",
+    );
+  if (input.reviewStatus === "queued" || input.reviewStatus === "running")
+    return decision(
+      "review_in_progress",
+      "review_pending",
+      "The current review has not finished.",
+    );
+  if (input.reviewStatus !== "completed")
+    return decision(
+      "blocked",
+      "review_failed",
+      "A successful review of this change is required.",
+    );
+
+  const reasons: MergeDecision["reasons"] = [];
+  const validated = mergeAssessmentSchema.safeParse(result?.mergeAssessment);
+  const assessment = validated.success ? validated.data : undefined;
+  /** Collect every human-facing impediment to the same review so a fix addresses the full decision. */
+  const add = (code: keyof typeof humanReasons) =>
+    reasons.push({ code, message: humanReasons[code] });
+  if (!snapshot) add("missing_policy_snapshot");
+  if (!assessment || result?.mode === "conversation") add("missing_assessment");
+  if (assessment) {
+    if (snapshot && assessment.confidence < snapshot.policy.minimumConfidence)
+      add("confidence_below_threshold");
+    if (!assessment.reviewComplete) add("incomplete_review");
+    if (assessment.requiresHumanReview) add("explicit_human_review");
+    if (assessment.riskLevel === "high" || assessment.riskLevel === "critical")
+      add("high_risk");
+    if (assessment.criticalAreas.length) add("critical_area");
+    if (assessment.verificationGaps.length) add("verification_gap");
+  }
+  if (result?.findings.length) add("actionable_findings");
+  if (
+    input.outstandingFindings !== 0 ||
+    (!input.outstandingFindingsAudited &&
+      result?.findingChecks?.some((check) => check.status !== "resolved"))
+  )
+    add("outstanding_findings");
+  if (input.humanEscalated && !reasons.length) add("previously_escalated");
+  if (reasons.length)
+    return {
+      status: "human_review_required",
+      reasons,
+      reviewers: snapshot
+        ? selectMergeReviewers(snapshot.policy, assessment)
+        : [],
+    };
+  if (!snapshot?.policy.enabled)
+    return decision(
+      "blocked",
+      "automation_disabled",
+      "Merge automation is disabled for this repository.",
+    );
+  // The initial release has no additional destination branch allowlist.
+  if (!input.defaultBranch || input.baseBranch !== input.defaultBranch)
+    return decision(
+      "blocked",
+      "target_not_allowed",
+      "Only the repository default branch is an authorized destination.",
+    );
+  if (!provider.guarded)
+    return decision(
+      "blocked",
+      "guard_unavailable",
+      provider.reason ||
+        "The provider cannot enforce a guarded merge for this change.",
+    );
+  if (
+    provider.restrictions === "blocked" ||
+    provider.restrictions === "unknown"
+  )
+    return decision(
+      "blocked",
+      "provider_restrictions",
+      provider.reason ||
+        "Provider permission or merge restrictions prevent authorization.",
+    );
+  if (
+    snapshot.policy.requirePassingChecks &&
+    (provider.checks === "failed" || provider.checks === "unknown")
+  )
+    return decision(
+      "blocked",
+      "checks_unverified",
+      provider.reason ||
+        "Required provider checks failed or could not be verified.",
+    );
+  if (
+    provider.restrictions !== "satisfied" ||
+    (snapshot.policy.requirePassingChecks && provider.checks !== "passing")
+  )
+    return decision(
+      "awaiting_checks",
+      "provider_pending",
+      provider.reason ||
+        "Provider checks or native merge requirements are pending.",
+    );
+  return decision(
+    "auto_merge_eligible",
+    "requirements_met",
+    snapshot.policy.dryRun
+      ? "Dry run. The reviewed revision meets the configured merge requirements."
+      : "The reviewed revision meets the configured merge requirements.",
+  );
+}
+
+/** Render untrusted text as a single literal Markdown span, suppressing provider mentions, HTML entities and slash commands. */
+function commentLiteral(text: string): string {
+  return (
+    "`" +
+    text
+      .replaceAll("`", "′")
+      .replaceAll("@", "＠")
+      .replaceAll("&", "＆")
+      .replace(/\s+/g, " ")
+      .trim() +
+    "`"
+  );
+}
+
+export const forgeMergeReasonMessages = {
+  github_schedule_owner_unbound:
+    "GitHub cannot bind the eligibility check to Razbor’s native merge request. Complete the merge through the human workflow.",
+  approval_unsupported:
+    "The provider cannot safely approve this reviewed revision.",
+  approval_actor_unavailable:
+    "The provider could not confirm an eligible approval identity for this pull request.",
+  approval_ready:
+    "The provider confirmed that Razbor can approve the reviewed revision.",
+  approval_unconfirmed:
+    "The provider could not confirm the current approval conditions.",
+  approval_required:
+    "The repository policy requires a confirmed Razbor approval before merge scheduling.",
+  shared_head_check:
+    "GitHub could not establish that this PR is the only open request using the reviewed head. A commit-wide eligibility check could release another PR.",
+  app_pinned_strict_check_required:
+    "Require strict, administrator-enforced default-branch protection and pin the Razbor eligibility check to this GitHub App.",
+  conflicting_eligibility_check:
+    "This commit already has an eligibility check for another review. Inspect the existing check before using a fresh revision.",
+  destination_changed:
+    "The provider's repository or default branch has changed since this review.",
+  direct_child_required:
+    "This native operation requires a single-parent head commit directly on the reviewed destination tip.",
+  exclusive_destination_required:
+    "The provider cannot confirm that this automation identity can merge only into the default branch.",
+  existing_schedule:
+    "The provider already has a merge schedule that this review does not own.",
+  forgejo_schedule_does_not_pin_reviewed_head:
+    "Forgejo's native scheduler discards the reviewed head SHA. A maintainer must merge this PR.",
+  eligibility_check_unconfirmed:
+    "GitHub has no visible eligibility check for this review. Razbor will resume if it appears. If GitHub verifies the request was never accepted and cannot arrive, follow the operator recovery procedure in docs/merge-providers.md, then request a new review.",
+  conversation_resolution_required:
+    "Require resolution of all review conversations in the default branch protection or an active pull request ruleset that this App cannot bypass.",
+  immutable_source_required:
+    "GitHub requires a locked source branch in this repository with force pushes, deletions and fork syncing disabled.",
+  installed_github_app_required:
+    "Install or reconnect the repository's GitHub App so Razbor can verify the source of its eligibility check.",
+  merge_method_unavailable:
+    "The selected merge method is unavailable with this project's merge and squash settings.",
+  merge_restrictions:
+    "The provider reports an outstanding merge restriction. Check approvals, conversations, conflicts and native merge requirements.",
+  native_auto_merge_unavailable:
+    "GitHub reports that the installed App cannot enable native auto-merge for this PR.",
+  not_open_ready:
+    "Automatic merging requires an open PR that is ready for review.",
+  pipeline_failed: "The pipeline for the reviewed commit did not succeed.",
+  pipeline_pending:
+    "A successful pipeline for the reviewed commit is still required.",
+  project_bot_required:
+    "Use a GitLab project bot with the Developer role for guarded merging.",
+  protected_successful_pipeline_required:
+    "Protect the GitLab target, require a successful pipeline and disable merging after a skipped pipeline.",
+  provider_merged: "The provider confirmed the reviewed head was merged.",
+  provider_ready:
+    "The provider confirmed the revision and native merge requirements.",
+  provider_scheduled:
+    "The provider confirmed a native merge schedule for the reviewed head.",
+  required_check_failed:
+    "A required GitHub check finished without a successful conclusion.",
+  required_check_pending:
+    "A passing result for each required GitHub check is still needed on the reviewed commit.",
+  required_check_unverified:
+    "Razbor is withholding its approval because it cannot match a required GitHub ruleset check to a result on the reviewed commit. Verify the rule in GitHub before approving.",
+  retired_eligibility_check:
+    "The existing GitHub eligibility check has already finished and cannot authorize this operation.",
+  revision_changed:
+    "The provider's PR identity, destination or reviewed revision has changed.",
+  unowned_schedule:
+    "An existing GitHub auto-merge request has no eligibility check belonging to this review.",
+  unsupported_github_merge_strategy:
+    "Enable the selected native GitHub merge method on a supported default branch. Merge-queue targets require a human.",
+  unsupported_gitlab_merge_strategy:
+    "This GitLab version or strategy cannot enforce the revision guard. Use semi-linear or fast-forward merging with merge trains and automatic rebase off.",
+  verification_check_required:
+    "Configure a required GitHub verification check in addition to Razbor's eligibility check.",
+} as const;
+
+const publicEscalationReasons = {
+  ...humanReasons,
+  provider_merged: "The provider confirmed the reviewed revision was merged.",
+  change_closed: "The provider reports that the pull request is closed.",
+  target_not_allowed:
+    "Only the repository default branch is an authorized destination.",
+  review_failed: "A successful review of this change is required.",
+  automation_disabled: "Merge automation is disabled for this repository.",
+  merge_refused: "The provider declined the guarded merge request.",
+  write_uncertain:
+    "The provider has not confirmed the outcome of the merge request.",
+  prior_write_uncertain:
+    "An older native merge request requires reconciliation.",
+  provider_unavailable:
+    "The provider could not verify the current merge conditions.",
+  publication_incomplete:
+    "Finding publication and reconciliation must finish before merging.",
+  remote_revision_changed:
+    "The provider revision or draft state changed. A current review is required.",
+  checks_unverified:
+    "Required provider checks failed or could not be verified.",
+  guard_unavailable:
+    "The provider cannot enforce a guarded merge for this change.",
+  provider_restrictions:
+    "Provider restrictions or permissions prevent a guarded merge.",
+};
+
+const publicReasonMessages = {
+  ...forgeMergeReasonMessages,
+  ...publicEscalationReasons,
+  invalid_policy_snapshot: "The saved policy is invalid.",
+  review_superseded:
+    "The review revisions or saved policy are no longer current.",
+  change_not_ready: "The pull request must be open and ready for review.",
+  review_pending: "The current review has not finished.",
+  provider_pending: "Provider checks or native merge requirements are pending.",
+  requirements_met:
+    "The reviewed revision meets the configured merge requirements.",
+  native_submission_refused: "The provider refused the guarded merge request.",
+  provider_binding_missing:
+    "A verified repository and a saved destination branch are required.",
+  provider_rate_limited:
+    "The provider rate-limited the request. Razbor will retry after the provider's waiting period.",
+  publication_superseded: "Request a new review of the current revision.",
+  schedule_superseded: "The review was superseded before the merge request.",
+  schedule_invalidated: "The previous merge authorization was retired.",
+  eligibility_check_retired:
+    "GitHub confirmed retirement of the pending eligibility check.",
+  unresolved_provider_merge:
+    "An outstanding native merge request requires reconciliation. Check its outcome in the provider.",
+  obsolete_review:
+    "The previous review no longer matches this pull request or its current policy.",
+  previous_escalation:
+    "This pull request was escalated. A human reviewer must complete the forge review and merge workflow.",
+  escalation_delivery_unconfirmed:
+    "Razbor could not confirm delivery of its earlier escalation comment. Check the provider request log before retrying the notification.",
+};
+
+const statusReason: Record<MergeDecisionStatus, string> = {
+  merged: "The provider confirmed the reviewed revision was merged.",
+  human_review_required: "A human reviewer must assess this change.",
+  stale: "The previous merge decision is out of date.",
+  review_in_progress: "The current review has not finished.",
+  awaiting_checks: "Provider checks or merge requirements are pending.",
+  auto_merge_eligible:
+    "The reviewed revision meets the configured merge requirements.",
+  blocked: "The service could not confirm all conditions required for a merge.",
+};
+
+/** Resolve stored codes against the explanations allowed for this audience. */
+function publicReasons(
+  decision: MergeDecision,
+  catalog: Readonly<Record<string, string>>,
+) {
+  const reasons: MergeDecision["reasons"] = [];
+  for (const code of new Set(decision.reasons.map((reason) => reason.code))) {
+    if (Object.hasOwn(catalog, code))
+      reasons.push({
+        code,
+        message: catalog[code],
+      });
+  }
+  if (!reasons.length)
+    reasons.push({
+      code: "decision_status",
+      message: statusReason[decision.status],
+    });
+  return reasons;
+}
+
+/** Expose status and service-owned reasons to members while keeping configured reviewer candidates private. */
+export function publicMergeDecision(decision: MergeDecision): MergeDecision {
+  return {
+    status: decision.status,
+    reasons: publicReasons(decision, publicReasonMessages),
+    reviewers: [],
+  };
+}
+
+/** Build a revision-bound triage comment. Recheck the allowlist even for saved decisions and limit mentions to a first notification. */
+export function renderMergeEscalation(input: {
+  decision: MergeDecision;
+  snapshot: MergePolicySnapshot;
+  assessment?: MergeAssessment | null;
+  headSha: string;
+  marker: string;
+  mention?: boolean;
+  approval?: ReviewApprovalStatus;
+}): string {
+  const { decision, snapshot } = input;
+  const parsed = mergeAssessmentSchema.safeParse(input.assessment);
+  const assessment = parsed.success ? parsed.data : undefined;
+  if (
+    !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.headSha) ||
+    !/^<!-- razbor:[A-Za-z0-9:_-]+ -->$/.test(input.marker)
+  )
+    throw new Error("Invalid escalation revision or marker.");
+  const human = decision.status === "human_review_required";
+  const dryRun = snapshot.policy.enabled && snapshot.policy.dryRun;
+  const lines = [
+    human
+      ? "**Razbor — Human review required**"
+      : dryRun
+        ? "**Razbor — Dry-run assessment**"
+        : "**Razbor — Review decision updated**",
+    "",
+    ...(assessment
+      ? [
+          `Merge confidence: ${assessment.confidence}/100 (uncalibrated model assessment)  `,
+          `Required threshold: ${snapshot.policy.minimumConfidence}/100  `,
+          `Risk: ${assessment.riskLevel}`,
+        ]
+      : ["A merge readiness score is unavailable."]),
+    "",
+    ...(!human ? [`Decision: ${decision.status}`, ""] : []),
+  ];
+  const reasons = publicReasons(
+    decision,
+    dryRun ? publicReasonMessages : publicEscalationReasons,
+  );
+  lines.push("Reasons:", ...reasons.map(({ message }) => "- " + message));
+  if (
+    dryRun &&
+    assessment?.reviewComplete &&
+    !assessment.criticalAreas.length &&
+    !assessment.verificationGaps.length
+  )
+    lines.push(
+      "- The review is complete and identified no critical areas or verification gaps.",
+    );
+  if (dryRun && decision.status === "auto_merge_eligible") {
+    lines.push("- No actionable or outstanding review findings remain.");
+    if (snapshot.policy.requirePassingChecks)
+      lines.push(
+        "- The required provider checks passed on the reviewed revision.",
+      );
+  }
+  if (dryRun) {
+    if (assessment)
+      lines.push(
+        "",
+        "Repository managers can read the detailed assessment notes on the review in Razbor.",
+      );
+    lines.push("", "Merge scheduling: disabled for this dry run.");
+  }
+  if (input.approval) {
+    const approval = {
+      approved:
+        "The provider confirmed Razbor’s approval for the reviewed commit.",
+      uncertain:
+        "The provider has not confirmed whether Razbor’s approval reached it.",
+      unavailable:
+        "Razbor could not approve the reviewed commit under the current provider conditions.",
+      dismissed: "The provider reports that Razbor’s approval was dismissed.",
+    };
+    lines.push("", approval[input.approval]);
+  }
+  const allowed = new Set(
+    snapshot.policy.humanReviewers.map((candidate) => candidate.username),
+  );
+  const reviewers = [...new Set(decision.reviewers)]
+    .filter(
+      (name) =>
+        allowed.has(name) && reviewerUsernameSchema.safeParse(name).success,
+    )
+    .slice(0, MAX_ESCALATION_MENTIONS);
+  if (human && reviewers.length)
+    lines.push(
+      "",
+      "Suggested reviewers: " +
+        reviewers
+          .map((name) =>
+            input.mention === false ? commentLiteral(name) : "@" + name,
+          )
+          .join(" "),
+    );
+  lines.push(
+    "",
+    "Reviewed commit: " + commentLiteral(input.headSha),
+    "",
+    input.marker,
+  );
+  return lines.join("\n");
+}

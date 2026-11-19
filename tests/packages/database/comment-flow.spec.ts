@@ -3,6 +3,8 @@ import { createHmac } from "node:crypto";
 import { createServer } from "node:http";
 import { test } from "node:test";
 
+import { eq } from "drizzle-orm";
+
 import {
   reviewCommand,
   preparePublication,
@@ -14,6 +16,8 @@ import {
   beginAttempt,
   finishAttempt,
   connectDatabase,
+  triageOutstanding,
+  findingKey,
   processInteraction,
   processInteractions,
   processStatusComments,
@@ -22,8 +26,10 @@ import {
   requestRepositoryDeletion,
   webhookView,
 } from "@razbor/database";
+import { reviews } from "@razbor/database/schema";
 import { applyRegistry, registrySchema } from "@razbor/database/registry";
 import {
+  createForge,
   verifyForgejoWebhook,
   parseForgejoComment,
 } from "@razbor/forge-adapters";
@@ -141,12 +147,27 @@ test(
       user: { id: number; login: string };
     }[] = [];
     let reviewWrites = 0;
+    const followupComments = new Map<
+      number,
+      {
+        id: number;
+        path: string;
+        body: string;
+        user: typeof bot;
+        resolver?: typeof bot;
+      }[]
+    >();
     let loseNativeResponse = false;
     let failReviewList = false;
     let reactionReads = 0;
     let nextNoteId = 100;
     let loseStatusCreate = true;
     let loseStatusDelete = true;
+    let auditCommentBody: string | undefined;
+    let auditCommentResolved = false;
+    let fixedReply:
+      { id: number; path: string; body: string; user: typeof bot } | undefined;
+    let recapBody = "";
     let maskStatusEdit = false;
     const deletions: number[] = [];
     let head = "b".repeat(40);
@@ -196,6 +217,20 @@ test(
         }
         res.statusCode = 405;
         return reply({});
+      }
+      if (route.endsWith("/issues/7/timeline"))
+        return reply([
+          {
+            id: 500,
+            type: "review",
+            review_id: 20,
+            user: bot,
+            body: recapBody,
+          },
+        ]);
+      if (route.endsWith("/issues/comments/500") && req.method === "PATCH") {
+        recapBody = input.body;
+        return reply({ id: 500, user: bot, body: recapBody });
       }
       if (/\/issues\/comments\/\d+$/.test(route)) {
         const id = Number(route.split("/").at(-1));
@@ -292,6 +327,17 @@ test(
             state: input.event,
             user: bot,
           });
+          followupComments.set(
+            native.at(-1)!.id,
+            (input.comments ?? []).map(
+              (c: { path: string; body: string }, i: number) => ({
+                id: 200 + i,
+                path: c.path,
+                body: c.body,
+                user: bot,
+              }),
+            ),
+          );
           if (loseNativeResponse) {
             loseNativeResponse = false;
             res.statusCode = 503;
@@ -304,15 +350,33 @@ test(
         }
         return reply(native);
       }
-      if (route.endsWith("/reviews/20/comments"))
+      if (route.endsWith("/reviews/20/comments")) {
+        if (req.method === "POST") {
+          assert.equal(fixedReply, undefined);
+          fixedReply = {
+            id: 22,
+            body: input.body,
+            path: input.path,
+            user: bot,
+          };
+          return reply({ id: fixedReply.id });
+        }
         return reply([
           {
             id: 21,
-            body: `<!-- razbor:${(await listReviews(db))[0].id}:finding -->`,
+            body:
+              auditCommentBody ??
+              `<!-- razbor:${(await listReviews(db))[0].id}:finding -->`,
             path: "file.ts",
+            user: bot,
+            resolver: auditCommentResolved ? bot : null,
           },
+          ...(fixedReply ? [fixedReply] : []),
         ]);
-      if (/\/reviews\/\d+\/comments$/.test(route)) return reply([]);
+      }
+      const followup = /\/reviews\/(\d+)\/comments$/.exec(route);
+      if (followup)
+        return reply(followupComments.get(Number(followup[1])) ?? []);
       res.statusCode = 404;
       reply({});
     });
@@ -471,7 +535,7 @@ test(
       assert.match(status.body, /Razbor is reviewing/);
       assert.match(human.body, /Razbor review queued/);
       await finishAttempt(db, review.id, attempt.attemptId, "test", {
-        summary: "One finding",
+        summary: "Two findings",
         findings: [
           {
             severity: "high",
@@ -482,6 +546,16 @@ test(
             body: "The timer is retained",
             failureScenario: "After shutdown",
             suggestion: "Clear the timer",
+          },
+          {
+            severity: "medium",
+            path: "file.ts",
+            lineStart: 1,
+            lineEnd: 1,
+            title: "Stale output",
+            body: "The cached value survives a refresh",
+            failureScenario: "A second read returns the old value",
+            suggestion: "Invalidate the cached output after refresh",
           },
         ],
       });
@@ -544,6 +618,130 @@ test(
         summary: "",
         findings: [],
       });
+      // The provider lists a formerly published review but no attributable finding marker.
+      // Phase 2 still publishes normally. A clean subsequent review cannot authorize a merge.
+      const [secondReview] = await db.db
+        .select()
+        .from(reviews)
+        .where(eq(reviews.publicId, next.id));
+      const api = createForge(
+        {
+          type: "forgejo",
+          apiUrl: `${origin}/api/v1`,
+          webUrl: origin,
+          allowHttp: true,
+        },
+        "team/project",
+      );
+      assert.equal(
+        await triageOutstanding(
+          db,
+          secondReview.repositoryId,
+          7,
+          String(bot.id),
+          api,
+          secondReview,
+        ),
+        2,
+      );
+      const [original] = await db.db
+        .select()
+        .from(reviews)
+        .where(eq(reviews.publicId, review.id));
+      const old = {
+        id: "20:21",
+        reviewId: review.id,
+        finding: original.result!.findings[0],
+      };
+      const resolved = {
+        id: old.id,
+        status: "resolved" as const,
+        evidence:
+          "Verified the prior cleanup path against the pinned revision.",
+      };
+      for (const savedFinding of [
+        old,
+        { ...old, id: "20:22" },
+        { ...old, reviewId: next.id },
+      ]) {
+        const count = await triageOutstanding(
+          db,
+          secondReview.repositoryId,
+          7,
+          String(bot.id),
+          api,
+          {
+            ...secondReview,
+            source: {
+              ...secondReview.source,
+              previousFindings: [savedFinding],
+            },
+            result: { ...secondReview.result!, findingChecks: [resolved] },
+          },
+        );
+        assert.equal(count, savedFinding === old ? 1 : 2);
+      }
+      const [firstFinding, secondFinding] = original.result!.findings;
+      // A quoted marker in the visible body belongs to a different finding than the
+      // final bot-owned marker. Resolving the quote must leave the real finding open.
+      auditCommentBody = `Quoted <!-- razbor:${review.id}:${findingKey(firstFinding)} -->\n<!-- razbor:${review.id}:${findingKey(secondFinding)} -->`;
+      /** Audit the original saved findings and an optional independent recap assessment. */
+      async function liveOutstanding(
+        secondStatus?: "open" | "resolved",
+        recapReview?: string,
+        recapFinding = secondFinding,
+      ) {
+        const firstId = secondStatus ? "20:22" : old.id;
+        const recap = recapReview && {
+          id: `recap:${recapReview}:${findingKey(recapFinding)}`,
+          reviewId: recapReview,
+          finding: recapFinding,
+        };
+        return triageOutstanding(
+          db,
+          secondReview.repositoryId,
+          7,
+          String(bot.id),
+          api,
+          {
+            ...secondReview,
+            source: {
+              ...secondReview.source,
+              previousFindings: [
+                { ...old, id: firstId },
+                ...(secondStatus ? [{ ...old, finding: secondFinding }] : []),
+                ...(recap ? [recap] : []),
+              ],
+            },
+            result: {
+              ...secondReview.result!,
+              findingChecks: [
+                { ...resolved, id: firstId },
+                ...(recap ? [{ ...resolved, id: recap.id }] : []),
+                ...(secondStatus
+                  ? [
+                      {
+                        id: old.id,
+                        status: secondStatus,
+                        evidence:
+                          "Inspected the original finding at the reviewed head.",
+                      },
+                    ]
+                  : []),
+              ],
+            },
+          },
+        );
+      }
+      assert.equal(await liveOutstanding(), 1);
+      // A previously resolved model assessment cannot retire a reopened native thread.
+      assert.equal(await liveOutstanding("resolved"), 1);
+      auditCommentResolved = true;
+      assert.equal(await liveOutstanding(), 0);
+      assert.equal(await liveOutstanding("resolved"), 0);
+      assert.equal(await liveOutstanding("open"), 0);
+      auditCommentResolved = false;
+      auditCommentBody = undefined;
       head = "c".repeat(40);
       await processInteraction(db, next.id);
       assert.equal(
@@ -785,6 +983,181 @@ test(
       assert.equal(reviewWrites, 4);
       config.repositories.project.webhook!.enabled = true;
       await applyWebhookSettings(db, config);
+      // Repeating an already published root cause creates no new thread. A clean
+      // follow-up can discharge it through its exact recorded original publication.
+      auditCommentBody = `Original finding\n<!-- razbor:${review.id}:${findingKey(secondFinding)} -->`;
+      assert.equal(await deliver("repeat-finding", 16), 202);
+      const [duplicate] = await listReviews(db);
+      const duplicateAttempt = await beginAttempt(
+        db,
+        duplicate.id,
+        "test",
+        30000,
+      );
+      assert.equal(duplicateAttempt.kind, "started");
+      await finishAttempt(
+        db,
+        duplicate.id,
+        duplicateAttempt.attemptId,
+        "test",
+        {
+          summary: "The same issue persists",
+          findings: [secondFinding],
+          findingChecks: [
+            {
+              id: old.id,
+              status: "open",
+              evidence: "The cached output is still stale.",
+            },
+          ],
+        },
+      );
+      await processInteraction(db, duplicate.id);
+      const duplicatePublication = (await publicationView(db, duplicate.id))
+        ?.publication;
+      assert.equal(duplicatePublication?.state, "published");
+      assert.deepEqual(duplicatePublication.openFindingOwners, {
+        [findingKey(secondFinding)]: review.id,
+      });
+      assert.equal(duplicatePublication.outstandingFindings, 1);
+      assert.equal(await liveOutstanding(), 1);
+      auditCommentResolved = true;
+      assert.equal(await liveOutstanding(), 0);
+      auditCommentBody = undefined;
+      assert.equal(
+        await liveOutstanding(),
+        1,
+        "missing evidence for the canonical finding must still block",
+      );
+      auditCommentBody = `Original finding\n<!-- razbor:${review.id}:${findingKey(secondFinding)} -->`;
+      await db.pool.query(
+        "update dispatch_outbox set publication=publication-'openFindingOwners' where review_id=(select id from reviews where public_id=$1)",
+        [duplicate.id],
+      );
+      assert.equal(
+        await liveOutstanding(),
+        1,
+        "legacy duplicate suppression without an exact publication record remains unaccounted for",
+      );
+      await db.pool.query(
+        "update dispatch_outbox set publication=publication||$1::jsonb where review_id=(select id from reviews where public_id=$2)",
+        [
+          { suppressedFindings: duplicatePublication.openFindingOwners },
+          duplicate.id,
+        ],
+      );
+      assert.equal(
+        await liveOutstanding("resolved"),
+        1,
+        "an old link cannot prove the representative was open at publication",
+      );
+      assert.equal(
+        await liveOutstanding("resolved", duplicate.id),
+        0,
+        "a later exact assessment can resolve the legacy recurrence",
+      );
+      // Restore a frozen follow-up that was queued before the original finding
+      // appeared. Its main recap survived, but the separate native finding review did not.
+      const missingNative = native.findIndex(
+        (r) => String(r.id) === duplicatePublication.remoteId,
+      );
+      assert.ok(missingNative >= 0);
+      const [missingReview] = native.splice(missingNative, 1);
+      const [survivingRecap] = native;
+      assert.ok(survivingRecap);
+      await db.pool.query(
+        "update reviews set source=source-'previousFindings',result=result-'findingChecks' where public_id=$1",
+        [duplicate.id],
+      );
+      await db.pool.query(
+        "update dispatch_outbox set publication=$1 where review_id=(select id from reviews where public_id=$2)",
+        [
+          {
+            ...duplicatePublication,
+            remoteId: String(survivingRecap.id),
+            reviewPayload: {
+              ...duplicatePublication.reviewPayload,
+              recapReviewId: String(survivingRecap.id),
+            },
+          },
+          duplicate.id,
+        ],
+      );
+      assert.deepEqual(
+        [await liveOutstanding(), await liveOutstanding("resolved")],
+        [1, 0],
+        "only the missing canonical finding requires evidence; its exact resolution retires the duplicate",
+      );
+      native.splice(missingNative, 0, missingReview);
+      auditCommentResolved = false;
+      assert.equal(await deliver("recurrence-after-resolution", 18), 202);
+      const [recurrence] = await listReviews(db);
+      const recurrenceAttempt = await beginAttempt(
+        db,
+        recurrence.id,
+        "test",
+        30000,
+      );
+      assert.equal(recurrenceAttempt.kind, "started");
+      const moved = {
+        ...secondFinding,
+        title: "A second cache survives",
+        body: secondFinding.body.toUpperCase(),
+        lineStart: 2,
+        lineEnd: 2,
+      };
+      assert.equal(findingKey(moved), findingKey(secondFinding));
+      const unanchored = { ...moved, path: "outside-diff.ts" };
+      await finishAttempt(
+        db,
+        recurrence.id,
+        recurrenceAttempt.attemptId,
+        "test",
+        {
+          summary: "The issue returned after the earlier resolution.",
+          findings: [moved, unanchored],
+          findingChecks: [
+            {
+              id: old.id,
+              status: "resolved",
+              evidence:
+                "The original location is fixed. A separate occurrence remains.",
+            },
+          ],
+        },
+      );
+      await processInteraction(db, recurrence.id);
+      const recurrencePublication = (await publicationView(db, recurrence.id))
+        ?.publication;
+      assert.equal(recurrencePublication?.state, "published");
+      assert.deepEqual(recurrencePublication.openFindingOwners, {});
+      assert.ok(
+        fixedReply?.body.endsWith(
+          `<!-- razbor:${review.id}:${findingKey(secondFinding)}:fixed -->`,
+        ),
+      );
+      auditCommentResolved = true;
+      const [recurrenceComment] = followupComments.get(
+        Number(recurrencePublication.remoteId),
+      )!;
+      assert.ok(
+        recurrenceComment.body.endsWith(
+          `\n<!-- razbor:${recurrence.id}:${findingKey(secondFinding)} -->`,
+        ),
+      );
+      assert.equal(await liveOutstanding("resolved"), 2);
+      recurrenceComment.resolver = bot;
+      assert.equal(
+        await liveOutstanding("resolved"),
+        1,
+        "the unanchored prose finding remains outstanding",
+      );
+      assert.equal(
+        await liveOutstanding("resolved", recurrence.id, unanchored),
+        0,
+      );
+      auditCommentBody = undefined;
+      auditCommentResolved = false;
       assert.equal(await deliver("retire", 13), 202);
       const retiring = (await listReviews(db))[0];
       await processStatusComments(db);

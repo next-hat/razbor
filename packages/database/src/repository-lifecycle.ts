@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 
-import { publicIdSchema, reviewTriggerModeSchema } from "@razbor/contracts";
+import {
+  mergePolicySchema,
+  publicIdSchema,
+  reviewTriggerModeSchema,
+} from "@razbor/contracts";
 import { createForge, verifyRegistration } from "@razbor/forge-adapters";
 
 import { requireContextSession } from "@database/src/contexts.js";
+import { wakeRepositoryTriage } from "@database/src/merge-policy.js";
+import { settleMergeAuthority } from "@database/src/merge-recovery.js";
 import {
   lockReviewTriggerChanges,
   resetRepositoryReviewTriggers,
@@ -75,6 +82,51 @@ async function editableRepository(
       `Update ${setting} in the repository's registry file.`,
     );
   return repo;
+}
+
+/** Replace the full privileged policy under its owning row lock; reject concurrent editor saves. */
+export async function updateRepositoryMergePolicy(
+  database: Database,
+  id: string,
+  input: unknown,
+  contextId?: string,
+  sessionToken?: string,
+) {
+  publicIdSchema("repository").parse(id);
+  const { version, policy } = z
+    .object({
+      version: z.number().int().positive(),
+      policy: mergePolicySchema,
+    })
+    .strict()
+    .parse(input);
+  await database.transaction(async (tx) => {
+    const repo = await editableRepository(
+      tx,
+      id,
+      "merge policy",
+      contextId,
+      sessionToken,
+    );
+    if (repo.mergePolicyVersion !== version)
+      throw new RepositoryManagementError(
+        409,
+        "Merge policy changed. Reload before saving.",
+      );
+    if (isDeepStrictEqual(repo.mergePolicy, policy)) return;
+    await settleMergeAuthority(database, tx, repo);
+    await wakeRepositoryTriage(tx, repo.id);
+    await tx
+      .update(repositories)
+      .set({
+        mergePolicy: policy,
+        mergePolicyVersion: version + 1,
+        version: repo.version + 1,
+        updatedAt: new Date(),
+      })
+      .where(eq(repositories.id, repo.id));
+  });
+  return getRepository(database, id, contextId);
 }
 
 /** Save the new policy and end any prior opt-ins and pending automatic work atomically. */
@@ -224,6 +276,8 @@ export async function requestRepositoryDeletion(
         "Type the exact repository name to confirm deletion.",
       );
     await lockReviewTriggerChanges(tx, repo.id);
+    if (repo.status === "active")
+      await settleMergeAuthority(database, tx, repo);
     const now = new Date();
     await tx
       .update(repositories)

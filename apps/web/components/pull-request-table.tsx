@@ -8,6 +8,7 @@ import {
 import type { PullRequestView } from "@razbor/database";
 
 import { Status } from "@web/components/status.js";
+import { MergeBadge } from "@web/components/merge-decision.js";
 import { Badge } from "@web/components/ui/badge.js";
 import { buttonVariants } from "@web/components/ui/button.js";
 import { formatUtc } from "@web/lib/date.js";
@@ -64,8 +65,7 @@ function PullRequestFindingCount({
 }
 
 /**
- * Lists PR identity, optional provider state, captured automated review status and findings together.
- * A completed automated review never removes a PR from the human review queue.
+ * Lists the current merge decision beside the captured review activity and findings.
  */
 export function PullRequestTable({
   pullRequests,
@@ -135,6 +135,20 @@ export function PullRequestTable({
                         </span>
                         <PullRequestReviewStatus pr={pr} />
                         <PullRequestFindingCount pr={pr} withLabel />
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        <MergeBadge
+                          merge={pr.merge}
+                          status={pr.latestReview?.status}
+                        />
+                        {pr.merge?.confidence !== undefined && (
+                          <span className="tabular-nums">
+                            Confidence {pr.merge.confidence}/100
+                          </span>
+                        )}
+                        {pr.merge?.riskLevel && (
+                          <span>{pr.merge.riskLevel} risk</span>
+                        )}
                       </div>
                     </div>
                   </div>

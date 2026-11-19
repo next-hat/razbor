@@ -1,6 +1,7 @@
 import {
   processDeferredOpen,
   processInteractions,
+  processMergeTriage,
   processStatusComments,
   pendingDispatches,
   dispatched,
@@ -165,6 +166,7 @@ export function startDispatcher(
   let stopping = false;
   let current: Promise<void> | undefined;
   let comments: Promise<void> | undefined;
+  let merges: Promise<void> | undefined;
   let deferredOpen: Promise<void> | undefined;
   /**
    * Run one reconciliation pass unless stopping or already busy, forwarding
@@ -180,6 +182,12 @@ export function startDispatcher(
         });
     // Optional forge writes use the same timer but never gate execution or
     // publication. Each branch has at most one outstanding batch per process.
+    if (!merges)
+      merges = processMergeTriage(database)
+        .catch(onError)
+        .finally(() => {
+          merges = undefined;
+        });
     if (!comments)
       comments = processStatusComments(database)
         .catch(onError)
@@ -203,6 +211,6 @@ export function startDispatcher(
   return async () => {
     stopping = true;
     clearInterval(timer);
-    await Promise.all([current, comments, deferredOpen]);
+    await Promise.all([current, comments, merges, deferredOpen]);
   };
 }

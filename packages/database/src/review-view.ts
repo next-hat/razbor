@@ -20,6 +20,14 @@ export const reviewViewSelection = {
     string | null
   >`coalesce(${reviewTriggers.change}->>'title', ${reviews.source}->'pullRequest'->>'title')`,
   evaluation: reviews.evaluation,
+  mergeDecision: reviews.mergeDecision,
+  mergeAction: reviews.mergeAction,
+  mergePolicyVersion: sql<
+    number | null
+  >`(${reviews.source}->'mergePolicy'->>'version')::integer`,
+  minimumConfidence: sql<
+    number | null
+  >`(${reviews.source}->'mergePolicy'->'policy'->>'minimumConfidence')::integer`,
   createdAt: reviews.createdAt,
   startedAt: reviews.startedAt,
   finishedAt: reviews.finishedAt,
@@ -40,6 +48,10 @@ export function reviewView(row: {
   headSha: string;
   changeTitle: string | null;
   evaluation: ReviewEvaluation;
+  mergeDecision: ReviewJobView["mergeDecision"] | null;
+  mergeAction: ReviewJobView["mergeAction"] | null;
+  mergePolicyVersion: number | null;
+  minimumConfidence: number | null;
   createdAt: Date;
   startedAt: Date | null;
   finishedAt: Date | null;
@@ -55,6 +67,14 @@ export function reviewView(row: {
     headSha: row.headSha,
     ...(row.changeTitle?.trim() ? { changeTitle: row.changeTitle } : {}),
     evaluation: reviewEvaluationSchema.parse(row.evaluation),
+    ...(row.mergeDecision ? { mergeDecision: row.mergeDecision } : {}),
+    ...(row.mergeAction ? { mergeAction: row.mergeAction } : {}),
+    ...(row.mergePolicyVersion != null
+      ? { mergePolicyVersion: row.mergePolicyVersion }
+      : {}),
+    ...(row.minimumConfidence != null
+      ? { minimumConfidence: row.minimumConfidence }
+      : {}),
     submittedAt: row.createdAt.toISOString(),
     ...(row.startedAt ? { startedAt: row.startedAt.toISOString() } : {}),
     ...(row.finishedAt ? { finishedAt: row.finishedAt.toISOString() } : {}),

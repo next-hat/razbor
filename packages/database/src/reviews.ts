@@ -18,14 +18,18 @@ import {
   reviewEvaluationUpdateSchema,
   validateFindingChecks,
   type ModelProvider,
+  type MergePolicySnapshot,
   type ReasoningEffort,
   type QueueJob,
   type ReviewEvaluation,
 } from "@razbor/contracts";
 
+import { settleMergeAuthority } from "@database/src/merge-recovery.js";
 import { reviewView, reviewViewSelection } from "@database/src/review-view.js";
 import {
   automaticReviewReady,
+  consoleFindingSnapshot,
+  previousConsoleFindings,
   retireObsoleteAutomaticRetry,
 } from "@database/src/review-triggers.js";
 import { snapshotRepositoryAgent } from "@database/src/agents.js";
@@ -95,10 +99,11 @@ export async function submitReview(
               eq(pullRequests.repositoryId, repo.id),
             ),
           )
-          .for("share")
+          .for("update")
       : [];
     if (pullRequestId && !target)
       throw new AuthInputError(404, "Pull request not found.");
+    if (target) await settleMergeAuthority(database, tx, repo, target.id);
     const request = target
       ? {
           ...inputRequest,
@@ -124,14 +129,23 @@ export async function submitReview(
       .values({
         publicId: publicId("review"),
         repositoryId: repo.id,
+        mergePullRequestId: target?.id,
         baseSha: request.baseSha,
         headSha: request.headSha,
         source: {
           configKey: repo.configKey,
           git: repo.git,
           indexOwner: repo.indexOwner,
+          mergePolicy: {
+            version: repo.mergePolicyVersion,
+            policy: repo.mergePolicy,
+          },
           ...(target
             ? {
+                mergeRevision: target.mergeRevision,
+                previousFindings: consoleFindingSnapshot(
+                  await previousConsoleFindings(tx, repo.id, target.number),
+                ),
                 pullRequest: {
                   number: target.number,
                   title: target.title,
@@ -187,16 +201,33 @@ export async function listReviews(
   ).map(reviewView);
 }
 
-/** Read a review by public ID, returning undefined when it does not exist. */
-export async function getReview(database: Database, id: string) {
+/** Read a review and its current PR link. Only management views need the full trusted policy snapshot. */
+export async function getReview(
+  database: Database,
+  id: string,
+  includePolicy = false,
+) {
   publicIdSchema("review").parse(id);
   const [row] = await database.db
-    .select(reviewViewSelection)
+    .select({
+      ...reviewViewSelection,
+      pullRequestId: pullRequests.publicId,
+      policySnapshot: includePolicy
+        ? sql<MergePolicySnapshot | null>`${reviews.source}->'mergePolicy'`
+        : sql<null>`null`,
+    })
     .from(reviews)
     .innerJoin(repositories, eq(reviews.repositoryId, repositories.id))
     .leftJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
+    .leftJoin(pullRequests, eq(pullRequests.id, reviews.mergePullRequestId))
     .where(eq(reviews.publicId, id));
-  return row ? reviewView(row) : undefined;
+  return row
+    ? {
+        ...reviewView(row),
+        ...(row.pullRequestId ? { pullRequestId: row.pullRequestId } : {}),
+        ...(row.policySnapshot ? { policySnapshot: row.policySnapshot } : {}),
+      }
+    : undefined;
 }
 
 export class ReviewEvaluationInputError extends Error {
@@ -512,6 +543,9 @@ async function beginAttemptInTransaction(
       submittedAt: row.createdAt.toISOString(),
       previousFindings: row.source.previousFindings,
       conversation: row.source.conversation,
+      ...(row.source.mergePolicy
+        ? { mergePolicy: row.source.mergePolicy }
+        : {}),
       ...(row.source.guidance ? { guidance: row.source.guidance } : {}),
       ...(row.source.mcpServers ? { mcpServers: row.source.mcpServers } : {}),
     },

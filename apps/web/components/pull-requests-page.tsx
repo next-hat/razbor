@@ -15,7 +15,7 @@ import {
 import type { PullRequestView } from "@razbor/database";
 
 import { ConsoleHero } from "@web/components/console-hero.js";
-import { PullRequestTable } from "@web/components/pull-request-table.js";
+import { TriageQueue } from "@web/components/triage-queue.js";
 import { PullRequestRefresh } from "@web/components/pull-request-refresh.js";
 import { formatUtc } from "@web/lib/date.js";
 import { usePullRequests } from "@web/lib/use-pull-requests.js";
@@ -168,9 +168,13 @@ export default function PullRequestsPage({
           className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4"
         >
           <PullRequestSummaryCard
-            label="Open pull requests"
-            value={counts.open}
-            detail="Waiting for human review"
+            label="Needs human review"
+            value={
+              openPullRequests?.filter(
+                (pr) => pr.merge?.decision.status === "human_review_required",
+              ).length
+            }
+            detail="Escalated open requests"
             icon={GitPullRequest}
             tone="findings"
           />
@@ -245,7 +249,7 @@ export default function PullRequestsPage({
         {!prs.data ? (
           !prs.error && <Skeleton className="h-64 w-full" />
         ) : visible?.length ? (
-          <PullRequestTable pullRequests={visible} showState />
+          <TriageQueue pullRequests={visible} global />
         ) : (
           <Empty className="border bg-card">
             <EmptyHeader>
@@ -264,15 +268,11 @@ export default function PullRequestsPage({
               <EmptyDescription>
                 {query
                   ? "Try another title, repository or pull request number."
-                  : "Pull requests from your connected repositories appear here after a successful refresh."}
+                  : "Choose Refresh to load pull requests from connected repositories."}
               </EmptyDescription>
             </EmptyHeader>
           </Empty>
         )}
-        <p className="text-xs text-muted-foreground">
-          Open pull requests stay in the human review queue even after an
-          automated review is complete.
-        </p>
       </div>
     </main>
   );

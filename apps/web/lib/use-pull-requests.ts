@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 
 import { usePoll } from "@web/lib/use-poll.js";
 
 /**
- * Polls saved PR data and synchronizes providers once on entry or on demand.
+ * Polls saved PR data and synchronizes providers when the user requests a refresh.
  * Failed discovery keeps the last snapshot and exposes a visible freshness warning.
  */
 export function usePullRequests<T>(url: string, initialData?: T) {
@@ -14,7 +14,6 @@ export function usePullRequests<T>(url: string, initialData?: T) {
   const [refreshing, setRefreshing] = useState(false);
   const [warning, setWarning] = useState("");
   const pending = useRef(false);
-  const enteredUrl = useRef("");
 
   /** Refreshes authorized repositories, then adopts their saved data without hiding failures. */
   const refresh = useCallback(async () => {
@@ -44,12 +43,6 @@ export function usePullRequests<T>(url: string, initialData?: T) {
       setRefreshing(false);
     }
   }, [setData, url]);
-
-  useEffect(() => {
-    if (enteredUrl.current === url) return;
-    enteredUrl.current = url;
-    void refresh();
-  }, [refresh, url]);
 
   return { ...snapshot, refreshing, warning, refresh };
 }

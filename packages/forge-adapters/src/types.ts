@@ -7,7 +7,7 @@ export type ForgeConnection = {
   allowHttp: boolean;
   token?: string;
   /** Provider-verified App identity, supplied only by trusted credential resolution. */
-  githubAppBot?: { id: string; login: string };
+  githubAppBot?: { id: string; login: string; appId?: string };
   timeoutMs?: number;
 };
 

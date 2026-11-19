@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { git, MAX_GIT_OUTPUT_BYTES } from "@harness/src/git.js";
+import { isGitCommand } from "@harness/src/tools/exec.js";
 
 const MAX_INPUT_BYTES = 1_000_000;
 
@@ -35,6 +36,13 @@ const diffOptions = [
   "--ignore-submodules=none",
   "--submodule=short",
 ];
+
+const patchOptions = new Set([
+  ...diffOptions.slice(1),
+  "--patch",
+  "-p",
+  "--color=never",
+]);
 
 /**
  * Splits NUL-delimited Git metadata, rejecting output that ends with an incomplete
@@ -174,6 +182,16 @@ function hunkPosition(patch: string, offset: number) {
   };
 }
 
+/** Identify a file's full change even when Git uses a different number of context lines. */
+function patchIdentity(patch: string) {
+  const changes = patch.split("\n").filter((line, i, lines) => {
+    if (line === "\\ No newline at end of file")
+      return /^[+-]/.test(lines[i - 1] ?? "");
+    return !line.startsWith(" ") && !line.startsWith("@@");
+  });
+  return createHash("sha256").update(changes.join("\n")).digest("hex");
+}
+
 export class PreparedDiff {
   private readonly nonce = randomUUID();
   private readonly cursors = new Map<
@@ -181,6 +199,7 @@ export class PreparedDiff {
     { selection: number[]; position: Position }
   >();
   private readonly supplied = new Map<number, number>();
+  private readonly completeExecPatches = new Set<string>();
   readCalls = 0;
   returnedBytes = 0;
   readonly manifest: string;
@@ -258,6 +277,42 @@ export class PreparedDiff {
       outputBytes,
       signal,
     );
+  }
+
+  /** Keep exact file changes received through successful, untruncated exec output. */
+  observeExec(argv: unknown, stdout: string) {
+    if (!Array.isArray(argv) || !isGitCommand(argv[0]) || argv[1] !== "diff")
+      return;
+    const base = argv.indexOf(this.baselineSha, 2);
+    if (
+      base < 2 ||
+      !argv
+        .slice(2, base)
+        .every(
+          (arg) =>
+            typeof arg === "string" &&
+            (patchOptions.has(arg) || /^(?:-U|--unified=)\d+$/.test(arg)),
+        ) ||
+      argv[base + 1] !== this.headSha ||
+      (argv.length > base + 2 && argv[base + 2] !== "--") ||
+      !stdout.startsWith("diff --git ")
+    )
+      return;
+    for (const patch of stdout.split(/(?=^diff --git )/m))
+      this.completeExecPatches.add(patchIdentity(patch));
+  }
+
+  /** Counts supported changes whose full patch was absent from both diff delivery and pinned Git output. */
+  uninspectedFiles() {
+    return this.files.filter((file, index) => {
+      const patch = this.patches[index];
+      return (
+        (file.content === "text" || file.content === "metadata") &&
+        (this.supplied.get(index) ?? 0) < patch.length &&
+        (!this.completeExecPatches.size ||
+          !this.completeExecPatches.has(patchIdentity(patch)))
+      );
+    }).length;
   }
 
   /** Validates a new-side finding against one immutable changed hunk ending on an added line. */

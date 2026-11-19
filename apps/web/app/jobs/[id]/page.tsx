@@ -28,14 +28,14 @@ export default async function Page({
   const { id } = await params;
   if (!publicIdSchema("review").safeParse(id).success) notFound();
   const user = await requirePageUser();
-  const identity = await getReview(await reviewDatabase(), id);
+  const isAdmin = canManageResource(user, "repository");
+  const identity = await getReview(await reviewDatabase(), id, isAdmin);
   if (
     !identity ||
     !identity.repositoryId ||
     !canAccessRepository(user, identity.repositoryId)
   )
     notFound();
-  const isAdmin = canManageResource(user, "repository");
   const initialData = await pageData(async (db) => {
     const review = await reviewWithReadiness(db, id);
     return review
@@ -52,6 +52,7 @@ export default async function Page({
       id={id}
       initialData={initialData}
       isAdmin={isAdmin}
+      policy={identity.policySnapshot}
     />
   );
 }

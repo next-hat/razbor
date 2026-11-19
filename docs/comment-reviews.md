@@ -107,9 +107,7 @@ with `read:user`, `write:repository`, and `write:issue`. Instance admin access i
 not required. On Forgejo v15, choose **All (public, private, and limited)** for
 token repository access; repository-specific tokens cannot administer hooks.
 
-**GitHub App:** the manifest requests **Contents: read**, **Pull requests: write**,
-and **Issues: write**, plus GitHub's built-in App metadata access. Creation also
-configures events.
+**GitHub App:** the manifest requests read access to Contents, Administration, Checks and Commit statuses, and write access to Pull requests and Issues. GitHub supplies metadata access. Creation also configures webhook events. Before enabling auto-approval on an existing App, add Administration, Checks and Commit statuses read access to its registration and have the installation owner approve the new permissions. Existing installations retiring eligibility checks from a preview need Checks write until cleanup finishes. [Updating a GitHub App registration](https://docs.github.com/en/apps/maintaining-github-apps/modifying-a-github-app-registration).
 
 **GitHub manual webhook:** grant **Contents: read**, **Pull requests: write**,
 and **Issues: write**. Older registrations with automatic hooks also need

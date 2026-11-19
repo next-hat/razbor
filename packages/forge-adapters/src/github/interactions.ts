@@ -11,11 +11,13 @@ import {
 import {
   ForgeOperationError,
   ForgeWebhookError,
-  removeIfPresent,
+  removeTemporaryStatus,
   reviewRevision,
   verifyStatusComment,
   type Forge,
+  type ForgeActor,
   type ForgeChange,
+  type ForgeMergeRequest,
   type ForgePullRequest,
   type ForgeReviewComment,
   type ForgeReviewPublication,
@@ -26,6 +28,16 @@ import {
   HttpForgeTransport,
   webhookEndpoint,
 } from "@forge-adapters/src/transport.js";
+import { resolveReviewer } from "@forge-adapters/src/merge.js";
+import {
+  approveGithubReview,
+  inspectGithubApproval,
+  retireGithubApproval,
+} from "@forge-adapters/src/github/approval.js";
+import {
+  inspectGithubMerge,
+  cancelGithubMerge,
+} from "@forge-adapters/src/github/merge.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
 
 const id = providerId.pipe(z.string().regex(/^\d+$/));
@@ -217,7 +229,10 @@ export class GithubForge implements Forge {
     "push",
   ] as const;
 
-  readonly capabilities = { resolveThreads: true };
+  readonly capabilities = {
+    resolveThreads: true,
+    guardedMerge: "conditional" as const,
+  };
 
   private readonly route: string;
 
@@ -273,6 +288,83 @@ export class GithubForge implements Forge {
       headers,
       budgetMs,
     );
+  }
+
+  /** Bind the guarded merge operations to this adapter's validated REST and GraphQL origins. */
+  private mergeApi() {
+    return {
+      route: this.route,
+      owner: this.owner,
+      name: this.repository,
+      app: this.connection.githubAppBot,
+      transport: this.transport,
+      graphql: this.graphql.bind(this),
+    };
+  }
+
+  /** Resolve one individual GitHub login, excluding apps and organizations. */
+  reviewerLogin(username: string) {
+    return resolveReviewer(username, async (name) => {
+      const user = z
+        .object({ login: z.string(), type: z.string() })
+        .parse(await this.transport.request(`users/${name}`));
+      return user.type === "User" ? user.login : undefined;
+    });
+  }
+
+  /** Read terminal PR state and evidence for retiring a legacy native merge. */
+  inspectMerge(request: ForgeMergeRequest) {
+    return inspectGithubMerge(this.mergeApi(), request);
+  }
+
+  /** Check review and CI readiness independently of native merge permissions. */
+  async inspectApproval(request: ForgeMergeRequest, bot: ForgeActor) {
+    return (await inspectGithubApproval(this.mergeApi(), request, bot))
+      .decision;
+  }
+
+  /** Reconcile this App's review or submit a first vote on the immutable PR and commit. */
+  approveReview(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    reconcileOnly: boolean,
+    beforeWrite: () => Promise<void>,
+    acknowledged = false,
+  ) {
+    return approveGithubReview(
+      this.mergeApi(),
+      request,
+      bot,
+      reconcileOnly,
+      beforeWrite,
+      acknowledged,
+    );
+  }
+
+  /** Dismiss an exact marked review by its immutable GitHub node ID. */
+  retireApproval(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    acknowledged: boolean,
+    beforeWrite: () => Promise<void>,
+  ) {
+    return retireGithubApproval(
+      this.mergeApi(),
+      request,
+      bot,
+      acknowledged,
+      beforeWrite,
+    );
+  }
+
+  /** GitHub cannot bind a successful Check Run to the owner of a particular native schedule. */
+  async scheduleMerge(): Promise<never> {
+    throw new ForgeOperationError("unsupported");
+  }
+
+  /** Revoke the saved review's App check without mutating a human's schedule. */
+  cancelMerge(request: ForgeMergeRequest) {
+    return cancelGithubMerge(this.mergeApi(), request);
   }
 
   /** Authenticate the raw delivery before extracting supported GitHub events. */
@@ -751,8 +843,9 @@ export class GithubForge implements Forge {
     botId: string,
     marker: string,
   ) {
-    await removeIfPresent(
+    await removeTemporaryStatus(
       commentId,
+      marker,
       async () => {
         await this.transport.request(
           await this.statusRoute(n, commentId, botId, marker),

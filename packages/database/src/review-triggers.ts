@@ -1,6 +1,21 @@
-import { and, count, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 
-import type { PreviousFinding, ReviewConversation } from "@razbor/contracts";
+import {
+  previousFindingsSchema,
+  type PreviousFinding,
+  type ReviewConversation,
+  type ReviewFinding,
+} from "@razbor/contracts";
 import type {
   ForgeChange,
   ForgeType,
@@ -12,6 +27,8 @@ import { snapshotRepositoryAgent } from "@database/src/agents.js";
 import type { Database, Transaction } from "@database/src/connection.js";
 import { publicId } from "@database/src/ids.js";
 import { snapshotRepositoryMcpServers } from "@database/src/mcp.js";
+import { latestMergeReview } from "@database/src/merge-policy.js";
+import { findingKey } from "@database/src/presentation.js";
 import { rearmStalePublication } from "@database/src/rearm-publication.js";
 import {
   dispatchOutbox,
@@ -50,6 +67,100 @@ type Observation = {
   automaticAuthorPermitted?: boolean;
   waitingForDiff?: boolean;
 };
+
+/**
+ * Rebuild outstanding console findings from immutable PR-bound results. Each
+ * result index identifies one occurrence even when two entries share a root
+ * cause. Only an assessment of its admission snapshot can retire it.
+ */
+export async function previousConsoleFindings(
+  db: Database["db"] | Transaction,
+  repositoryId: string,
+  number: number,
+  excludeReviewId?: string,
+) {
+  const resolvedIds = sql`jsonb_path_query_array(${reviews.result},
+    '$.findingChecks[*] ? (@.status == "resolved" && @.id starts with "console:").id')`;
+  const history = await db
+    .select({
+      id: reviews.publicId,
+      head: reviews.headSha,
+      findings: sql<
+        ReviewFinding[] | null
+      >`case when ${reviewTriggers.id} is null then ${reviews.result}->'findings' end`,
+      // A console assessment must be repeated when the destination or revision changes.
+      resolved: sql<
+        PreviousFinding[] | null
+      >`case when ${reviewTriggers.id} is not null or (
+        ${reviews.source}->>'mergeRevision' = ${pullRequests.mergeRevision}::text
+        and ${reviews.headSha} = ${pullRequests.headSha} and ${reviews.baseSha} = ${pullRequests.baseSha}
+      ) then jsonb_path_query_array(${reviews.source}, '$.previousFindings[*] ? (@.id == $ids[*])',
+        jsonb_build_object('ids', ${resolvedIds})) end`,
+    })
+    .from(reviews)
+    .innerJoin(pullRequests, eq(pullRequests.id, reviews.mergePullRequestId))
+    .leftJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
+    .leftJoin(dispatchOutbox, eq(dispatchOutbox.reviewId, reviews.id))
+    .where(
+      and(
+        eq(reviews.repositoryId, repositoryId),
+        eq(pullRequests.repositoryId, repositoryId),
+        eq(pullRequests.number, number),
+        eq(reviews.status, "completed"),
+        sql`${reviews.source}->>'conversation' is null`,
+        excludeReviewId ? ne(reviews.publicId, excludeReviewId) : undefined,
+        or(
+          and(
+            isNull(reviewTriggers.id),
+            sql`jsonb_array_length(${reviews.result}->'findings') > 0`,
+          ),
+          and(
+            sql`jsonb_array_length(${resolvedIds}) > 0`,
+            or(
+              isNull(reviewTriggers.id),
+              sql`${dispatchOutbox.publication}->>'state' = 'published'
+                  and ${dispatchOutbox.publication}->>'stale' is distinct from 'true'
+                  and ${dispatchOutbox.publication}->>'rearmed' is distinct from 'true'`,
+            ),
+          ),
+        ),
+      ),
+    )
+    .orderBy(reviews.createdAt, reviews.publicId);
+  const open = new Map<string, PreviousFinding>();
+  for (const row of history) {
+    for (const saved of row.resolved ?? []) {
+      const old = open.get(saved.id);
+      if (
+        old &&
+        saved.reviewId === old.reviewId &&
+        findingKey(saved.finding) === findingKey(old.finding)
+      )
+        open.delete(saved.id);
+    }
+    for (const [index, finding] of (row.findings ?? []).entries()) {
+      const id = `console:${row.id}:${index}`;
+      open.set(id, { id, reviewId: row.id, originalHead: row.head, finding });
+    }
+  }
+  return [...open.values()];
+}
+
+/** Fill the remaining admission budget with console findings. The merge audit still reads every occurrence. */
+export function consoleFindingSnapshot(
+  consoleFindings: PreviousFinding[],
+  published: PreviousFinding[] = [],
+) {
+  const snapshot = previousFindingsSchema.parse(published);
+  for (const finding of consoleFindings) {
+    snapshot.push(finding);
+    if (!previousFindingsSchema.safeParse(snapshot).success) {
+      snapshot.pop();
+      if (previousFindingsSchema.safeParse([finding]).success) break;
+    }
+  }
+  return snapshot;
+}
 
 /** Match a redelivery or an already declined command replayed under a different delivery ID. */
 export function triggerDelivery(hookId: string, event: ChangeEvent) {
@@ -299,6 +410,7 @@ async function queueReview(
   forge: ForgeType,
   change: ForgeChange,
   observation: Observation,
+  target: typeof pullRequests.$inferSelect,
   generation: number,
 ) {
   const { event, previous, conversation } = observation;
@@ -307,32 +419,92 @@ async function queueReview(
   // fences runner reservation: only an unstarted review may receive a new revision.
   let queued: typeof reviews.$inferSelect | undefined;
   if (automatic) {
-    const existing = await latestRevisionReview(tx, repo.id, change, false);
-    if (existing) {
+    const [entry] = await latestMergeReview(tx, target.id);
+    const latest = entry?.review;
+    const sameDiff =
+      latest &&
+      latest.headSha === change.headSha &&
+      latest.baseSha === change.mergeBase &&
+      (entry.trigger?.baseSha ?? latest.source.pullRequest?.baseSha) ===
+        change.baseSha &&
+      (!entry.trigger ||
+        (entry.trigger.startSha ?? null) === (change.startSha ?? null));
+    // A refresh may already have observed the ready transition. A title edit
+    // needs work only when an existing review is stale under merge automation.
+    if (
+      forge === "forgejo" &&
+      event.kind === "ready" &&
+      generation === observation.generation &&
+      (!repo.mergePolicy.enabled ||
+        !sameDiff ||
+        latest.source.mergeRevision === undefined ||
+        latest.source.mergeRevision === target.mergeRevision)
+    )
+      return;
+    if (
+      sameDiff &&
+      !latest.source.conversation &&
+      (latest.source.mergePolicy?.version ?? 1) === repo.mergePolicyVersion &&
+      (!repo.mergePolicy.enabled ||
+        latest.source.mergeRevision === target.mergeRevision) &&
+      ["queued", "running", "completed"].includes(latest.status)
+    ) {
       await supersedeQueuedAutomaticReviews(
         tx,
         repo.id,
         change.number,
-        existing.id,
+        latest.id,
       );
-      if (existing.status === "completed" && existing.origin)
-        await rearmStalePublication(tx, existing.id, generation);
+      if (latest.status === "completed" && entry.trigger)
+        await rearmStalePublication(tx, latest.id, generation);
       return undefined;
     }
-    const [pending] = await tx
-      .select({ review: reviews })
-      .from(reviews)
-      .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
-      .where(
-        and(
-          sameChange(repo.id, change.number),
-          eq(reviewTriggers.origin, "automatic"),
-          eq(reviews.status, "queued"),
-          eq(reviews.version, 0),
-        ),
-      )
-      .limit(1)
-      .for("update", { of: reviews });
+    // A restored revision can replay its saved stale result without inference
+    // when merge automation is disabled. A newer attempt on this same diff
+    // always takes precedence, including a failed manual re-review.
+    if (latest && !sameDiff && !repo.mergePolicy.enabled) {
+      const candidate = await latestRevisionReview(tx, repo.id, change, true);
+      const [replay] =
+        candidate?.status === "completed" && candidate.origin
+          ? await tx
+              .select({ id: reviews.id })
+              .from(reviews)
+              .innerJoin(
+                dispatchOutbox,
+                eq(dispatchOutbox.reviewId, reviews.id),
+              )
+              .where(
+                and(
+                  eq(reviews.id, candidate.id),
+                  eq(reviews.mergePullRequestId, target.id),
+                  sql`coalesce((${reviews.source}->'mergePolicy'->>'version')::int,1) = ${repo.mergePolicyVersion}`,
+                  sql`(${dispatchOutbox.publication}->>'state' = 'stale' or ${dispatchOutbox.publication}->>'rearmed' = 'true')`,
+                ),
+              )
+          : [];
+      if (replay) {
+        await supersedeQueuedAutomaticReviews(tx, repo.id, change.number);
+        await rearmStalePublication(tx, replay.id, generation);
+        return undefined;
+      }
+    }
+    const [pending] = latest
+      ? await tx
+          .select({ review: reviews })
+          .from(reviews)
+          .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
+          .where(
+            and(
+              sameChange(repo.id, change.number),
+              eq(reviewTriggers.origin, "automatic"),
+              eq(reviews.status, "queued"),
+              eq(reviews.version, 0),
+              eq(reviews.id, latest.id),
+            ),
+          )
+          .limit(1)
+          .for("update", { of: reviews })
+      : [];
     queued = pending?.review;
     // Retire a previous revision already waiting for a retry even when its old
     // model assignment can no longer get a runner. A live attempt stays pinned.
@@ -343,6 +515,8 @@ async function queueReview(
       queued?.id,
     );
   }
+  // Admission only queues work. The review insert/update wakes triage, which
+  // reconciles any older provider authority before this review can authorize a write.
   const git = structuredClone(repo.git);
   const remote = git.upstream.split("/")[2];
   const ref =
@@ -361,12 +535,30 @@ async function queueReview(
   const mcpServers = await snapshotRepositoryMcpServers(tx, repo.id);
   const values = {
     repositoryId: repo.id,
+    mergePullRequestId: conversation ? null : target.id,
     baseSha: change.mergeBase,
     headSha: change.headSha,
     source: {
       configKey: repo.configKey,
       git,
       indexOwner: repo.indexOwner,
+      ...(!conversation
+        ? {
+            mergePolicy: {
+              version: repo.mergePolicyVersion,
+              policy: repo.mergePolicy,
+            },
+            mergeRevision: target.mergeRevision,
+            baseBranch: target.baseBranch ?? undefined,
+            headBranch: target.headBranch ?? undefined,
+            pullRequest: {
+              number: change.number,
+              title: change.title,
+              url: change.url,
+              baseSha: change.baseSha,
+            },
+          }
+        : {}),
       ...(agent ? { agent } : {}),
       ...(guidance ? { guidance } : {}),
       ...(mcpServers.length ? { mcpServers } : {}),
@@ -619,6 +811,8 @@ export async function acceptReviewTrigger(
       }
     }
     const now = new Date();
+    const headBranch = change?.headBranch ?? session?.headBranch ?? null;
+    const baseBranch = change?.baseBranch ?? session?.baseBranch ?? null;
     // Equal-head deliveries can share an observation generation. Only changes
     // affecting eligibility or the diff invalidate another request's provider read.
     const changed =
@@ -629,6 +823,8 @@ export async function acceptReviewTrigger(
           session.baseSha !== change.baseSha ||
           session.mergeBase !== change.mergeBase ||
           session.startSha !== (change.startSha ?? null) ||
+          session.headBranch !== headBranch ||
+          session.baseBranch !== baseBranch ||
           session.draft !== (change.draft ?? null))) ||
       session.continuousReviewSince?.getTime() !== since?.getTime() ||
       session.reviewSessionResetAt?.getTime() !== reset?.getTime();
@@ -639,6 +835,7 @@ export async function acceptReviewTrigger(
       syncedAt: now,
       updatedAt: now,
     };
+    let target = session;
     if (change) {
       const values = {
         ...sessionValues,
@@ -652,10 +849,10 @@ export async function acceptReviewTrigger(
         author: change.author ?? null,
         headSha: change.headSha,
         baseSha: change.baseSha,
-        headBranch: change.headBranch ?? null,
-        baseBranch: change.baseBranch ?? null,
+        headBranch,
+        baseBranch,
       };
-      await tx
+      [target] = await tx
         .insert(pullRequests)
         .values({
           ...values,
@@ -665,7 +862,8 @@ export async function acceptReviewTrigger(
         .onConflictDoUpdate({
           target: [pullRequests.repositoryId, pullRequests.number],
           set: values,
-        });
+        })
+        .returning();
     } else if (session) {
       await tx
         .update(pullRequests)
@@ -710,10 +908,7 @@ export async function acceptReviewTrigger(
         .where(eq(webhookDeliveries.id, receipt.id));
       return { historyGeneration: sessionValues.triggerGeneration } as const;
     }
-    // Forgejo reports an edited title and the resulting draft flag. An
-    // unchanged, already-ready snapshot is an ordinary rename.
-    if (forge === "forgejo" && event.kind === "ready" && !changed)
-      return { reviewId: undefined } as const;
+    if (!target) throw new Error("Missing persisted pull request for review");
     const reviewId = await queueReview(
       tx,
       active,
@@ -721,6 +916,7 @@ export async function acceptReviewTrigger(
       forge,
       change,
       observation,
+      target,
       sessionValues.triggerGeneration,
     );
     return { reviewId } as const;

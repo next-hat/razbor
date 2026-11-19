@@ -48,6 +48,27 @@ test("UTF-8 byte threshold chooses complete inline or manifest-only context", as
   }
 });
 
+test("pinned exec diffs accept explicit patch formatting and verify the delivered changes", async (t) => {
+  const f = await diffFixture();
+  t.after(() => f.close());
+  const diff = await new RepositoryTools(f.repository).prepareDiff(
+    f.base,
+    f.head,
+    0,
+  );
+  const options = ["--no-color", "--no-ext-diff", "--unified=1"];
+  const args = ["diff", ...options, f.base, f.head, "--"];
+  const output = await git(f.repository, args, undefined, false);
+  const unread = diff.uninspectedFiles();
+  assert.ok(unread > 0);
+  diff.observeExec(["git", "diff", "--cached", f.base, f.head, "--"], output);
+  diff.observeExec(["git", "diff", ...options, f.head, f.base, "--"], output);
+  diff.observeExec(["git", ...args], output.split("\n")[0] + "\n");
+  assert.equal(diff.uninspectedFiles(), unread);
+  diff.observeExec(["git", ...args], output);
+  assert.equal(diff.uninspectedFiles(), 0);
+});
+
 test("batch continuation reconstructs exact patches and preserves original hunk counters", async () => {
   const f = await diffFixture();
   try {

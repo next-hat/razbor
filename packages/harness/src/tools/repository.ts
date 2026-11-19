@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 
@@ -6,6 +7,7 @@ import { z } from "zod";
 import { commitSchema } from "@razbor/contracts";
 
 import { PreparedDiff } from "@harness/src/tools/diff.js";
+import { execSearchPath } from "@harness/src/tools/exec.js";
 import { git, MAX_GIT_OUTPUT_BYTES } from "@harness/src/git.js";
 
 const MAX_FILE_BYTES = 100_000;
@@ -26,7 +28,195 @@ export const readFileArguments = z
   })
   .strict();
 
+type LineRange = { start: number; end: number };
+
+type DeliveredPage = LineRange & { totalLines: number };
+
+type SourceReads = { supplied: LineRange[]; clipped: LineRange[] };
+
+type FailedRead = {
+  path: string;
+  revision: "head" | "baseline";
+  ranges: LineRange[];
+};
+
+/** Check whether the returned pages cover a requested interval, including out-of-order reads. */
+function coversLines(pages: LineRange[], range: LineRange) {
+  let next = range.start;
+  for (const page of pages) {
+    if (page.start > next) break;
+    next = Math.max(next, page.end + 1);
+    if (next > range.end) return true;
+  }
+  return false;
+}
+
+/** Identify exact UTF-8 source text independently of the repository's object format. */
+function sourceDigest(content: string) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/** Subtract delivered lines on both sides of a requested interval; a confirmed EOF also settles lines beyond the file. */
+function subtractPage(ranges: LineRange[], page: DeliveredPage) {
+  const remaining: LineRange[] = [];
+  for (const { start, end } of ranges) {
+    const last = Math.min(end, page.totalLines);
+    const beforeEnd = Math.min(last, page.start - 1);
+    if (start <= beforeEnd) remaining.push({ start, end: beforeEnd });
+    const afterStart = Math.max(start, page.end + 1);
+    if (afterStart <= last) remaining.push({ start: afterStart, end: last });
+  }
+  return remaining;
+}
+
 export class RepositoryTools {
+  private readonly sourceReads = new Map<string, SourceReads>();
+  private readonly deliveredPages = new Map<string, DeliveredPage[]>();
+  private readonly failedReads = new Map<string, FailedRead>();
+  private readonly completeExecSources = new Set<string>();
+  private readonly emptyExecObjects = new Set<string>();
+  private longestExecSourceBytes = 0;
+
+  /** Remember an identifiable failed request on this pinned comparison. Malformed requests cannot be reconciled. */
+  recordFailedRead(input: unknown) {
+    const parsed = readFileArguments.safeParse(input);
+    if (!parsed.success) return false;
+    const { path, revision, startLine, endLine } = parsed.data;
+    const start = startLine ?? 1;
+    const end = endLine ?? start + 399;
+    if (end < start) return false;
+    const key = JSON.stringify([path, revision ?? "head"]);
+    let missing = [{ start, end }];
+    for (const page of this.deliveredPages.get(key) ?? []) {
+      missing = subtractPage(missing, page);
+      if (!missing.length) return true;
+    }
+    const request = this.failedReads.get(key) ?? {
+      path,
+      revision: revision ?? "head",
+      ranges: [],
+    };
+    request.ranges.push(...missing);
+    this.failedReads.set(key, request);
+    return true;
+  }
+
+  /** Retain intact pages and confirmed EOF or absence for earlier and later failed reads of this pinned path. */
+  observeSourceRead(
+    read: { path: string; revision: string } & (
+      | { state: "absent" }
+      | {
+          state: "available";
+          startLine: number;
+          endLine: number;
+          totalLines: number;
+        }
+    ),
+  ) {
+    const key = JSON.stringify([read.path, read.revision]);
+    const page =
+      read.state === "available"
+        ? {
+            start: read.startLine,
+            end: read.endLine,
+            totalLines: read.totalLines,
+          }
+        : { start: 1, end: 0, totalLines: 0 };
+    const delivered = this.deliveredPages.get(key) ?? [];
+    delivered.push(page);
+    this.deliveredPages.set(key, delivered);
+    const request = this.failedReads.get(key);
+    if (!request) return;
+    const remaining = subtractPage(request.ranges, page);
+    if (remaining.length) request.ranges = remaining;
+    else this.failedReads.delete(key);
+  }
+
+  /** Check outstanding ranges against complete exec output, including when the pinned tree was unavailable at read time. */
+  async hasFailedReads() {
+    if (!this.completeExecSources.size && !this.emptyExecObjects.size)
+      return this.failedReads.size > 0;
+    for (const { path, revision } of this.failedReads.values()) {
+      try {
+        const entry = await this.sourceEntry(path, revision);
+        if (
+          entry?.type !== "blob" ||
+          !["100644", "100755"].includes(entry.mode)
+        )
+          return true;
+        // A larger blob cannot match any delivered output. Git requires a positive buffer limit even for an empty blob.
+        const content = await git(
+          this.repository,
+          ["cat-file", "blob", entry.oid],
+          this.signal,
+          false,
+          Math.max(1, this.longestExecSourceBytes),
+        );
+        const supplied = content
+          ? this.completeExecSources.has(sourceDigest(content))
+          : this.emptyExecObjects.has(`${entry.sha}:${path}`);
+        if (!supplied) return true;
+      } catch {
+        this.signal?.throwIfAborted();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** Match complete text by content. Empty output needs a Git command explicitly reading the requested pinned object. */
+  observeExec(stdout: string, argv?: unknown, searchPath?: string) {
+    if (stdout === "") {
+      if (!Array.isArray(argv)) return;
+      const [command, operation, subject, object] = argv;
+      const candidates = execSearchPath(searchPath)
+        .split(path.delimiter)
+        .map((dir) => path.join(dir, "git"));
+      const checkout = path.resolve(this.repository) + path.sep;
+      // A caller-selected checkout program named git cannot establish an empty observation.
+      const installed = candidates.filter((file) => !file.startsWith(checkout));
+      const trusted =
+        command === "git"
+          ? installed.length === candidates.length
+          : installed.includes(command);
+      if (!trusted) return;
+      // Only an exact SHA:tree-path can match a failed read. Git's ./ and ../ operands depend on the exec cwd.
+      if (
+        argv.length === 3 &&
+        operation === "show" &&
+        typeof subject === "string"
+      )
+        this.emptyExecObjects.add(subject);
+      else if (
+        argv.length === 4 &&
+        operation === "cat-file" &&
+        subject === "blob" &&
+        typeof object === "string"
+      )
+        this.emptyExecObjects.add(object);
+      return;
+    }
+    if (stdout.includes("\0")) return;
+    this.completeExecSources.add(sourceDigest(stdout));
+    this.longestExecSourceBytes = Math.max(
+      this.longestExecSourceBytes,
+      Buffer.byteLength(stdout),
+    );
+  }
+
+  /** Count immutable files with a requested interval still missing from the delivered evidence. */
+  unfinishedSourceReads() {
+    let count = 0;
+    for (const [digest, reads] of this.sourceReads) {
+      if (!reads.clipped.length || this.completeExecSources.has(digest))
+        continue;
+      reads.supplied.sort((a, b) => a.start - b.start);
+      if (reads.clipped.some((range) => !coversLines(reads.supplied, range)))
+        count++;
+    }
+    return count;
+  }
+
   private revisions?: { head: string; baseline: string };
 
   /**
@@ -178,7 +368,20 @@ export class RepositoryTools {
         state: "unsupported",
         reason: "binary source",
       });
-    return sourcePage(content, metadata, endLine);
+    const page = sourcePage(content, metadata, endLine);
+    if (page.state === "available") {
+      const digest = sourceDigest(content);
+      const reads = this.sourceReads.get(digest) ?? {
+        supplied: [],
+        clipped: [],
+      };
+      reads.supplied.push({ start: startLine, end: page.endLine });
+      const requestedEnd = Math.min(page.totalLines, endLine);
+      if (page.endLine < requestedEnd)
+        reads.clipped.push({ start: page.endLine + 1, end: requestedEnd });
+      this.sourceReads.set(digest, reads);
+    }
+    return JSON.stringify(page);
   }
 
   /**
@@ -216,7 +419,7 @@ export function toolError(e: unknown) {
 }
 
 /**
- * Serializes a numbered source page within line and byte limits, including a
+ * Builds a numbered source page within serialized line and byte limits, including a
  * continuation line or an explicit oversized-line state.
  */
 function sourcePage(
@@ -236,7 +439,7 @@ function sourcePage(
    */
   const result = () => ({
     ...metadata,
-    state: "available",
+    state: "available" as const,
     endLine: next - 1,
     totalLines: lines.length,
     source: source.join("\n"),
@@ -254,10 +457,10 @@ function sourcePage(
     }
   }
   if (!source.length && next <= last)
-    return JSON.stringify({
+    return {
       ...metadata,
-      state: "unavailable",
+      state: "unavailable" as const,
       reason: "source line exceeds response limit",
-    });
-  return JSON.stringify(result());
+    };
+  return result();
 }

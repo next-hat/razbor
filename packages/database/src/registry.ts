@@ -9,6 +9,7 @@ import { parse } from "smol-toml";
 import {
   publicIdSchema,
   reviewTriggerModeSchema,
+  mergePolicySchema,
   type ReviewTriggerMode,
   githubInstallationSchema,
   type GithubInstallation,
@@ -47,8 +48,11 @@ import {
   type SecretReference,
 } from "@database/src/schema.js";
 import { publicId } from "@database/src/ids.js";
+import { RepositoryManagementError } from "@database/src/repository-lifecycle.js";
 import { resetRepositoryReviewTriggers } from "@database/src/review-triggers.js";
 import { readStoredSecret } from "@database/src/secrets.js";
+import { settleMergeAuthority } from "@database/src/merge-recovery.js";
+import { wakeRepositoryTriage } from "@database/src/merge-policy.js";
 import { reviewCommandText } from "@database/src/presentation.js";
 import {
   githubInstallationAccess,
@@ -87,6 +91,7 @@ export const registrySchema = z
         .object({
           webhook: webhookSettingsSchema.optional(),
           reviewTriggerMode: reviewTriggerModeSchema.optional(),
+          mergePolicy: mergePolicySchema.optional(),
           codebaseMemoryEnabled: z.boolean().optional(),
           forge: identifier.optional(),
           selector: z.string().min(1).max(1024).optional(),
@@ -223,10 +228,10 @@ async function validateImportCredentialContext(
 }
 
 /**
- * Apply declared forge and repository settings under the registry lock,
- * preserving ownership and identity; changed source policies invalidate
- * verification without deleting absent entries. An omitted indexing preference keeps
- * the saved value or defaults a new repository according to its source-service owner.
+ * Apply declared settings under the registry lock, preserving ownership,
+ * identity and absent entries. Settle prior merge authority before a source
+ * edit invalidates verification and review revisions. An omitted indexing
+ * preference keeps its saved value or defaults by source-service owner.
  */
 export async function applyRegistry(
   database: Database,
@@ -238,6 +243,7 @@ export async function applyRegistry(
     await tx.execute(sql`select pg_advisory_xact_lock(748321, 2)`);
     const managedBy = config.registry.key;
     const importContextId = await defaultImportContextId(tx);
+    const rotatingForges = new Set<string>();
     const forgeIds = new Map<
       string,
       { id: string; contextId: string | null }
@@ -283,6 +289,11 @@ export async function applyRegistry(
               publicId: publicId("forge"),
             })
             .returning();
+      if (
+        existing &&
+        !isDeepStrictEqual(existing.credential, values.credential)
+      )
+        rotatingForges.add(row.id);
       forgeIds.set(key, { id: row.id, contextId: row.contextId });
     }
     for (const [key, r] of Object.entries(config.repositories)) {
@@ -334,6 +345,7 @@ export async function applyRegistry(
         git: r.git,
         indexOwner: r.indexing.owner,
         persistent: r.indexing.persistent,
+        mergePolicy: mergePolicySchema.parse(r.mergePolicy ?? {}),
         reviewTriggerMode: r.reviewTriggerMode ?? "manual",
         codebaseMemoryEnabled,
       };
@@ -352,7 +364,36 @@ export async function applyRegistry(
           existing.persistent !== r.indexing.persistent;
         const triggersChanged =
           existing.reviewTriggerMode !== values.reviewTriggerMode;
-        if (!sourceChanged && !indexingChanged && !triggersChanged) continue;
+        const policyChanged = !isDeepStrictEqual(
+          existing.mergePolicy,
+          values.mergePolicy,
+        );
+        if (
+          !sourceChanged &&
+          !indexingChanged &&
+          !triggersChanged &&
+          !policyChanged
+        )
+          continue;
+        if (policyChanged || sourceChanged) {
+          try {
+            await settleMergeAuthority(database, tx, existing);
+          } catch (error) {
+            if (
+              forgeId &&
+              rotatingForges.has(forgeId) &&
+              error instanceof RepositoryManagementError &&
+              error.status === 409
+            )
+              throw new RepositoryManagementError(
+                409,
+                error.message +
+                  " Apply the new forge credential with an empty [repositories] table first, then retry the repository import.",
+              );
+            throw error;
+          }
+          await wakeRepositoryTriage(tx, existing.id, sourceChanged);
+        }
         if (triggersChanged)
           await resetRepositoryReviewTriggers(tx, existing.id);
         await tx
@@ -360,6 +401,8 @@ export async function applyRegistry(
           .set({
             ...values,
             version: existing.version + 1,
+            mergePolicyVersion:
+              existing.mergePolicyVersion + Number(policyChanged),
             ...(sourceChanged ? { verifiedAt: null } : {}),
             ...(indexingChanged
               ? {
@@ -382,6 +425,7 @@ export const repositorySelection = {
   publicId: repositories.publicId,
   configKey: repositories.configKey,
   managedBy: repositories.managedBy,
+  mergePolicyVersion: repositories.mergePolicyVersion,
   reviewTriggerMode: repositories.reviewTriggerMode,
   codebaseMemoryEnabled: repositories.codebaseMemoryEnabled,
   forgePublicId: forgeInstances.publicId,
@@ -415,6 +459,7 @@ function repositoryView(row: {
   configKey: string;
   managedBy: string;
   codebaseMemoryEnabled: boolean;
+  mergePolicyVersion: number;
   reviewTriggerMode: ReviewTriggerMode;
   forgePublicId: string | null;
   forgeType: "github" | "gitlab" | "forgejo" | null;
@@ -435,6 +480,8 @@ function repositoryView(row: {
     id: row.publicId,
     configKey: row.configKey,
     codebaseMemoryEditable: isUiManagedRepository(row),
+    mergePolicyEditable: isUiManagedRepository(row),
+    mergePolicyVersion: row.mergePolicyVersion,
     reviewTriggerModeEditable: isUiManagedRepository(row),
     reviewTriggerMode: row.reviewTriggerMode,
     codebaseMemoryEnabled: row.codebaseMemoryEnabled,
@@ -520,7 +567,7 @@ export async function getRepository(
 ) {
   publicIdSchema("repository").parse(id);
   const [row] = await database.db
-    .select(repositorySelection)
+    .select({ ...repositorySelection, mergePolicy: repositories.mergePolicy })
     .from(repositories)
     .leftJoin(
       forgeInstances,
@@ -544,7 +591,9 @@ export async function getRepository(
           : sql`${repositories.contextId} = (select id from account_contexts where public_id = ${contextId})`,
       ),
     );
-  return row ? repositoryView(row) : undefined;
+  return row
+    ? { ...repositoryView(row), mergePolicy: row.mergePolicy }
+    : undefined;
 }
 
 /**

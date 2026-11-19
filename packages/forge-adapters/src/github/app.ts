@@ -206,14 +206,23 @@ export async function listGithubAppInstallations(
   }
 }
 
-/** Verify active App ownership and mint an expiring token, optionally restricted to one exact repository. */
+/** Mint a short-lived installation token. Git source gets read-only contents in its repository, and discovery gets only metadata. */
 export async function createGithubInstallationToken(
   connection: ForgeConnection,
   credentials: GithubAppCredentials,
   installationId: string,
   repositoryId?: string,
+  purpose: "server" | "source" | "discovery" = "server",
 ) {
   try {
+    if (purpose === "source" && repositoryId === undefined)
+      throw new ForgeOperationError("invalid-response");
+    const permissions =
+      purpose === "source"
+        ? { contents: "read" }
+        : purpose === "discovery"
+          ? { metadata: "read" }
+          : undefined;
     const transport = appTransport(connection, credentials);
     const installation = installationSchema.parse(
       await transport.request(`app/installations/${id.parse(installationId)}`),
@@ -240,17 +249,33 @@ export async function createGithubInstallationToken(
           .max(16384)
           .regex(/^[^\r\n\0]+$/),
         expires_at: z.string().datetime({ offset: true }),
+        permissions: z.record(z.string(), z.string()).optional(),
         repositories: z.array(z.object({ id })).optional(),
       })
       .parse(
         await transport.request(
           `app/installations/${installation.id}/access_tokens`,
           "POST",
-          repositoryNumber === undefined
-            ? {}
-            : { repository_ids: [repositoryNumber] },
+          {
+            ...(repositoryNumber === undefined
+              ? {}
+              : { repository_ids: [repositoryNumber] }),
+            ...(permissions ? { permissions } : {}),
+          },
         ),
       );
+    if (
+      permissions &&
+      result.permissions &&
+      Object.entries(result.permissions).some(
+        ([key, level]) =>
+          level !== "none" &&
+          (level !== "read" ||
+            (key !== "metadata" &&
+              (purpose !== "source" || key !== "contents"))),
+      )
+    )
+      throw new ForgeOperationError("permission");
     const expiresAt = Date.parse(result.expires_at);
     if (
       expiresAt <= Date.now() + 60000 ||
@@ -279,6 +304,8 @@ export async function listGithubInstallationRepositories(
       connection,
       credentials,
       installationId,
+      undefined,
+      "discovery",
     );
     const transport = new HttpForgeTransport(connection, {
       Authorization: `Bearer ${token}`,

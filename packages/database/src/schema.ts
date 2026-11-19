@@ -19,6 +19,11 @@ import {
 
 import {
   publicIdPattern,
+  mergePolicySchema,
+  type MergeDecision,
+  type MergePolicy,
+  type MergePolicySnapshot,
+  type ReviewApprovalStatus,
   type ModelProvider,
   type ReasoningEffort,
   type ResourceKind,
@@ -40,6 +45,7 @@ import type {
   RepositoryMetadata,
   ForgeType,
   ForgeChange,
+  ForgeMergeWriteStage,
   ForgePublicationProgress,
   ForgeWebhook,
   InlineComment,
@@ -257,6 +263,11 @@ export const repositories = pgTable(
     agentId: uuid("agent_id").references(() => agents.id, {
       onDelete: "restrict",
     }),
+    mergePolicy: jsonb("merge_policy")
+      .$type<MergePolicy>()
+      .notNull()
+      .default(mergePolicySchema.parse({})),
+    mergePolicyVersion: integer("merge_policy_version").notNull().default(1),
     // Null preserves existing runner capability settings until the UI saves guidance.
     guidance: jsonb("guidance").$type<RepositoryGuidance>(),
     selector: text("selector"),
@@ -316,6 +327,18 @@ export const repositories = pgTable(
   ],
 );
 
+export type EscalationComment = {
+  botId: string;
+  reservationRetryAt?: number;
+  pendingReservations?: number;
+  /** Hashes of unconfirmed edit bodies on remoteId, or true for unidentifiable pending writes. */
+  uncertainEdit?: boolean | string[];
+  remoteId?: string;
+  creatingBody?: string;
+  shownBody?: string;
+  mentioned?: boolean;
+};
+
 export const pullRequests = pgTable(
   "pull_requests",
   {
@@ -325,6 +348,10 @@ export const pullRequests = pgTable(
       .notNull()
       .references(() => repositories.id, { onDelete: "cascade" }),
     number: integer("number").notNull(),
+    mergeRevision: integer("merge_revision").notNull().default(1),
+    mergeAfter: timestamp("merge_after", { withTimezone: true }),
+    humanEscalated: boolean("human_escalated").notNull().default(false),
+    escalationComment: jsonb("escalation_comment").$type<EscalationComment>(),
     draft: boolean("draft"),
     mergeBase: text("merge_base"),
     startSha: text("start_sha"),
@@ -725,10 +752,28 @@ export const reviews = pgTable(
       .references(() => repositories.id),
     baseSha: text("base_sha").notNull(),
     headSha: text("head_sha").notNull(),
+    mergePullRequestId: uuid("merge_pull_request_id").references(
+      () => pullRequests.id,
+      { onDelete: "set null" },
+    ),
+    mergeWriteStage: text("merge_write_stage").$type<ForgeMergeWriteStage>(),
+    forgeApproval: jsonb("forge_approval").$type<{
+      botId: string;
+      status: ReviewApprovalStatus;
+      retiring?: boolean;
+      retirementSent?: boolean;
+      retireAfter?: number;
+    }>(),
+    mergeDecision: jsonb("merge_decision").$type<MergeDecision>(),
+    mergeAction: text("merge_action").$type<
+      "dry_run" | "writing" | "scheduled" | "merged" | "uncertain" | "refused"
+    >(),
     // Pins source policy and prior findings for this run; never secret values.
     source: jsonb("source")
       .$type<{
         configKey: string;
+        mergePolicy?: MergePolicySnapshot;
+        mergeRevision?: number;
         git: GitPolicy;
         indexOwner: string;
         headBranch?: string;
@@ -1005,6 +1050,11 @@ export type Publication = {
     /** Existing bot-owned recap to edit independently of new inline review records. */
     recapReviewId?: string;
   };
+  outstandingFindings?: number;
+  /** Older suppression records did not establish whether the representative was still open. */
+  suppressedFindings?: Record<string, string>;
+  /** Each duplicate finding key is bound to an exact prior finding verified open during publication. */
+  openFindingOwners?: Record<string, string>;
   limitations?: string[];
   error?: string;
   writing?: boolean;

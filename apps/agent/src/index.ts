@@ -99,6 +99,7 @@ try {
           },
         },
       },
+      mergePolicy: job.mergePolicy,
       previousFindings: job.previousFindings,
       conversation: job.conversation,
       /**
