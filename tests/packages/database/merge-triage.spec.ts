@@ -572,6 +572,7 @@ test(
     const inspections: number[] = [];
     const voteWrites: number[] = [];
     let voteFailure: "not-sent" | "rate-limited" | undefined;
+    let votePreflight: "checks_pending" | "checks_unverified" | undefined;
     let providerVoteDeadline: number | undefined;
     const liveApprovalEvents: string[] = [];
     let visibleVote: "absent" | "approved" | "dismissed" = "absent";
@@ -599,6 +600,7 @@ test(
           }
         }
         if (reconcileOnly) return visibleVote;
+        if (request.number === 8 && votePreflight) return votePreflight;
         await beforeWrite();
         assert.equal(await voteStatus(request.reviewId), "uncertain");
         if (request.number === 9 && voteFailure) {
@@ -1236,14 +1238,25 @@ test(
     assert.equal(approve.mock.callCount(), 0);
     const votingReview = await complete(votePr, 96);
     checks = { state: "blocked", reason: "github_schedule_owner_unbound" };
-    for (const code of [
-      "required_check_pending",
-      "required_check_unverified",
-    ]) {
-      approvalChecks = { state: "awaiting_checks", reason: code };
+    for (const [code, secondPreflight] of [
+      ["required_check_pending", undefined],
+      ["required_check_unverified", undefined],
+      ["required_check_pending", "checks_pending"],
+      ["required_check_unverified", "checks_unverified"],
+    ] as const) {
+      votePreflight = secondPreflight;
+      approvalChecks = secondPreflight
+        ? { state: "ready", reason: "approval_ready" }
+        : { state: "awaiting_checks", reason: code };
+      const callsBefore = approve.mock.callCount();
       const started = Date.now();
       await processMergeTriage(restart);
-      assert.equal(approve.mock.callCount(), 0);
+      assert.equal(
+        approve.mock.callCount(),
+        callsBefore + (secondPreflight ? 1 : 0),
+      );
+      assert.equal(await voteStatus(votingReview), null);
+      assert.deepEqual(voteWrites, []);
       const listed = (await listPullRequests(db, [repo.id])).find(
         (entry) => entry.id === votePr,
       );
@@ -1259,9 +1272,14 @@ test(
           bodyFor(8),
           /cannot match a required GitHub ruleset check/,
         );
-      } else assert.ok((await deadline(votePr))!.getTime() >= started + 60_000);
+      } else {
+        const nextPoll = (await deadline(votePr))!.getTime();
+        assert.ok(nextPoll >= started + 60_000);
+        assert.ok(nextPoll <= Date.now() + 60_000);
+      }
       await due(votePr);
     }
+    votePreflight = undefined;
     approvalChecks = { state: "ready", reason: "approval_ready" };
     checks = {
       state: "blocked",

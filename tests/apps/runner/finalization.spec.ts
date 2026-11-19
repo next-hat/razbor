@@ -17,6 +17,7 @@ import {
 import { reviewRepository, type ReviewConfig } from "@razbor/harness";
 import { git } from "@razbor/harness/git";
 import { RemoteMemory } from "@razbor/harness/mcp";
+import { RepositoryTools } from "@razbor/harness/repository";
 import { runnerConfigSchema } from "@razbor/runner/config";
 import { ModelRelay } from "@razbor/runner/relay";
 
@@ -790,11 +791,55 @@ test("failed verification is retained even when the model claims full merge read
   );
 });
 
-for (const recover of [true, false]) {
+test("a failed reread retains delivered lines, EOF and absence on the same pinned path", async (t) => {
+  const files = await diffFixture();
+  t.after(() => files.close());
+  const content = Array.from(
+    { length: 405 },
+    (_, index) => "line " + index,
+  ).join("\n");
+  await files.write("source.ts", content);
+  await files.write("related.ts", content);
+  const tools = new RepositoryTools(files.repository);
+  await tools.prepareDiff(files.base, await files.commit());
+  /** Deliver the real pinned source page, preserving the tool's per-call line limit. */
+  async function deliver(input: unknown) {
+    const page = JSON.parse(await tools.readFile(input));
+    assert.ok(page.state === "available" || page.state === "absent");
+    tools.observeSourceRead(page);
+  }
+  const request = { path: "source.ts", startLine: 1, endLine: 800 };
+  await deliver(request);
+  await deliver({ ...request, path: "related.ts", startLine: 401 });
+  await deliver({ ...request, revision: "baseline" });
+  assert.ok(tools.recordFailedRead(request));
+  assert.equal(await tools.hasFailedReads(), true);
+  await deliver({ ...request, startLine: 405 });
+  assert.equal(await tools.hasFailedReads(), true);
+  await deliver({ ...request, startLine: 401, endLine: 404 });
+  assert.equal(await tools.hasFailedReads(), false);
+  assert.ok(tools.recordFailedRead(request));
+  assert.equal(await tools.hasFailedReads(), false);
+  const absent = { path: "missing.ts" };
+  await deliver(absent);
+  assert.ok(tools.recordFailedRead(absent));
+  assert.equal(await tools.hasFailedReads(), false);
+});
+
+for (const [empty, command] of [
+  [false, "show"],
+  [false, "unrelated"],
+  [true, "show"],
+  [true, "cat-file"],
+  [true, "unrelated"],
+] as const) {
   test(
-    recover
-      ? "complete pinned exec output recovers a failed source read"
-      : "partial and unrelated exec output preserve a failed source read",
+    (empty ? "empty" : "nonempty") +
+      " failed source read " +
+      (command === "unrelated" ? "remains unresolved" : "recovers") +
+      " after " +
+      command +
+      " output",
     async (t) => {
       const f = await fixture(t, "openai", [
         () => {
@@ -818,15 +863,27 @@ for (const recover of [true, false]) {
             },
           };
         },
-        () => ({ call: { id: "other-file", argv: ["cat", "related.ts"] } }),
         () => ({
           call: {
-            id: "source",
-            argv: recover
-              ? ["git", "show", f.files.head + ":source.ts"]
-              : ["head", "-n", "1", "source.ts"],
+            id: "other-file",
+            argv: ["git", "show", f.files.head + ":related.ts"],
           },
         }),
+        () => {
+          const spec = f.files.head + ":source.ts";
+          if (command === "show")
+            return { call: { id: "source", argv: ["git", "show", spec] } };
+          if (command === "cat-file")
+            return {
+              call: { id: "source", argv: ["git", "cat-file", "blob", spec] },
+            };
+          return {
+            call: {
+              id: "source",
+              argv: empty ? ["true"] : ["head", "-n", "1", "source.ts"],
+            },
+          };
+        },
         (payload) => {
           const outputs = toolBlocks("openai", payload).filter(
             (item) =>
@@ -844,6 +901,19 @@ for (const recover of [true, false]) {
           };
         },
       ]);
+      if (empty) {
+        await f.files.write("source.ts", "");
+        await f.files.write("related.ts", "");
+        f.files.base = await f.files.commit();
+        await f.files.write("guide.md", "Changed guide\n");
+        f.files.head = await f.files.commit();
+      } else {
+        await f.files.write(
+          "source.ts",
+          "\uFEFFnew implementation 💡\nstable context\n",
+        );
+        f.files.head = await f.files.commit();
+      }
       const tree = await fixtureObjectPath(
         f.files.repository,
         f.files.head + "^{tree}",
@@ -851,7 +921,8 @@ for (const recover of [true, false]) {
       const returned = await f.review({
         mergePolicy: { version: 1, policy: mergePolicySchema.parse({}) },
       });
-      if (recover) assert.deepEqual(returned.mergeAssessment, readyAssessment);
+      if (command !== "unrelated")
+        assert.deepEqual(returned.mergeAssessment, readyAssessment);
       else {
         assert.equal(returned.mergeAssessment?.reviewComplete, false);
         assert.match(

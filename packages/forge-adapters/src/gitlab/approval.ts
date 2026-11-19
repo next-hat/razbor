@@ -182,6 +182,7 @@ export async function approveGitlabReview(
     reconcileOnly,
   );
   if (decision.state === "stale") return "stale";
+  if (decision.state === "awaiting_checks") return "checks_pending";
   if (decision.state !== "ready") return "unsupported";
   if (active)
     return acknowledged ? "approved" : reconcileOnly ? "absent" : "unsupported";

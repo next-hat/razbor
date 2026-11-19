@@ -37,6 +37,13 @@ const diffOptions = [
   "--submodule=short",
 ];
 
+const patchOptions = new Set([
+  ...diffOptions.slice(1),
+  "--patch",
+  "-p",
+  "--color=never",
+]);
+
 /**
  * Splits NUL-delimited Git metadata, rejecting output that ends with an incomplete
  * record.
@@ -274,13 +281,20 @@ export class PreparedDiff {
 
   /** Keep exact file changes received through successful, untruncated exec output. */
   observeExec(argv: unknown, stdout: string) {
+    if (!Array.isArray(argv) || !isGitCommand(argv[0]) || argv[1] !== "diff")
+      return;
+    const base = argv.indexOf(this.baselineSha, 2);
     if (
-      !Array.isArray(argv) ||
-      !isGitCommand(argv[0]) ||
-      argv[1] !== "diff" ||
-      argv[2] !== this.baselineSha ||
-      argv[3] !== this.headSha ||
-      (argv.length > 4 && argv[4] !== "--") ||
+      base < 2 ||
+      !argv
+        .slice(2, base)
+        .every(
+          (arg) =>
+            typeof arg === "string" &&
+            (patchOptions.has(arg) || /^(?:-U|--unified=)\d+$/.test(arg)),
+        ) ||
+      argv[base + 1] !== this.headSha ||
+      (argv.length > base + 2 && argv[base + 2] !== "--") ||
       !stdout.startsWith("diff --git ")
     )
       return;

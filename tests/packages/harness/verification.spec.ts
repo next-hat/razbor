@@ -269,6 +269,20 @@ test("exec terminates background descendants when their command leader exits", a
 test("exec bounds combined output without splitting UTF-8 and clamps trusted limits", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "razbor-output-"));
   t.after(() => rm(root, { recursive: true, force: true }));
+  const text = "\uFEFF💡";
+  for (const [bytes, prefix] of [
+    [2, ""],
+    [3, "\uFEFF"],
+    [6, "\uFEFF"],
+    [7, text],
+  ] as const) {
+    const result = await executeCommand(root, {
+      argv: node("process.stdout.write(process.argv[1])", text),
+      maxOutputBytes: bytes,
+    });
+    assert.equal(result.stdout, prefix);
+    assert.equal(result.truncated, bytes < Buffer.byteLength(text));
+  }
   for (const script of [
     'process.stdout.write("💡".repeat(1000)); process.stderr.write("error".repeat(1000))',
     'process.stdout.write(Buffer.alloc(10000, 255)); process.stderr.write("error")',

@@ -7,6 +7,7 @@ import { z } from "zod";
 import { commitSchema } from "@razbor/contracts";
 
 import { PreparedDiff } from "@harness/src/tools/diff.js";
+import { execSearchPath } from "@harness/src/tools/exec.js";
 import { git, MAX_GIT_OUTPUT_BYTES } from "@harness/src/git.js";
 
 const MAX_FILE_BYTES = 100_000;
@@ -28,6 +29,8 @@ export const readFileArguments = z
   .strict();
 
 type LineRange = { start: number; end: number };
+
+type DeliveredPage = LineRange & { totalLines: number };
 
 type SourceReads = { supplied: LineRange[]; clipped: LineRange[] };
 
@@ -53,10 +56,25 @@ function sourceDigest(content: string) {
   return createHash("sha256").update(content).digest("hex");
 }
 
+/** Subtract delivered lines on both sides of a requested interval; a confirmed EOF also settles lines beyond the file. */
+function subtractPage(ranges: LineRange[], page: DeliveredPage) {
+  const remaining: LineRange[] = [];
+  for (const { start, end } of ranges) {
+    const last = Math.min(end, page.totalLines);
+    const beforeEnd = Math.min(last, page.start - 1);
+    if (start <= beforeEnd) remaining.push({ start, end: beforeEnd });
+    const afterStart = Math.max(start, page.end + 1);
+    if (afterStart <= last) remaining.push({ start: afterStart, end: last });
+  }
+  return remaining;
+}
+
 export class RepositoryTools {
   private readonly sourceReads = new Map<string, SourceReads>();
+  private readonly deliveredPages = new Map<string, DeliveredPage[]>();
   private readonly failedReads = new Map<string, FailedRead>();
   private readonly completeExecSources = new Set<string>();
+  private readonly emptyExecObjects = new Set<string>();
   private longestExecSourceBytes = 0;
 
   /** Remember an identifiable failed request on this pinned comparison. Malformed requests cannot be reconciled. */
@@ -68,17 +86,22 @@ export class RepositoryTools {
     const end = endLine ?? start + 399;
     if (end < start) return false;
     const key = JSON.stringify([path, revision ?? "head"]);
+    let missing = [{ start, end }];
+    for (const page of this.deliveredPages.get(key) ?? []) {
+      missing = subtractPage(missing, page);
+      if (!missing.length) return true;
+    }
     const request = this.failedReads.get(key) ?? {
       path,
       revision: revision ?? "head",
       ranges: [],
     };
-    request.ranges.push({ start, end });
+    request.ranges.push(...missing);
     this.failedReads.set(key, request);
     return true;
   }
 
-  /** Remove only lines accounted for by an intact page or confirmed absence at the same pinned path and revision. */
+  /** Retain intact pages and confirmed EOF or absence for earlier and later failed reads of this pinned path. */
   observeSourceRead(
     read: { path: string; revision: string } & (
       | { state: "absent" }
@@ -91,28 +114,28 @@ export class RepositoryTools {
     ),
   ) {
     const key = JSON.stringify([read.path, read.revision]);
+    const page =
+      read.state === "available"
+        ? {
+            start: read.startLine,
+            end: read.endLine,
+            totalLines: read.totalLines,
+          }
+        : { start: 1, end: 0, totalLines: 0 };
+    const delivered = this.deliveredPages.get(key) ?? [];
+    delivered.push(page);
+    this.deliveredPages.set(key, delivered);
     const request = this.failedReads.get(key);
     if (!request) return;
-    const remaining: LineRange[] = [];
-    if (read.state === "available") {
-      for (const { start, end } of request.ranges) {
-        // EOF proves any lines beyond the blob are absent. Within the file,
-        // preserve the portions of each failed range on either side of this page.
-        const last = Math.min(end, read.totalLines);
-        const beforeEnd = Math.min(last, read.startLine - 1);
-        if (start <= beforeEnd) remaining.push({ start, end: beforeEnd });
-        const afterStart = Math.max(start, read.endLine + 1);
-        if (afterStart <= last)
-          remaining.push({ start: afterStart, end: last });
-      }
-    }
+    const remaining = subtractPage(request.ranges, page);
     if (remaining.length) request.ranges = remaining;
     else this.failedReads.delete(key);
   }
 
   /** Check outstanding ranges against complete exec output, including when the pinned tree was unavailable at read time. */
   async hasFailedReads() {
-    if (!this.completeExecSources.size) return this.failedReads.size > 0;
+    if (!this.completeExecSources.size && !this.emptyExecObjects.size)
+      return this.failedReads.size > 0;
     for (const { path, revision } of this.failedReads.values()) {
       try {
         const entry = await this.sourceEntry(path, revision);
@@ -129,7 +152,10 @@ export class RepositoryTools {
           false,
           Math.max(1, this.longestExecSourceBytes),
         );
-        if (!this.completeExecSources.has(sourceDigest(content))) return true;
+        const supplied = content
+          ? this.completeExecSources.has(sourceDigest(content))
+          : this.emptyExecObjects.has(`${entry.sha}:${path}`);
+        if (!supplied) return true;
       } catch {
         this.signal?.throwIfAborted();
         return true;
@@ -138,8 +164,38 @@ export class RepositoryTools {
     return false;
   }
 
-  /** Match a complete command result against immutable file contents, independent of path aliases. */
-  observeExec(stdout: string) {
+  /** Match complete text by content. Empty output needs a Git command explicitly reading the requested pinned object. */
+  observeExec(stdout: string, argv?: unknown, searchPath?: string) {
+    if (stdout === "") {
+      if (!Array.isArray(argv)) return;
+      const [command, operation, subject, object] = argv;
+      const candidates = execSearchPath(searchPath)
+        .split(path.delimiter)
+        .map((dir) => path.join(dir, "git"));
+      const checkout = path.resolve(this.repository) + path.sep;
+      // A caller-selected checkout program named git cannot establish an empty observation.
+      const installed = candidates.filter((file) => !file.startsWith(checkout));
+      const trusted =
+        command === "git"
+          ? installed.length === candidates.length
+          : installed.includes(command);
+      if (!trusted) return;
+      // Only an exact SHA:tree-path can match a failed read. Git's ./ and ../ operands depend on the exec cwd.
+      if (
+        argv.length === 3 &&
+        operation === "show" &&
+        typeof subject === "string"
+      )
+        this.emptyExecObjects.add(subject);
+      else if (
+        argv.length === 4 &&
+        operation === "cat-file" &&
+        subject === "blob" &&
+        typeof object === "string"
+      )
+        this.emptyExecObjects.add(object);
+      return;
+    }
     if (stdout.includes("\0")) return;
     this.completeExecSources.add(sourceDigest(stdout));
     this.longestExecSourceBytes = Math.max(

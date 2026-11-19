@@ -22,6 +22,13 @@ type ApprovalResult = {
   retryAt?: Date;
 };
 
+/** Poll a changing check after a minute. An unverifiable ruleset needs a new triage trigger. */
+function waitingForApprovalChecks(unverified: boolean): ApprovalResult {
+  return unverified
+    ? { status: "unavailable", reason: "required_check_unverified" }
+    : { status: "unavailable", retryAt: new Date(Date.now() + 60_000) };
+}
+
 /** Cast at most one exact-head vote. A lost write can only be reconciled by reading the forge. */
 export async function syncReviewApproval(
   database: Database,
@@ -70,20 +77,11 @@ export async function syncReviewApproval(
     try {
       if (!saved) {
         const state = await api.inspectApproval(request, bot);
-        // The ruleset needs operator attention. Resume on a later triage trigger.
-        if (
-          state.state === "awaiting_checks" &&
-          state.reason === "required_check_unverified"
-        )
-          return { status: "unavailable", reason: state.reason };
-        if (state.state !== "ready")
-          return {
-            status: "unavailable",
-            retryAt:
-              state.state === "awaiting_checks"
-                ? new Date(Date.now() + 60_000)
-                : undefined,
-          };
+        if (state.state === "awaiting_checks")
+          return waitingForApprovalChecks(
+            state.reason === "required_check_unverified",
+          );
+        if (state.state !== "ready") return { status: "unavailable" };
         // A ready approval preflight verified checks and restrictions for a vote.
         // These facts are never passed to the native merge dispatcher.
         const local = evaluateMergeDecision({
@@ -126,6 +124,11 @@ export async function syncReviewApproval(
         };
       else if (result === "absent" && saved?.status === "approved")
         status = "dismissed";
+      else if (
+        !saved &&
+        (result === "checks_pending" || result === "checks_unverified")
+      )
+        return waitingForApprovalChecks(result === "checks_unverified");
       else return { status: "unavailable" };
       await tx
         .update(reviews)

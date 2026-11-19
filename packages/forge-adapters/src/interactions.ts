@@ -2,9 +2,15 @@ import type { ForgeType } from "@forge-adapters/src/types.js";
 
 export type ForgeActor = { id: string; login: string };
 
-/** An absent result permits read-only reconciliation of a potentially delayed vote. */
+/** Check outcomes precede the write fence. An absent vote can still be in flight during reconciliation. */
 export type ForgeApprovalResult =
-  "approved" | "absent" | "unsupported" | "stale" | "dismissed";
+  | "approved"
+  | "absent"
+  | "unsupported"
+  | "stale"
+  | "dismissed"
+  | "checks_pending"
+  | "checks_unverified";
 
 export type ForgeApprovalRetirement = "retired" | "unconfirmed";
 

@@ -112,13 +112,13 @@ function externalId(request: ForgeMergeRequest) {
 /** Read every reported run for this head, including historical runs when retiring a check. */
 export async function checks(
   api: GithubApi,
-  request: ForgeMergeRequest,
+  commitOid: string,
   eligibilityName?: string,
 ) {
   const filter = eligibilityName
     ? `filter=all&check_name=${encodeURIComponent(eligibilityName)}&app_id=${api.app?.appId}`
     : "filter=latest";
-  const commitRoute = `${api.route}/commits/${request.headSha}`;
+  const commitRoute = `${api.route}/commits/${commitOid}`;
   const runs = new Map<string, z.infer<typeof check>>();
   let total: number | undefined;
   for (let page = 1; page <= maxCheckPages; page++) {
@@ -136,7 +136,7 @@ export async function checks(
       throw new ForgeOperationError("invalid-response");
     for (const row of response.check_runs) {
       if (
-        row.head_sha !== request.headSha ||
+        row.head_sha !== commitOid ||
         runs.has(row.id) ||
         (eligibilityName &&
           (row.name !== eligibilityName || row.app.id !== api.app?.appId))
@@ -159,7 +159,7 @@ export async function checks(
   if (
     suites.total_count > 1000 ||
     suites.check_suites.length !== Math.min(1, suites.total_count) ||
-    suites.check_suites.some((suite) => suite.head_sha !== request.headSha) ||
+    suites.check_suites.some((suite) => suite.head_sha !== commitOid) ||
     (suites.total_count === 0 && runs.size > 0)
   )
     throw new ForgeOperationError("invalid-response");
@@ -308,7 +308,7 @@ export async function inspectGithubMerge(
   )
     return blocked;
   // A historical check can outlive its review even if the current review has no write stage.
-  const gates = await checks(api, request, eligibilityCheck);
+  const gates = await checks(api, request.headSha, eligibilityCheck);
   if (gates.length !== 1) return blocked;
   const [gate] = gates;
   if (gate.external_id !== externalId(request)) {
@@ -388,7 +388,7 @@ export async function cancelGithubMerge(
     ? [eligibilityCheck, retiredEligibilityCheck]
     : [eligibilityCheck];
   const matching = await Promise.all(
-    names.map((name) => checks(api, request, name)),
+    names.map((name) => checks(api, request.headSha, name)),
   );
   const owned = matching
     .flat()
@@ -428,7 +428,7 @@ export async function cancelGithubMerge(
           conclusion: "cancelled",
         },
       );
-    const verified = (await checks(api, request, name)).find(
+    const verified = (await checks(api, request.headSha, name)).find(
       (row) => row.id === gate.id,
     );
     if (

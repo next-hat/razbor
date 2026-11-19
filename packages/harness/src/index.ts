@@ -841,11 +841,13 @@ export async function reviewRepository(
         message = messageFor(result);
       } else if (sourceRead) rtools.observeSourceRead(sourceRead);
       else if (completeExecOutput !== undefined) {
-        rtools.observeExec(completeExecOutput);
-        prepared.observeExec(
-          (call.arguments as { argv?: unknown }).argv,
+        const argv = (call.arguments as { argv?: unknown }).argv;
+        rtools.observeExec(
           completeExecOutput,
+          argv,
+          config.verification?.exec?.env?.PATH,
         );
+        prepared.observeExec(argv, completeExecOutput);
       }
       evidenceIds.add(evidenceId);
       if (call.name === "read_diff") reportContext();

@@ -41,6 +41,16 @@ export function isGitCommand(executable: unknown) {
   return typeof executable === "string" && path.basename(executable) === "git";
 }
 
+/** Return the absolute search directories used for child commands, with the POSIX default when none are configured. */
+export function execSearchPath(configured?: string) {
+  return (
+    (configured ?? "")
+      .split(path.delimiter)
+      .filter((entry) => path.isAbsolute(entry))
+      .join(path.delimiter) || "/usr/bin:/bin"
+  );
+}
+
 /**
  * Runs argv without a shell from a repository-confined directory using only
  * caller-approved environment variables. Caps time and combined output, kills child
@@ -83,11 +93,7 @@ export async function executeCommand(
     : args.argv;
   const env = { ...policy.env };
   // Relative PATH entries would let the reviewed checkout shadow installed utilities.
-  if (env.PATH !== undefined)
-    env.PATH =
-      env.PATH.split(path.delimiter)
-        .filter((entry) => path.isAbsolute(entry))
-        .join(path.delimiter) || "/usr/bin:/bin";
+  if (env.PATH !== undefined) env.PATH = execSearchPath(env.PATH);
   if (isGit)
     Object.assign(env, {
       GIT_CONFIG_NOSYSTEM: "1",
@@ -185,12 +191,18 @@ export async function executeCommand(
       cleanup();
       // Also remove background children that inherited neither output pipe.
       kill();
-      const out = new TextDecoder().decode(Buffer.concat(stdout), {
-        stream: truncated,
-      });
-      const err = new TextDecoder().decode(Buffer.concat(stderr), {
-        stream: truncated,
-      });
+      const out = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+        Buffer.concat(stdout),
+        {
+          stream: truncated,
+        },
+      );
+      const err = new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+        Buffer.concat(stderr),
+        {
+          stream: truncated,
+        },
+      );
       const boundedOut = textPrefix(out, maxOutputBytes);
       const boundedErr = textPrefix(
         err,

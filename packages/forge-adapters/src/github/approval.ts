@@ -36,13 +36,16 @@ const voteFields = `{pageInfo{hasPreviousPage startCursor endCursor} nodes{${opi
 
 const approvalVariables = `$owner:String!, $name:String!, $number:Int!, $bot:String!`;
 
+const statusFields = `oid status{contexts{context state isRequired(pullRequestNumber:$number) creator{__typename ... on Bot{databaseId login}}}}`;
+
 const approvalSelection = `repository(owner:$owner,name:$name) {
     databaseId defaultBranchRef{name}
     pullRequest(number:$number) {
       id number state isDraft author{login} headRefOid baseRefOid baseRefName
       isInMergeQueue autoMergeRequest{enabledAt} mergeable mergeStateStatus reviewDecision
       headRepository{databaseId} headRef{branchProtectionRule{${lockFields}}}
-      commits(last:1){nodes{commit{oid status{contexts{context state isRequired(pullRequestNumber:$number) creator{__typename ... on Bot{databaseId login}}}}}}}
+      commits(last:1){nodes{commit{${statusFields}}}}
+      potentialMergeCommit{${statusFields} parents(first:2){totalCount nodes{oid}}}
       baseRef{refUpdateRule{viewerAllowedToDismissReviews} branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}
       reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved}}
       latestOpinionatedReviews(first:100){pageInfo{hasNextPage} nodes{state}}
@@ -93,6 +96,11 @@ const commitStatus = z.object({
     .nullable(),
 });
 
+const checkedCommit = z.object({
+  oid: commitSha,
+  status: z.object({ contexts: z.array(commitStatus).max(2000) }).nullable(),
+});
+
 const approvalRepository = z.object({
   databaseId: mergeId,
   defaultBranchRef: z.object({ name: z.string() }),
@@ -115,21 +123,16 @@ const approvalRepository = z.object({
       .enum(["APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"])
       .nullable(),
     commits: z.object({
-      nodes: z
-        .array(
-          z.object({
-            commit: z.object({
-              oid: commitSha,
-              status: z
-                .object({
-                  contexts: z.array(commitStatus).max(2000),
-                })
-                .nullable(),
-            }),
-          }),
-        )
-        .length(1),
+      nodes: z.array(z.object({ commit: checkedCommit })).length(1),
     }),
+    potentialMergeCommit: checkedCommit
+      .extend({
+        parents: z.object({
+          totalCount: z.coerce.number().int().nonnegative(),
+          nodes: z.array(z.object({ oid: commitSha })).max(2),
+        }),
+      })
+      .nullable(),
     baseRef: z.object({
       refUpdateRule: z
         .object({ viewerAllowedToDismissReviews: z.boolean() })
@@ -248,7 +251,17 @@ export async function inspectGithubApproval(
   api: GithubApi,
   request: ForgeMergeRequest,
   bot: ForgeActor,
-  readVoteOnly = false,
+) {
+  return readGithubApproval(api, request, bot, "inspect");
+}
+
+/** Evaluate the current PR with verified App identities reused only within the same voting attempt. */
+async function readGithubApproval(
+  api: GithubApi,
+  request: ForgeMergeRequest,
+  bot: ForgeActor,
+  mode: "inspect" | "reconcile" | "approve",
+  confirmedApps?: ReadonlyMap<string, string | undefined>,
 ): Promise<{
   decision: ForgeMergeState;
   pullId?: string;
@@ -342,7 +355,7 @@ export async function inspectGithubApproval(
         : opinion.body.endsWith(marker)
           ? "approved"
           : "unsupported";
-  if (readVoteOnly)
+  if (mode === "reconcile")
     return {
       decision: mergeState("ready", "approval_ready"),
       pullId: pr.id,
@@ -374,6 +387,18 @@ export async function inspectGithubApproval(
     !["CLEAN", "BLOCKED", "UNSTABLE"].includes(pr.mergeStateStatus)
   )
     return { decision: mergeState("blocked", "merge_restrictions") };
+  const preview = pr.potentialMergeCommit;
+  if (
+    preview &&
+    (preview.oid === request.headSha ||
+      preview.oid === request.baseSha ||
+      preview.parents.totalCount !== 2 ||
+      preview.parents.nodes[0]?.oid !== request.baseSha ||
+      preview.parents.nodes[1]?.oid !== request.headSha)
+  )
+    return {
+      decision: mergeState("awaiting_checks", "required_check_pending"),
+    };
   const rules = await rulesetChecks(api, request);
   const classic = pr.baseRef.branchProtectionRule;
   const sourceLocked =
@@ -419,17 +444,35 @@ export async function inspectGithubApproval(
       (!rule.app || rule.app.databaseId === run.app.id)
     );
   }
-  // An approval never releases Razbor's own native-merge gate.
-  const runs = (await checks(api, request)).filter(
+  // GitHub falls back to the reviewed head when the test merge commit has no reports.
+  const mergeRuns = preview ? await checks(api, preview.oid) : [];
+  const usePreview = !!(mergeRuns.length || preview?.status?.contexts.length);
+  const headRuns =
+    !usePreview || request.requirePassingChecks
+      ? await checks(api, request.headSha)
+      : [];
+  const authoritative = usePreview && preview ? preview : tip;
+  /** Exclude the current App's native-merge gates from approval CI. */
+  function isReviewCheck(run: (typeof headRuns)[number]) {
+    return (
+      run.app.id !== api.app?.appId ||
+      ![eligibilityCheck, retiredEligibilityCheck].includes(run.name)
+    );
+  }
+  const providerRuns = (usePreview ? mergeRuns : headRuns).filter(
     (run) =>
       (request.requirePassingChecks ||
         approvalChecks.some((rule) => matchesRun(rule, run))) &&
-      (run.app.id !== api.app?.appId ||
-        ![eligibilityCheck, retiredEligibilityCheck].includes(run.name)),
+      isReviewCheck(run),
   );
-  const statusApps = new Map<string, string | undefined>();
+  // Strict local policy also rejects failed or pending checks reported on the head.
+  const policyRuns =
+    usePreview && request.requirePassingChecks
+      ? [...providerRuns, ...headRuns.filter(isReviewCheck)]
+      : providerRuns;
+  const statusApps = new Map(confirmedApps);
   const statuses: { name: string; state: string; appId?: string }[] = [];
-  for (const status of tip.status?.contexts ?? []) {
+  for (const status of authoritative.status?.contexts ?? []) {
     const name = status.context.toLowerCase();
     const named = approvalChecks.filter(
       (rule) => rule.context.toLowerCase() === name,
@@ -438,8 +481,14 @@ export async function inspectGithubApproval(
       status.creator?.__typename === "Bot" ? status.creator.databaseId : null;
     let appId: string | undefined;
     if (status.isRequired && named.some((rule) => rule.app) && creatorId) {
-      if (!statusApps.has(creatorId))
+      if (!statusApps.has(creatorId)) {
+        // A new producer on the confirmation pass needs a fresh inspection.
+        if (confirmedApps)
+          return {
+            decision: mergeState("awaiting_checks", "required_check_pending"),
+          };
         statusApps.set(creatorId, await statusAppId(api, status.creator));
+      }
       appId = statusApps.get(creatorId);
     }
     // Unknown provenance can block an explicitly required status, but only a
@@ -456,13 +505,17 @@ export async function inspectGithubApproval(
     )
       statuses.push({ name, state: status.state, appId });
   }
+  const policyStatuses =
+    usePreview && request.requirePassingChecks
+      ? [...statuses, ...(tip.status?.contexts ?? [])]
+      : statuses;
   if (
-    runs.some(
+    policyRuns.some(
       (run) =>
         run.status === "completed" &&
         !["success", "skipped", "neutral"].includes(run.conclusion ?? ""),
     ) ||
-    statuses.some((status) => ["FAILURE", "ERROR"].includes(status.state))
+    policyStatuses.some((status) => ["FAILURE", "ERROR"].includes(status.state))
   )
     return { decision: mergeState("blocked", "required_check_failed") };
   // Workflow rules identify source files, repositories and revisions. The
@@ -473,16 +526,16 @@ export async function inspectGithubApproval(
     };
   if (
     (request.requirePassingChecks &&
-      !runs.some((run) => run.conclusion === "success") &&
+      !providerRuns.some((run) => run.conclusion === "success") &&
       !statuses.some((status) => status.state === "SUCCESS")) ||
-    runs.some((run) => run.status !== "completed") ||
-    statuses.some((status) => status.state !== "SUCCESS")
+    policyRuns.some((run) => run.status !== "completed") ||
+    policyStatuses.some((status) => status.state !== "SUCCESS")
   )
     return {
       decision: mergeState("awaiting_checks", "required_check_pending"),
     };
   for (const rule of approvalChecks) {
-    if (runs.some((run) => matchesRun(rule, run))) continue;
+    if (providerRuns.some((run) => matchesRun(rule, run))) continue;
     // Failed or pending runs and statuses on either required channel already
     // returned above. A passing legacy status can supply a missing Check Run.
     if (
@@ -503,6 +556,20 @@ export async function inspectGithubApproval(
     !gateRequired
   )
     return { decision: mergeState("blocked", "merge_restrictions") };
+  if (mode === "approve" && !confirmedApps && !previous) {
+    // Re-evaluate the live rules, revisions, reviews and CI after external App
+    // lookups. GitHub can pin the submitted vote to a head, but not to CI state.
+    const confirmed = await readGithubApproval(
+      api,
+      request,
+      bot,
+      mode,
+      statusApps,
+    );
+    if (confirmed.pullId && confirmed.pullId !== pullId)
+      return { decision: mergeState("stale", "revision_changed") };
+    return confirmed;
+  }
   return {
     decision: mergeState("ready", "approval_ready"),
     pullId: pr.id,
@@ -524,14 +591,18 @@ export async function approveGithubReview(
   beforeWrite: () => Promise<void>,
   acknowledged = false,
 ): Promise<ForgeApprovalResult> {
-  const { decision, pullId, previous } = await inspectGithubApproval(
+  const { decision, pullId, previous } = await readGithubApproval(
     api,
     request,
     bot,
-    reconcileOnly,
+    reconcileOnly ? "reconcile" : "approve",
   );
   if (previous) return previous;
   if (decision.state === "stale") return "stale";
+  if (decision.state === "awaiting_checks")
+    return decision.reason === "required_check_unverified"
+      ? "checks_unverified"
+      : "checks_pending";
   if (decision.state !== "ready" || !pullId) return "unsupported";
   if (reconcileOnly) return acknowledged ? "dismissed" : "absent";
   const marker = approvalMarker(request);

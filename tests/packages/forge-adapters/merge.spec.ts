@@ -822,8 +822,20 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     author: { databaseId: number };
     pullRequest: { id: string };
   }[] = [];
+  const previewStatus = {
+    context: "legacy",
+    state: "SUCCESS",
+    isRequired: true,
+    creator: null,
+  };
+  const preview = {
+    oid: "d".repeat(40),
+    parents: { totalCount: 2, nodes: [{ oid: baseSha }, { oid: headSha }] },
+    status: { contexts: [] as (typeof previewStatus)[] },
+  };
   const pr = {
     id: "NODE7",
+    potentialMergeCommit: null as typeof preview | null,
     number: 7,
     state: "OPEN",
     isDraft: false,
@@ -892,6 +904,9 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   let otherRunConclusion: string | null | undefined;
   let statusBotId = 80;
   let statusApp = 5;
+  let changeDuringLookup: (() => void) | undefined;
+  let changePreviewRun = false;
+  let previewRun: { name: string; conclusion: string | null } | undefined;
   const optionalRun = {
     id: 5,
     name: "Optional",
@@ -925,6 +940,10 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
         } else {
           assert.match(query, /dismissesStaleReviews/);
           assert.match(query, /reviewThreads/);
+          assert.match(
+            query,
+            /potentialMergeCommit\{[^\n]*parents\(first:2\)\{totalCount nodes\{oid\}/,
+          );
           assert.match(query, /isRequired\(pullRequestNumber:\$number\)/);
           assert.match(
             query,
@@ -1034,8 +1053,10 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     assert.equal(method, "GET");
     if (path.endsWith("/users/legacy-check%5Bbot%5D"))
       return { id: statusBotId, type: "Bot", login: "legacy-check[bot]" };
-    if (path.endsWith("/apps/legacy-check"))
+    if (path.endsWith("/apps/legacy-check")) {
+      changeDuringLookup?.();
       return { id: statusApp, slug: "legacy-check" };
+    }
     if (path.includes("/rules/branches/main?"))
       return enforcedRuleset
         ? [
@@ -1054,6 +1075,26 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
         enforcement: "active",
         current_user_can_bypass: bypass,
       };
+    if (path.includes(`/commits/${preview.oid}/check-runs?`)) {
+      const runs = previewRun
+        ? [
+            {
+              ...optionalRun,
+              ...previewRun,
+              head_sha: preview.oid,
+              status: previewRun.conclusion ? "completed" : "in_progress",
+            },
+          ]
+        : [];
+      return { total_count: runs.length, check_runs: runs };
+    }
+    if (path.includes(`/commits/${preview.oid}/check-suites?`)) {
+      if (changePreviewRun && previewRun) previewRun.conclusion = null;
+      return {
+        total_count: previewRun ? 1 : 0,
+        check_suites: previewRun ? [{ head_sha: preview.oid }] : [],
+      };
+    }
     if (path.includes("/check-runs?")) {
       const runs = showOptionalRun
         ? [
@@ -1113,6 +1154,69 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   pr.mergeable = "MERGEABLE";
   const requiredOnly = { ...request, requirePassingChecks: false };
   const contexts = pr.commits.nodes[0].commit.status.contexts;
+  pr.potentialMergeCommit = preview;
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "approval_ready",
+  );
+  preview.status.contexts.push(previewStatus);
+  for (const [state, reason] of [
+    ["FAILURE", "required_check_failed"],
+    ["PENDING", "required_check_pending"],
+    ["SUCCESS", "approval_ready"],
+  ]) {
+    previewStatus.state = state;
+    assert.equal(
+      (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+      reason,
+    );
+  }
+  previewStatus.context = "unrelated";
+  assert.equal(
+    await api.approveReview(requiredOnly, approvalBot, false, checkpoint),
+    "checks_pending",
+  );
+  preview.status.contexts.pop();
+  previewRun = { name: "legacy", conclusion: "failure" };
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "required_check_failed",
+  );
+  previewRun.conclusion = "success";
+  changePreviewRun = true;
+  assert.equal(
+    await api.approveReview(requiredOnly, approvalBot, false, checkpoint),
+    "checks_pending",
+  );
+  changePreviewRun = false;
+  previewRun.conclusion = "success";
+  contexts[0].state = "FAILURE";
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "approval_ready",
+  );
+  assert.equal(
+    (await api.inspectApproval(request, approvalBot)).reason,
+    "required_check_failed",
+  );
+  const headStatus = contexts.pop()!;
+  assert.equal(
+    (await api.inspectApproval(request, approvalBot)).reason,
+    "approval_ready",
+  );
+  headStatus.state = "SUCCESS";
+  contexts.push(headStatus);
+  for (const i of [0, 1]) {
+    const original = preview.parents.nodes[i].oid;
+    preview.parents.nodes[i].oid = "f".repeat(40);
+    assert.equal(
+      (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+      "required_check_pending",
+    );
+    preview.parents.nodes[i].oid = original;
+  }
+  pr.potentialMergeCommit = null;
+  previewRun = undefined;
   const optionalStatus = {
     context: "Optional legacy status",
     state: "SUCCESS",
@@ -1268,6 +1372,38 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     (await api.inspectApproval(requiredOnly, approvalBot)).reason,
     "approval_ready",
   );
+  changeDuringLookup = () => {
+    optionalStatus.state = "FAILURE";
+  };
+  assert.equal(
+    await api.approveReview(requiredOnly, approvalBot, false, checkpoint),
+    "unsupported",
+  );
+  optionalStatus.state = "SUCCESS";
+  changeDuringLookup = () => {
+    pr.headRefOid = baseSha;
+  };
+  assert.equal(
+    await api.approveReview(requiredOnly, approvalBot, false, checkpoint),
+    "stale",
+  );
+  pr.headRefOid = headSha;
+  changeDuringLookup = () => {
+    contexts.push({
+      context: "advisory",
+      state: "PENDING",
+      isRequired: false,
+      creator: null,
+    });
+  };
+  await assert.rejects(
+    api.approveReview(requiredOnly, approvalBot, false, async () => {
+      throw new Error("reached approval fence");
+    }),
+    /reached approval fence/,
+  );
+  contexts.pop();
+  changeDuringLookup = undefined;
   statusBotId = 81;
   assert.equal(
     (await api.inspectApproval(requiredOnly, approvalBot)).reason,
@@ -1309,6 +1445,10 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
       "required_check_unverified",
     );
   }
+  assert.equal(
+    await api.approveReview(requiredOnly, approvalBot, false, checkpoint),
+    "checks_unverified",
+  );
   const hiddenStatus = contexts.pop()!;
   const hiddenRule =
     pr.baseRef.branchProtectionRule.requiredStatusChecks.pop()!;
@@ -1805,6 +1945,10 @@ test("GitLab approval uses the numeric MR and SHA guard and requires revision-bo
   settings.selective_code_owner_removals = false;
   for (const state of ["approvals_syncing", "ci_still_running", "checking"]) {
     mr.detailed_merge_status = state;
+    assert.equal(
+      await api.approveReview(request, approvalBot, false, checkpoint),
+      "checks_pending",
+    );
     assert.equal(
       (await api.inspectApproval(request, approvalBot)).state,
       "awaiting_checks",

@@ -4,7 +4,10 @@
  */
 export function textPrefix(text: string, maxBytes: number): string {
   // Streaming decode omits an incomplete final UTF-8 sequence.
-  return new TextDecoder().decode(Buffer.from(text).subarray(0, maxBytes), {
-    stream: true,
-  });
+  return new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+    Buffer.from(text).subarray(0, maxBytes),
+    {
+      stream: true,
+    },
+  );
 }
