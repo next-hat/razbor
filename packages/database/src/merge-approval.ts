@@ -126,14 +126,14 @@ export async function syncReviewApproval(
       if (
         !saved &&
         error instanceof ForgeOperationError &&
-        !error.uncertain &&
-        error.status !== undefined &&
-        error.status >= 400 &&
-        error.status < 500
+        error.definitelyRefused
       ) {
-        const retryable = error.retryAt !== undefined || error.status === 429;
+        const retryable =
+          error.reason === "not-sent" ||
+          error.retryAt !== undefined ||
+          error.status === 429;
         if (uncertain) {
-          // Only a definitive response to the attempted vote can retire its intent.
+          // Only this attempt's unsent or definitively refused vote can release its intent.
           await tx
             .update(reviews)
             .set({

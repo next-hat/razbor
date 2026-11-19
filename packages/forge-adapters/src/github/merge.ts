@@ -256,7 +256,11 @@ export function requiredCheckState(
     );
     if (!matching.length || matching.some((r) => r.status !== "completed"))
       return mergeState("awaiting_checks", "required_check_pending");
-    if (matching.some((r) => r.conclusion !== "success"))
+    if (
+      matching.some(
+        (r) => !["success", "neutral", "skipped"].includes(r.conclusion ?? ""),
+      )
+    )
       return mergeState("blocked", "required_check_failed");
   }
 }

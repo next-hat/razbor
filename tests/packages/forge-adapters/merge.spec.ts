@@ -366,6 +366,7 @@ function gitlabFixture(t: TestContext) {
   const flags = {
     loseResponse: false,
     refuse: false,
+    rateLimited: false,
     nullMergeUser: false,
     base: baseSha,
     version: "19.4.0-ee",
@@ -395,6 +396,11 @@ function gitlabFixture(t: TestContext) {
       method === "PUT"
     ) {
       mutations.push(body);
+      if (flags.rateLimited)
+        return new Response(null, {
+          status: 429,
+          headers: { "retry-after": "180" },
+        });
       if (flags.refuse) return new Response(null, { status: 409 });
       mr.merge_when_pipeline_succeeds = true;
       mr.merge_user = flags.nullMergeUser ? null : { id: 2 };
@@ -488,16 +494,35 @@ test("GitLab requires project-enforced unsquashed merges and checks the terminal
   assert.equal(await f.api.scheduleMerge(unsquashed), "scheduled");
   f.mr.state = "merged";
   f.mr.squash_commit_sha = headSha;
+  assert.equal((await f.api.inspectMerge(request)).state, "merged");
   assert.equal(
     (await f.api.inspectMerge(unsquashed)).reason,
     "merge_method_unavailable",
   );
   f.mr.squash_commit_sha = null;
   assert.equal((await f.api.inspectMerge(unsquashed)).state, "merged");
+  for (const missing of [null, undefined]) {
+    f.mr.squash_commit_sha = missing;
+    const result = await f.api.inspectMerge(request);
+    assert.equal(result.terminal, true);
+    assert.equal(result.reason, "merge_method_unavailable");
+  }
 });
 
 test("GitLab distinguishes a guarded refusal from an unknown outcome and reconciles the latter by reading", async (t) => {
   const f = gitlabFixture(t);
+  const now = Date.now();
+  t.mock.method(Date, "now", () => now);
+  const stages: ForgeMergeWriteStage[] = [];
+  f.flags.rateLimited = true;
+  await assert.rejects(
+    f.api.scheduleMerge(request, false, async (stage) => {
+      stages.push(stage);
+    }),
+    { status: 429, uncertain: false, retryAt: now + 180000 },
+  );
+  assert.deepEqual(stages, ["submitting", "prepared"]);
+  f.flags.rateLimited = false;
   f.flags.refuse = true;
   await assert.rejects(
     f.api.scheduleMerge(request),
@@ -513,7 +538,7 @@ test("GitLab distinguishes a guarded refusal from an unknown outcome and reconci
     (await forge("gitlab").inspectMerge(request)).state,
     "scheduled",
   );
-  assert.equal(f.mutations.length, 2);
+  assert.equal(f.mutations.length, 3);
 });
 
 test("GitLab binds an unattributed schedule to a positive PUT receipt and preserves uncertainty after transport loss", async (t) => {
@@ -741,6 +766,7 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   let checkpoints = 0;
   let pendingApp = 1;
   let optionalConclusion = "skipped";
+  let graphqlRejection: Response | undefined;
   let historyFault:
     | "stale head"
     | "repeated cursor"
@@ -850,6 +876,7 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
       const variables = body.variables as Record<string, string>;
       assert.equal(variables.head, headSha);
       assert.equal(variables.pull, pr.id);
+      if (graphqlRejection) return graphqlRejection;
       assert.equal(checkpoints, mutations.length + 1);
       mutations.push("approval");
       const review = {
@@ -934,11 +961,39 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     "awaiting_checks",
   );
   pr.mergeable = "MERGEABLE";
-  optionalConclusion = "neutral";
+  pr.baseRef.branchProtectionRule.requiredStatusChecks.push({
+    context: "Optional",
+    app: { databaseId: 5 },
+  });
+  for (const passing of ["neutral", "skipped"]) {
+    optionalConclusion = passing;
+    assert.equal(
+      (await api.inspectApproval(request, approvalBot)).state,
+      "ready",
+    );
+  }
+  const [legacyStatus] = pr.commits.nodes[0].commit.status.contexts.splice(
+    0,
+    1,
+  );
+  const [legacyRule] =
+    pr.baseRef.branchProtectionRule.requiredStatusChecks.splice(1, 1);
   assert.equal(
     (await api.inspectApproval(request, approvalBot)).state,
+    "awaiting_checks",
+  );
+  assert.equal(
+    (
+      await api.inspectApproval(
+        { ...request, requirePassingChecks: false },
+        approvalBot,
+      )
+    ).state,
     "ready",
   );
+  pr.commits.nodes[0].commit.status.contexts.push(legacyStatus);
+  pr.baseRef.branchProtectionRule.requiredStatusChecks.pop();
+  pr.baseRef.branchProtectionRule.requiredStatusChecks.push(legacyRule);
   pr.isInMergeQueue = true;
   assert.equal(
     await api.approveReview(request, approvalBot, false, checkpoint),
@@ -1007,6 +1062,47 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     "absent",
   );
   assert.equal(checkpoints, 0);
+  const reset = Math.floor(Date.now() / 1000) + 300;
+  const errors = [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }];
+  for (const payload of [
+    { data: null, errors },
+    { message: "API rate limit exceeded" },
+  ]) {
+    graphqlRejection = Response.json(payload, {
+      headers: {
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(reset),
+      },
+    });
+    await assert.rejects(
+      api.approveReview(request, approvalBot, false, async () => {}),
+      {
+        status: 200,
+        uncertain: false,
+        retryAt: reset * 1000,
+      },
+    );
+  }
+  for (const payload of [
+    { data: { addPullRequestReview: null }, errors },
+    { data: null, errors: [...errors, { type: "INTERNAL" }] },
+    {
+      data: null,
+      errors: [
+        { ...errors[0], path: ["addPullRequestReview", "pullRequestReview"] },
+      ],
+    },
+  ]) {
+    graphqlRejection = Response.json(payload);
+    await assert.rejects(
+      api.approveReview(request, approvalBot, false, async () => {}),
+      {
+        reason: "invalid-response",
+        uncertain: true,
+      },
+    );
+  }
+  graphqlRejection = undefined;
   loseResponse = true;
   await assert.rejects(
     api.approveReview(request, approvalBot, false, checkpoint),
@@ -1315,6 +1411,16 @@ test("GitLab approval uses the numeric MR and SHA guard and requires revision-bo
     await api.approveReview(request, approvalBot, true, checkpoint),
     "absent",
   );
+  let now = Date.now();
+  const clock = t.mock.method(Date, "now", () => now);
+  await assert.rejects(
+    api.approveReview(request, approvalBot, false, async () => {
+      now += 60_000;
+    }),
+    { reason: "not-sent", uncertain: false },
+  );
+  clock.mock.restore();
+  assert.equal(writes, 0);
   assert.equal(
     await api.approveReview(request, approvalBot, false, checkpoint),
     "approved",

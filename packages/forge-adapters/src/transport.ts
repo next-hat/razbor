@@ -23,42 +23,53 @@ async function responseText(
   return Buffer.concat(chunks).toString("utf8");
 }
 
-/** Recognize GitHub's explicit HTTP rejection and bound reads of diagnostic response bodies. */
-async function githubRateLimitRetry(response: Response) {
-  if (response.status === 403) {
-    let payload;
-    try {
-      payload = z
-        .object({
-          message: z.string().optional(),
-          errors: z
-            .array(
-              z.object({
-                type: z.string().optional(),
-                message: z.string().optional(),
-              }),
-            )
-            .optional(),
-          data: z.null().optional(),
-        })
-        .safeParse(JSON.parse(await responseText(response, 16384, false)));
-    } catch {
-      return;
-    }
-    if (!payload.success) return;
-    const messages = [payload.data, ...(payload.data.errors ?? [])];
-    if (
-      !messages.some(({ message }) =>
-        /(?:exceeded (?:a |the )?(?:secondary |primary |api )?rate limit|api rate limit exceeded)/i.test(
-          message ?? "",
-        ),
-      ) &&
-      !payload.data.errors?.some((error) => error.type === "RATE_LIMITED")
+const rateLimitMessage =
+  /(?:exceeded (?:a |the )?(?:secondary |primary |api )?rate limit|api rate limit exceeded)/i;
+
+const githubRateLimit = z.object({
+  message: z.string().optional(),
+  data: z.null().optional(),
+  errors: z
+    .array(
+      z.object({
+        type: z.string().optional(),
+        message: z.string().optional(),
+        // A field-level error can follow execution of the mutation.
+        path: z.array(z.unknown()).max(0).nullish(),
+      }),
     )
-      return;
-  } else {
-    await response.body?.cancel();
+    .nonempty()
+    .optional(),
+});
+
+/** Accept an explicit request-wide rate rejection, never a partial GraphQL result or mixed errors. */
+function githubRateLimited(value: unknown, allowTopLevelMessage: boolean) {
+  const payload = githubRateLimit.safeParse(value);
+  if (!payload.success) return false;
+  const { message, errors } = payload.data;
+  if (errors)
+    return errors.every(
+      (e) =>
+        e.type === "RATE_LIMITED" ||
+        (!e.type && rateLimitMessage.test(e.message ?? "")),
+    );
+  return allowTopLevelMessage && rateLimitMessage.test(message ?? "");
+}
+
+/** Parse only bounded diagnostic bodies on GitHub's shared permission/rate-limit status. */
+async function githubRateLimitedResponse(response: Response) {
+  try {
+    return githubRateLimited(
+      JSON.parse(await responseText(response, 16384, false)),
+      true,
+    );
+  } catch {
+    return false;
   }
+}
+
+/** Honor valid provider delay and reset headers or wait a minute before retrying. */
+function rateLimitRetry(response: Response) {
   const now = Date.now();
   const after = response.headers.get("retry-after");
   const reset =
@@ -66,7 +77,11 @@ async function githubRateLimitRetry(response: Response) {
       ? response.headers.get("x-ratelimit-reset")
       : null;
   const times = [
-    after && /^\d+$/.test(after) ? now + Number(after) * 1000 : NaN,
+    after && /^\d+$/.test(after)
+      ? now + Number(after) * 1000
+      : after
+        ? Date.parse(after)
+        : NaN,
     reset && /^\d+$/.test(reset) ? Number(reset) * 1000 : NaN,
   ].filter(
     (time) => time >= now && Number.isSafeInteger(time) && time <= 8.64e15,
@@ -104,7 +119,8 @@ export class HttpForgeTransport {
     )
       throw new ForgeOperationError("invalid-response");
     const remaining = this.deadline - Date.now();
-    if (remaining <= 0) throw new ForgeOperationError("unavailable");
+    if (remaining <= 0)
+      throw new ForgeOperationError(mutating ? "not-sent" : "unavailable");
     try {
       const response = await fetch(url, {
         method,
@@ -122,19 +138,21 @@ export class HttpForgeTransport {
       });
       if (!response.ok) {
         if (
-          mutating &&
-          this.connection.type === "github" &&
-          (response.status === 403 || response.status === 429)
+          (response.status === 429 &&
+            ["github", "gitlab"].includes(this.connection.type)) ||
+          (response.status === 403 &&
+            this.connection.type === "github" &&
+            (await githubRateLimitedResponse(response)))
         ) {
-          const retryAt = await githubRateLimitRetry(response);
-          if (retryAt !== undefined)
-            throw new ForgeOperationError(
-              "unavailable",
-              false,
-              response.status,
-              retryAt,
-            );
-        } else await response.body?.cancel();
+          if (response.status === 429) await response.body?.cancel();
+          throw new ForgeOperationError(
+            "unavailable",
+            false,
+            response.status,
+            rateLimitRetry(response),
+          );
+        }
+        if (!response.bodyUsed) await response.body?.cancel();
         const reason =
           response.status === 401 || response.status === 403
             ? "permission"
@@ -148,7 +166,23 @@ export class HttpForgeTransport {
         );
       }
       const raw = await responseText(response, 4 * 1048576, mutating);
-      return text ? raw : raw ? parse(raw) : null;
+      const value = text ? raw : raw ? parse(raw) : null;
+      if (
+        this.connection.type === "github" &&
+        route === "graphql" &&
+        githubRateLimited(
+          value,
+          response.headers.get("x-ratelimit-remaining") === "0" ||
+            response.headers.has("retry-after"),
+        )
+      )
+        throw new ForgeOperationError(
+          "unavailable",
+          false,
+          response.status,
+          rateLimitRetry(response),
+        );
+      return value;
     } catch (error) {
       if (error instanceof ForgeOperationError) throw error;
       throw new ForgeOperationError("unavailable", mutating);

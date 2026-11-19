@@ -109,7 +109,10 @@ export async function inspectGitlabMerge(
       terminal: mr.state === "merged",
     };
   if (mr.state === "merged") {
-    if (request.method === "merge" && mr.squash_commit_sha !== null)
+    if (
+      (request.method === "merge" && mr.squash_commit_sha !== null) ||
+      (request.method === "squash" && !mr.squash_commit_sha)
+    )
       return {
         ...mergeState("blocked", "merge_method_unavailable"),
         terminal: true,

@@ -178,6 +178,7 @@ export class ForgeOperationError extends Error {
       | "permission"
       | "unsupported"
       | "unavailable"
+      | "not-sent"
       | "diff-pending"
       | "invalid-response"
       | "change-closed",
@@ -187,6 +188,16 @@ export class ForgeOperationError extends Error {
     readonly retryAt?: number,
   ) {
     super(`Forge operation: ${reason}`);
+  }
+
+  /** Whether this call was refused or stopped before dispatch, without a possible remote write. */
+  get definitelyRefused() {
+    return (
+      !this.uncertain &&
+      (this.reason === "not-sent" ||
+        this.retryAt !== undefined ||
+        (this.status !== undefined && this.status >= 400 && this.status < 500))
+    );
   }
 }
 

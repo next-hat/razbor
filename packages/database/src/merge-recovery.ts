@@ -242,11 +242,7 @@ async function withdrawApproval(
     if (error instanceof ForgeOperationError && !error.uncertain) {
       // A refusal of this call cannot discharge an earlier ambiguous withdrawal.
       const rejected =
-        sentHere &&
-        !receipt.retirementSent &&
-        error.status !== undefined &&
-        error.status >= 400 &&
-        error.status < 500;
+        sentHere && !receipt.retirementSent && error.definitelyRefused;
       if (rejected || error.retryAt !== undefined)
         await persist({
           ...saved,
