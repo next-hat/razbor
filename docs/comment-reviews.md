@@ -414,10 +414,16 @@ A manual command requests a fresh review. Active continuous policies also
 respond to source revision events.
 
 If the forge's ready event was missed, refresh the pull request list. Razbor
-checks the current draft state and diff revision for tracked reviews. If the
-latest completed automatic review matches that revision and repository policy
-still permits publication, Razbor can publish its saved result without running
-the reviewer again.
+checks the PR's readiness and exact diff, then looks up the newest review of
+that revision. If the newest review was automatic and completed, Razbor can
+reopen its stale publication when repository policy permits. A newer failed
+manual review of the same revision blocks recovery of an older automatic
+result. An already published result stays published.
+
+Refresh saves each repository's PR list in one transaction. If a required
+detail request times out or the forge returns an unexpected error, Razbor
+reports that repository as incomplete and defers all its listed PR updates
+until the next refresh.
 
 ## Troubleshooting
 

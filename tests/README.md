@@ -64,10 +64,14 @@ duplicates, and that the management CLI can abandon an ambiguous bulk without
 resubmitting it or deleting another user's draft.
 For checkpoints that record the bot ID, recovery requires matching credentials
 and succeeds without an operator-supplied ID.
-It also drops a ready event after the MR's diff refs change, then verifies that
-refresh recovers the matching completed result and publishes it exactly once.
+It also drops a ready event after the MR's diff refs change, refreshes with the
+webhook disabled, and verifies that refresh after re-enablement recovers and
+publishes the matching result exactly once.
 The Forgejo fixture refreshes an unreviewed PR before its signed title edit and
-checks that the edit starts exactly one review.
+checks that the edit starts exactly one review. It also overlaps detail reads
+with a webhook and checks which readiness information survives a missing detail
+field or a changed revision. A failed detail request defers updates to another
+tracked PR and a newly listed PR until the fixture's next successful refresh.
 The status-comment fixture covers masked 404s, deletion during an active review,
 and recovery after a bot rotation through restored credentials or manual removal.
 The Forgejo provider fixture accepts web and API pull-request URLs from their

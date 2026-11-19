@@ -74,6 +74,12 @@ test(
     const observed = barrier();
     const release = barrier();
     let pauseRead = false;
+    const concurrentDetail = barrier();
+    const releaseRefresh = barrier();
+    let refreshReads: number[] | undefined;
+    let omitDetailDraft = false;
+    let staleListing = false;
+    let unavailableDetail: number | undefined;
     const server = createServer(async (req, res) => {
       const path = new URL(req.url!, "http://localhost").pathname;
       const method = req.method ?? "GET";
@@ -101,17 +107,21 @@ test(
       if (path.endsWith("/reviews")) return send([]);
       const pull = /\/pulls\/(\d+)$/.exec(path);
       /** Return the provider's current PR fields for both listing and detail reads. */
-      function pullResponse(number: number) {
+      function pullResponse(number: number, detail: boolean) {
         return {
           number,
           state: closed ? "closed" : "open",
           merged: false,
-          draft,
+          draft: number === 25 && detail && omitDetailDraft ? undefined : draft,
           title: "Review lifecycle",
           user: prAuthor,
           html_url: origin + "/team/project/pulls/" + number,
           base: { sha: base, ref: "main" },
-          head: { sha: head, ref: "fork-feature" },
+          head: {
+            sha:
+              number === 25 && !detail && staleListing ? "e".repeat(40) : head,
+            ref: "fork-feature",
+          },
           merge_base: base,
           updated_at: commandTime.toISOString(),
         };
@@ -119,17 +129,26 @@ test(
       if (path.endsWith("/pulls"))
         return send(
           new URL(req.url!, origin).searchParams.get("page") === "1"
-            ? [...observedPulls].map(pullResponse)
+            ? [...observedPulls].map((number) => pullResponse(number, false))
             : [],
         );
       if (pull) {
         const number = Number(pull[1]);
+        if (number === unavailableDetail) {
+          res.writeHead(503);
+          return send({ message: "Detail unavailable" });
+        }
         observedPulls.add(number);
-        const response = pullResponse(number);
+        const response = pullResponse(number, true);
         if (pauseRead) {
           pauseRead = false;
           observed.resolve();
           await release.promise;
+        }
+        if (refreshReads) {
+          refreshReads.push(number);
+          if (refreshReads.length === 1) await releaseRefresh.promise;
+          else concurrentDetail.resolve();
         }
         return send(response);
       }
@@ -503,6 +522,14 @@ test(
       prAuthor = { ...author, login: "ALICE" };
       await lifecycle("opened", 24);
       assert.equal((await history()).length, beforeFork + 2);
+      // Refresh may recover readiness for a completed automatic run on this revision.
+      const [reviewed] = await history();
+      const run = await beginAttempt(database, reviewed.id, "fixture", 30000);
+      assert.ok(run.kind === "started");
+      await finishAttempt(database, reviewed.id, run.attemptId, "fixture", {
+        summary: "Review complete",
+        findings: [],
+      });
       config.repositories.project.webhook!.permitted_senders = ["*"];
       await applyWebhookSettings(database, config);
       await lifecycle("opened", 25);
@@ -510,6 +537,63 @@ test(
       privateRepo = true;
       await lifecycle("synchronized", 25);
       assert.equal((await history()).length, beforeFork + 3);
+
+      // A slow detail must allow another PR to progress. A racing webhook
+      // invalidates the observed row version and requires a fresh detail.
+      refreshReads = [];
+      omitDetailDraft = true;
+      const refresh = syncPullRequests(database, [repo.id]);
+      try {
+        await Promise.race([
+          concurrentDetail.promise,
+          refresh.then(({ failures }) => {
+            throw new Error(
+              `Refresh finished before details overlapped: ${failures}`,
+            );
+          }),
+        ]);
+        draft = true;
+        await lifecycle("edited", 24);
+        draft = false;
+      } finally {
+        releaseRefresh.resolve();
+      }
+      assert.deepEqual((await refresh).failures, []);
+      assert.equal(refreshReads.filter((number) => number === 24).length, 3);
+      refreshReads = undefined;
+      /** Read readiness directly to distinguish a confirmed ready PR from an unknown state. */
+      const savedDraft = async (number: number) =>
+        (
+          await database.pool.query(
+            "select draft from pull_requests where number = $1",
+            [number],
+          )
+        ).rows[0].draft;
+      assert.equal(await savedDraft(24), false);
+      assert.equal(await savedDraft(25), false);
+      staleListing = true;
+      observedPulls.add(26);
+      unavailableDetail = 24;
+      assert.deepEqual((await syncPullRequests(database, [repo.id])).failures, [
+        repo.id,
+      ]);
+      assert.equal(await savedDraft(25), false);
+      assert.ok(
+        !(await listPullRequests(database, [repo.id])).some(
+          (item) => item.number === 26,
+        ),
+      );
+      unavailableDetail = undefined;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.equal(await savedDraft(25), null);
+      assert.ok(
+        (await listPullRequests(database, [repo.id])).some(
+          (item) => item.number === 26,
+        ),
+      );
     } finally {
       release.resolve();
       delete process.env.RAZBOR_TEST_TRIGGER_SECRET;
@@ -1066,6 +1150,31 @@ test(
         "stale",
       );
       assert.equal(bulkRequests, 0);
+      // An open listing without a verified diff cannot offer the saved verdict.
+      diffReady = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.equal(
+        (await publicationView(database, followup.id))?.publication?.state,
+        "stale",
+      );
+      diffReady = true;
+      // Refresh observes the ready revision while the hook is off. After
+      // re-enabling it, the same generation must rearm the saved review.
+      config.repositories.project.webhook!.enabled = false;
+      await applyWebhookSettings(database, config);
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.equal(
+        (await publicationView(database, followup.id))?.publication?.state,
+        "stale",
+      );
+      config.repositories.project.webhook!.enabled = true;
+      await applyWebhookSettings(database, config);
       assert.deepEqual(
         (await syncPullRequests(database, [repo.id])).failures,
         [],

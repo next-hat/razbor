@@ -245,15 +245,48 @@ function validateListing(changes: ForgePullRequest[]) {
 type RefreshChange = ForgePullRequest &
   Partial<Pick<ForgeChange, "mergeBase" | "startSha">>;
 
-/** List open PRs and verify the readiness and exact diff of those with review history or an active session. */
+/** Read the exact revision of a tracked PR, keeping listing readiness only for the same revision and title. */
+async function readTrackedChange(
+  api: Forge,
+  summary: ForgePullRequest,
+): Promise<RefreshChange | undefined> {
+  try {
+    const detail = await api.change(summary.number);
+    const sameRevision =
+      detail.headSha === summary.headSha &&
+      detail.baseSha === summary.baseSha &&
+      detail.title === summary.title;
+    return {
+      ...summary,
+      ...detail,
+      draft: detail.draft ?? (sameRevision ? summary.draft : undefined),
+    };
+  } catch (error) {
+    if (error instanceof ForgeOperationError) {
+      if (error.reason === "change-closed") return undefined;
+      if (error.reason === "diff-pending" && api.type === "gitlab")
+        return { ...summary, draft: undefined };
+    }
+    throw error;
+  }
+}
+
+/** Read open PRs and verify their tracked revisions, optionally rereading just one contested PR. */
 async function readOpenPullRequests(
   database: Database,
   repositoryId: string,
   api: Forge,
+  deadline: number,
+  retryNumber?: number,
 ) {
+  const listingStartedAt = new Date();
   const listed = await api.openChanges();
   validateListing(listed);
-  const savedRows = listed.length
+  const selected =
+    retryNumber === undefined
+      ? listed
+      : listed.filter((change) => change.number === retryNumber);
+  const savedRows = selected.length
     ? await database.db
         .select({
           number: pullRequests.number,
@@ -272,43 +305,45 @@ async function readOpenPullRequests(
             eq(pullRequests.repositoryId, repositoryId),
             inArray(
               pullRequests.number,
-              listed.map((change) => change.number),
+              selected.map((change) => change.number),
             ),
           ),
         )
     : [];
   const saved = new Map(savedRows.map((row) => [row.number, row]));
-  const changes: RefreshChange[] = [];
-  for (const summary of listed) {
-    if (!saved.get(summary.number)?.tracked) {
-      changes.push(summary);
-      continue;
-    }
-    // Listings do not guarantee the immutable diff refs used by retries and publication.
-    // Read the complete revision for review sessions only, within the same provider deadline.
-    try {
-      changes.push({
-        ...summary,
-        ...(await api.change(summary.number)),
-      });
-    } catch (error) {
-      if (!(error instanceof ForgeOperationError)) throw error;
-      if (error.reason === "diff-pending" && api.type === "gitlab") {
-        changes.push({ ...summary, draft: undefined });
-      } else if (error.reason !== "change-closed") {
-        throw error;
-      }
-      // A closed detail is omitted here and must pass the closure check below.
+  const observations = selected.map((change: RefreshChange) => ({
+    change,
+    before: saved.get(change.number),
+    listingStartedAt,
+  }));
+  const changes = new Map(observations.map((row) => [row.change.number, row]));
+  const tracked = observations.filter((row) => row.before?.tracked);
+  const batchSize = 4;
+  for (let offset = 0; offset < tracked.length; offset += batchSize) {
+    if (Date.now() >= deadline) throw new Error("Provider refresh timed out");
+    const batch = tracked.slice(offset, offset + batchSize);
+    // Drain all in-flight reads before failing the repository or starting the next batch.
+    const details = await Promise.allSettled(
+      batch.map((row) => readTrackedChange(api, row.change)),
+    );
+    for (const [index, detail] of details.entries()) {
+      if (detail.status === "rejected") throw detail.reason;
+      const row = batch[index];
+      if (detail.value) row.change = detail.value;
+      else changes.delete(row.change.number);
     }
   }
-  return { changes, saved };
+  return changes;
 }
 
-/** Identify the closure to reread after a concurrent webhook invalidates the refresh transaction. */
-class ClosureChanged extends Error {
-  /** Retain the provider PR number so other confirmed closures keep their original observation times. */
-  constructor(readonly number: number) {
-    super("Pull request changed during closure verification");
+/** Identify the provider observation to repeat after a concurrent webhook invalidates the refresh transaction. */
+class ObservationChanged extends Error {
+  /** Leave unrelated PR observations intact when rereading the contested PR. */
+  constructor(
+    readonly number: number,
+    readonly state: "open" | "closed",
+  ) {
+    super("Pull request changed during refresh");
   }
 }
 
@@ -375,7 +410,7 @@ export async function syncPullRequests(
               : undefined,
             ...(app ? { githubAppBot: app.bot } : {}),
           };
-          const listingStartedAt = new Date();
+          const deadline = Date.now() + 20000;
           const verified = await verifyRepository(
             connection,
             selector,
@@ -386,15 +421,15 @@ export async function syncPullRequests(
             verified.fullPath !== selector
           )
             throw new Error("Verified repository identity changed");
-          const remainingBudget =
-            20000 - (Date.now() - listingStartedAt.getTime());
+          const remainingBudget = deadline - Date.now();
           if (remainingBudget <= 0)
             throw new Error("Provider refresh timed out");
           const api = createForge(connection, selector, remainingBudget);
-          const { changes, saved } = await readOpenPullRequests(
+          const changes = await readOpenPullRequests(
             database,
             repo.id,
             api,
+            deadline,
           );
           const absent = await database.db
             .select({ number: pullRequests.number })
@@ -403,11 +438,8 @@ export async function syncPullRequests(
               and(
                 eq(pullRequests.repositoryId, repo.id),
                 eq(pullRequests.state, "open"),
-                changes.length
-                  ? notInArray(
-                      pullRequests.number,
-                      changes.map((change) => change.number),
-                    )
+                changes.size
+                  ? notInArray(pullRequests.number, [...changes.keys()])
                   : undefined,
               ),
             );
@@ -415,9 +447,10 @@ export async function syncPullRequests(
             number,
             { rowVersion: string; observedAt: Date }
           >();
+          const retriedOpen = new Set<number>();
 
-          /** Fence each authoritative close read against concurrent observations, including a same-revision open. */
-          async function observeClosure(number: number) {
+          /** Fence a verified close against concurrent opens. A contested open PR must be accounted for on retry. */
+          async function observeClosure(number: number, requireClosed = false) {
             closedObservations.delete(number);
             const [before] = await database.db
               // A same-revision open keeps the trigger generation and can even
@@ -431,18 +464,21 @@ export async function syncPullRequests(
                   eq(pullRequests.state, "open"),
                 ),
               );
-            if (!before) return;
+            if (!before && !requireClosed) return;
             try {
               await api.change(number);
+              if (requireClosed)
+                throw new Error("Open pull request missing from refresh");
             } catch (error) {
               if (
                 error instanceof ForgeOperationError &&
                 error.reason === "change-closed"
               ) {
-                closedObservations.set(number, {
-                  ...before,
-                  observedAt: new Date(),
-                });
+                if (before)
+                  closedObservations.set(number, {
+                    ...before,
+                    observedAt: new Date(),
+                  });
               } else {
                 throw error;
               }
@@ -450,7 +486,7 @@ export async function syncPullRequests(
           }
           for (const { number } of absent) await observeClosure(number);
 
-          /** Either commit the entire provider snapshot or roll back the batch for a fresh close observation. */
+          /** Commit the repository snapshot atomically, rolling back if a tracked observation needs a fresh read. */
           async function saveSnapshot(tx: Transaction) {
             const syncedAt = new Date();
             // Also fence admission for a first observation, before a PR row exists to lock.
@@ -490,8 +526,11 @@ export async function syncPullRequests(
               })
               .from(repositoryWebhooks)
               .where(eq(repositoryWebhooks.repositoryId, repo.id));
-            for (const change of changes) {
-              const before = saved.get(change.number);
+            for (const {
+              change,
+              before,
+              listingStartedAt,
+            } of changes.values()) {
               const values = {
                 title: change.title,
                 url: change.url,
@@ -561,17 +600,18 @@ export async function syncPullRequests(
                   optedIn: pullRequests.continuousReviewSince,
                 });
               if (
-                !before ||
-                !updated ||
-                updated.generation === before.generation
+                !updated &&
+                (before?.tracked || retriedOpen.has(change.number))
               )
-                continue;
+                throw new ObservationChanged(change.number, "open");
+              if (!before || !updated) continue;
               if (change.draft === true) {
-                await supersedeQueuedAutomaticReviews(
-                  tx,
-                  repo.id,
-                  change.number,
-                );
+                if (updated.generation !== before.generation)
+                  await supersedeQueuedAutomaticReviews(
+                    tx,
+                    repo.id,
+                    change.number,
+                  );
                 continue;
               }
               if (
@@ -612,7 +652,7 @@ export async function syncPullRequests(
                   ),
                 )
                 .returning({ number: pullRequests.number });
-              if (!closed) throw new ClosureChanged(number);
+              if (!closed) throw new ObservationChanged(number, "closed");
               await supersedeQueuedAutomaticReviews(tx, repo.id, number);
             }
           }
@@ -622,11 +662,33 @@ export async function syncPullRequests(
               return true;
             } catch (error) {
               if (
-                !(error instanceof ClosureChanged) ||
-                Date.now() - listingStartedAt.getTime() >= 20000
+                !(error instanceof ObservationChanged) ||
+                Date.now() >= deadline
               )
                 throw error;
-              await observeClosure(error.number);
+              if (error.state === "closed") {
+                await observeClosure(
+                  error.number,
+                  retriedOpen.has(error.number),
+                );
+              } else {
+                // Each contested open PR gets one fresh listing and detail under the same deadline.
+                if (retriedOpen.has(error.number)) throw error;
+                retriedOpen.add(error.number);
+                const reread = await readOpenPullRequests(
+                  database,
+                  repo.id,
+                  api,
+                  deadline,
+                  error.number,
+                );
+                const fresh = reread.get(error.number);
+                if (fresh) changes.set(error.number, fresh);
+                else {
+                  changes.delete(error.number);
+                  await observeClosure(error.number, true);
+                }
+              }
             }
           }
         },
