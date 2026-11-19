@@ -20,6 +20,8 @@ export type ForgeChange = {
 
 export type ForgePullRequest = {
   number: number;
+  /** Readiness reported by the listing, when the provider includes it. */
+  draft?: boolean;
   title: string;
   url: string;
   author?: string;

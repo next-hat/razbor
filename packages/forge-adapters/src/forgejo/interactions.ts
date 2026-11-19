@@ -343,6 +343,7 @@ export class ForgejoInteractions implements Forge {
             number,
             state: z.literal("open"),
             merged: z.literal(false),
+            draft: z.boolean().optional(),
             title: z.string(),
             html_url: z.string().url(),
             user: user.nullable().optional(),
@@ -370,6 +371,7 @@ export class ForgejoInteractions implements Forge {
         seen.add(pull.number);
         result.push({
           number: pull.number,
+          draft: pull.draft,
           title: pull.title,
           url: pull.html_url,
           author: pull.user?.login,

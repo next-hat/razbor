@@ -4,6 +4,7 @@ import {
   eq,
   inArray,
   isNotNull,
+  lt,
   lte,
   notInArray,
   or,
@@ -15,6 +16,8 @@ import {
   createForge,
   ForgeOperationError,
   verifyRepository,
+  type Forge,
+  type ForgeChange,
   type ForgePullRequest,
 } from "@razbor/forge-adapters";
 
@@ -23,7 +26,10 @@ import { getRepositoryGithubApp } from "@database/src/github-apps.js";
 import { publicId } from "@database/src/ids.js";
 import { readSecret } from "@database/src/registry.js";
 import {
+  allowsAutomaticAuthor,
+  latestRevisionReview,
   lockReviewTriggerChanges,
+  rearmRefreshedPublication,
   supersedeQueuedAutomaticReviews,
 } from "@database/src/review-triggers.js";
 import { reviewView, reviewViewSelection } from "@database/src/review-view.js";
@@ -236,6 +242,68 @@ function validateListing(changes: ForgePullRequest[]) {
   }
 }
 
+type RefreshChange = ForgePullRequest &
+  Partial<Pick<ForgeChange, "mergeBase" | "startSha">>;
+
+/** List open PRs and verify the readiness and exact diff of those with review history or an active session. */
+async function readOpenPullRequests(
+  database: Database,
+  repositoryId: string,
+  api: Forge,
+) {
+  const listed = await api.openChanges();
+  validateListing(listed);
+  const savedRows = listed.length
+    ? await database.db
+        .select({
+          number: pullRequests.number,
+          draft: pullRequests.draft,
+          generation: pullRequests.triggerGeneration,
+          rowVersion: sql<string>`xmin::text`,
+          tracked: sql<boolean>`${pullRequests.mergeBase} is not null
+            or ${pullRequests.continuousReviewSince} is not null
+            or exists (select 1 from review_triggers t
+              where t.repository_id = pull_requests.repository_id
+              and t.change->>'number' = pull_requests.number::text)`,
+        })
+        .from(pullRequests)
+        .where(
+          and(
+            eq(pullRequests.repositoryId, repositoryId),
+            inArray(
+              pullRequests.number,
+              listed.map((change) => change.number),
+            ),
+          ),
+        )
+    : [];
+  const saved = new Map(savedRows.map((row) => [row.number, row]));
+  const changes: RefreshChange[] = [];
+  for (const summary of listed) {
+    if (!saved.get(summary.number)?.tracked) {
+      changes.push(summary);
+      continue;
+    }
+    // Listings do not guarantee the immutable diff refs used by retries and publication.
+    // Read the complete revision for review sessions only, within the same provider deadline.
+    try {
+      changes.push({
+        ...summary,
+        ...(await api.change(summary.number)),
+      });
+    } catch (error) {
+      if (!(error instanceof ForgeOperationError)) throw error;
+      if (error.reason === "diff-pending" && api.type === "gitlab") {
+        changes.push({ ...summary, draft: undefined });
+      } else if (error.reason !== "change-closed") {
+        throw error;
+      }
+      // A closed detail is omitted here and must pass the closure check below.
+    }
+  }
+  return { changes, saved };
+}
+
 /** Identify the closure to reread after a concurrent webhook invalidates the refresh transaction. */
 class ClosureChanged extends Error {
   /** Retain the provider PR number so other confirmed closures keep their original observation times. */
@@ -323,8 +391,11 @@ export async function syncPullRequests(
           if (remainingBudget <= 0)
             throw new Error("Provider refresh timed out");
           const api = createForge(connection, selector, remainingBudget);
-          const changes = await api.openChanges();
-          validateListing(changes);
+          const { changes, saved } = await readOpenPullRequests(
+            database,
+            repo.id,
+            api,
+          );
           const absent = await database.db
             .select({ number: pullRequests.number })
             .from(pullRequests)
@@ -384,7 +455,10 @@ export async function syncPullRequests(
             const syncedAt = new Date();
             // Also fence admission for a first observation, before a PR row exists to lock.
             const [current] = await tx
-              .select({ id: repositories.id })
+              .select({
+                id: repositories.id,
+                mode: repositories.reviewTriggerMode,
+              })
               .from(repositories)
               .where(
                 and(
@@ -409,7 +483,15 @@ export async function syncPullRequests(
               .for("share");
             if (currentForge?.updatedAt.getTime() !== forge.updatedAt.getTime())
               throw new Error("Forge configuration changed during refresh");
+            const [hook] = await tx
+              .select({
+                enabled: repositoryWebhooks.enabled,
+                senders: repositoryWebhooks.senders,
+              })
+              .from(repositoryWebhooks)
+              .where(eq(repositoryWebhooks.repositoryId, repo.id));
             for (const change of changes) {
+              const before = saved.get(change.number);
               const values = {
                 title: change.title,
                 url: change.url,
@@ -417,12 +499,33 @@ export async function syncPullRequests(
                 author: change.author ?? null,
                 headSha: change.headSha,
                 baseSha: change.baseSha,
+                draft: change.draft ?? null,
+                mergeBase: change.mergeBase ?? null,
+                startSha: change.startSha ?? null,
                 headBranch: change.headBranch ?? null,
                 baseBranch: change.baseBranch ?? null,
                 updatedAt: new Date(change.updatedAt),
                 syncedAt,
               };
-              await tx
+              if (
+                forge.type === "forgejo" &&
+                before &&
+                before.draft !== false &&
+                change.draft === false &&
+                change.mergeBase
+              ) {
+                const existing = await latestRevisionReview(
+                  tx,
+                  repo.id,
+                  { ...change, mergeBase: change.mergeBase },
+                  false,
+                );
+                // A signed Forgejo title edit can admit the first review or reoffer
+                // a completed manual review. Refresh only reoffers automatic results.
+                if (existing?.origin !== "automatic")
+                  values.draft = before.draft;
+              }
+              const [updated] = await tx
                 .insert(pullRequests)
                 .values({
                   ...values,
@@ -437,12 +540,58 @@ export async function syncPullRequests(
                     ...values,
                     // A webhook that read the previous revision must refresh before admission.
                     triggerGeneration: sql`${pullRequests.triggerGeneration} + case
-                      when (${pullRequests.state}, ${pullRequests.headSha}, ${pullRequests.baseSha})
-                        is distinct from (excluded.state, excluded.head_sha, excluded.base_sha)
+                      when (${pullRequests.state}, ${pullRequests.headSha}, ${pullRequests.baseSha}, ${pullRequests.draft}, ${pullRequests.mergeBase}, ${pullRequests.startSha})
+                        is distinct from (excluded.state, excluded.head_sha, excluded.base_sha, excluded.draft, excluded.merge_base, excluded.start_sha)
                       then 1 else 0 end`,
                   },
-                  setWhere: lte(pullRequests.syncedAt, listingStartedAt),
+                  // A webhook may have updated the row during the listing or the detail read.
+                  setWhere: before
+                    ? and(
+                        // For tied timestamps only a detail read made after the
+                        // saved row was observed can safely supersede its state.
+                        change.mergeBase
+                          ? lte(pullRequests.syncedAt, listingStartedAt)
+                          : lt(pullRequests.syncedAt, listingStartedAt),
+                        sql`${pullRequests}.xmin = ${before.rowVersion}::xid`,
+                      )
+                    : sql`false`,
+                })
+                .returning({
+                  generation: pullRequests.triggerGeneration,
+                  optedIn: pullRequests.continuousReviewSince,
                 });
+              if (
+                !before ||
+                !updated ||
+                updated.generation === before.generation
+              )
+                continue;
+              if (change.draft === true) {
+                await supersedeQueuedAutomaticReviews(
+                  tx,
+                  repo.id,
+                  change.number,
+                );
+                continue;
+              }
+              if (
+                hook?.enabled &&
+                values.draft === false &&
+                change.mergeBase &&
+                ((current.mode === "automatic" &&
+                  allowsAutomaticAuthor(
+                    verified.visibility,
+                    change.author,
+                    hook.senders,
+                  )) ||
+                  (current.mode === "opt_in_continuous" && updated.optedIn))
+              )
+                await rearmRefreshedPublication(
+                  tx,
+                  repo.id,
+                  { ...change, mergeBase: change.mergeBase },
+                  updated.generation,
+                );
             }
             for (const [number, observation] of closedObservations) {
               const [closed] = await tx

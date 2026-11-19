@@ -368,6 +368,7 @@ export class GithubForge implements Forge {
           z.object({
             number,
             state: z.literal("open"),
+            draft: z.boolean().optional(),
             title: z.string(),
             html_url: z.string().url(),
             user: user.nullable(),
@@ -395,6 +396,7 @@ export class GithubForge implements Forge {
         seen.add(pull.number);
         result.push({
           number: pull.number,
+          draft: pull.draft,
           title: pull.title,
           url: pull.html_url,
           author: pull.user?.login,

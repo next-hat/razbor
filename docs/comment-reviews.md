@@ -413,6 +413,12 @@ If base or head commits change before publication, razbor reports a stale review
 A manual command requests a fresh review. Active continuous policies also
 respond to source revision events.
 
+If the forge's ready event was missed, refresh the pull request list. Razbor
+checks the current draft state and diff revision for tracked reviews. If the
+latest completed automatic review matches that revision and repository policy
+still permits publication, Razbor can publish its saved result without running
+the reviewer again.
+
 ## Troubleshooting
 
 | Problem                                | What to check                                                                                                                     |

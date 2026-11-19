@@ -438,6 +438,8 @@ export class GitlabForge implements Forge {
           z.object({
             iid: integer,
             state: z.literal("opened"),
+            draft: z.boolean().optional(),
+            work_in_progress: z.boolean().optional(),
             title: z.string(),
             web_url: z.string().url(),
             author: actor.nullable(),
@@ -475,6 +477,7 @@ export class GitlabForge implements Forge {
         }
         result.push({
           number: pull.iid,
+          draft: pull.draft ?? pull.work_in_progress,
           title: pull.title,
           url: pull.web_url,
           author: pull.author?.username,

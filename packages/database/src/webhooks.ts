@@ -28,6 +28,7 @@ import {
 
 import {
   acceptReviewTrigger,
+  allowsAutomaticAuthor,
   lockReviewTriggerChanges,
   reviewSubmissionLock,
   reviewTriggerSession,
@@ -942,22 +943,6 @@ function webhookErrorReason(error: unknown) {
   if (error instanceof ForgeOperationError) return error.reason;
   if (error instanceof z.ZodError) return "invalid-data";
   return "unavailable";
-}
-
-/** Public fully automatic reviews require an explicit case-insensitive match for the forge's PR author. */
-function allowsAutomaticAuthor(
-  visibility: RepositoryMetadata["visibility"] | undefined,
-  author: string | null | undefined,
-  senders: string[],
-) {
-  if (visibility !== "public")
-    return visibility === "private" || visibility === "internal";
-  const login = author?.toLowerCase();
-  return (
-    !!login &&
-    login !== "*" &&
-    senders.some((sender) => sender.toLowerCase() === login)
-  );
 }
 
 /** Queue policy-authorized work for the current revision and greet a newly opened PR once. */

@@ -22,6 +22,7 @@ import {
   publicationView,
   listPullRequests,
   submitReview,
+  syncPullRequests,
   webhookView,
 } from "@razbor/database";
 import { applyRegistry, registrySchema } from "@razbor/database/registry";
@@ -69,6 +70,7 @@ test(
       }
     >();
     const mutations: string[] = [];
+    const observedPulls = new Set<number>();
     const observed = barrier();
     const release = barrier();
     let pauseRead = false;
@@ -98,9 +100,9 @@ test(
       if (path.endsWith("/reactions")) return send(method === "GET" ? [] : {});
       if (path.endsWith("/reviews")) return send([]);
       const pull = /\/pulls\/(\d+)$/.exec(path);
-      if (pull) {
-        const number = Number(pull[1]);
-        const response = {
+      /** Return the provider's current PR fields for both listing and detail reads. */
+      function pullResponse(number: number) {
+        return {
           number,
           state: closed ? "closed" : "open",
           merged: false,
@@ -111,7 +113,19 @@ test(
           base: { sha: base, ref: "main" },
           head: { sha: head, ref: "fork-feature" },
           merge_base: base,
+          updated_at: commandTime.toISOString(),
         };
+      }
+      if (path.endsWith("/pulls"))
+        return send(
+          new URL(req.url!, origin).searchParams.get("page") === "1"
+            ? [...observedPulls].map(pullResponse)
+            : [],
+        );
+      if (pull) {
+        const number = Number(pull[1]);
+        observedPulls.add(number);
+        const response = pullResponse(number);
         if (pauseRead) {
           pauseRead = false;
           observed.resolve();
@@ -359,6 +373,11 @@ test(
       await lifecycle("opened", 9);
       assert.equal((await history()).length, 5);
       draft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.equal((await history()).length, 5);
       await lifecycle("edited", 9);
       assert.equal((await history()).length, 6);
       await lifecycle("synchronized", 9);
@@ -507,12 +526,13 @@ test(
     const fixture = await databaseFixture();
     const secret = "b".repeat(64);
     process.env.RAZBOR_TEST_MR_SECRET = secret;
-    const base = "1".repeat(40),
-      target = "2".repeat(40),
+    const target = "2".repeat(40),
       head = "3".repeat(40);
+    let base = "1".repeat(40);
     let start = target;
     let iid = 27;
     let diffReady = false;
+    let draft = false;
     let closed = false;
     let draftNote: { id: number; author_id: number; note: string } | undefined;
     const closedCommandRead = barrier();
@@ -557,24 +577,39 @@ test(
               : []
             : { id: 1 },
         );
-      if (path.endsWith("/merge_requests/" + iid))
-        return send({
+      if (
+        path.endsWith("/merge_requests/" + iid) ||
+        path.endsWith("/merge_requests")
+      ) {
+        const mr = {
           iid,
           project_id: 1,
           source_project_id: 2,
           target_project_id: 1,
           sha: head,
           state: closed ? "closed" : "opened",
-          draft: false,
+          draft,
           title: "Fork MR",
           author: { id: 2, username: "alice" },
           web_url: origin + "/team/project/-/merge_requests/" + iid,
           target_branch: "main",
           source_branch: "fork-branch",
+          updated_at: "2026-01-01T00:00:00Z",
+        };
+        if (path.endsWith("/merge_requests"))
+          return send(
+            !closed &&
+              new URL(req.url!, origin).searchParams.get("page") === "1"
+              ? [mr]
+              : [],
+          );
+        return send({
+          ...mr,
           diff_refs: diffReady
             ? { start_sha: start, base_sha: base, head_sha: head }
             : {},
         });
+      }
       if (path.endsWith("/repository/branches/main"))
         return send({ name: "main", commit: { id: target } });
       if (path.endsWith("/draft_notes"))
@@ -584,10 +619,30 @@ test(
         res.statusCode = 404;
         return send({});
       }
-      if (path.endsWith("/draft_notes/bulk_publish")) bulkRequests++;
+      if (path.endsWith("/draft_notes/bulk_publish")) {
+        bulkRequests++;
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk);
+        summaryNote = {
+          id: 53,
+          body: JSON.parse(Buffer.concat(chunks).toString()).note,
+          author: { id: 9, username: "razbor" },
+          created_at: "2026-01-02T00:00:00Z",
+        };
+        return send({});
+      }
+      if (path.endsWith("/approvals")) return send({ user_can_approve: true });
+      if (path.endsWith("/reviewers"))
+        return send([
+          { user: { id: 9, username: "razbor" }, state: "requested_changes" },
+        ]);
       if (path.endsWith("/discussions")) return send(discussions);
       if (path.endsWith("/raw_diffs")) return res.end(diff);
-      if (path.endsWith("/notes/52") && req.method === "PUT" && summaryNote) {
+      if (
+        summaryNote &&
+        path.endsWith("/notes/" + summaryNote.id) &&
+        req.method === "PUT"
+      ) {
         const chunks: Buffer[] = [];
         for await (const chunk of req) chunks.push(chunk);
         summaryNote.body = JSON.parse(Buffer.concat(chunks).toString()).body;
@@ -977,6 +1032,17 @@ test(
         ]),
         [["52:61", anchored.title]],
       );
+      // A draft update changes only GitLab's diff refs. The MR returns to its
+      // reviewed revision without a ready webhook and the list omits diff_refs.
+      const reviewedBase = base;
+      const reviewedStart = start;
+      base = "a".repeat(40);
+      start = "b".repeat(40);
+      draft = true;
+      assert.equal(await deliver("mr-draft-during-attempt", "update"), 200);
+      base = reviewedBase;
+      start = reviewedStart;
+      draft = false;
       await finishAttempt(
         database,
         followup.id,
@@ -994,8 +1060,26 @@ test(
         },
       );
       await processInteraction(database, followup.id);
-      const frozen = (await publicationView(database, followup.id))?.publication
-        ?.reviewPayload;
+      assert.equal(
+        (await publicationView(database, followup.id))?.publication?.state,
+        "stale",
+      );
+      assert.equal(bulkRequests, 0);
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      const refreshed = (await publicationView(database, followup.id))
+        ?.publication;
+      assert.equal(refreshed?.state, "pending");
+      assert.equal(refreshed.rearmed, true);
+      await processInteraction(database, followup.id);
+      const published = (await publicationView(database, followup.id))
+        ?.publication;
+      assert.equal(published?.state, "published");
+      assert.equal(published.remoteId, "53");
+      assert.equal(bulkRequests, 1);
+      const frozen = published.reviewPayload;
       assert.ok(frozen);
       assert.deepEqual(frozen.comments, []);
       assert.equal(frozen.recapReviewId, undefined);

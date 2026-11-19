@@ -5,6 +5,7 @@ import type {
   ForgeChange,
   ForgeType,
   ForgeWebhook,
+  RepositoryMetadata,
 } from "@razbor/forge-adapters";
 
 import { snapshotRepositoryAgent } from "@database/src/agents.js";
@@ -31,6 +32,11 @@ const supersededPublication = {
 } as const;
 
 type ChangeEvent = Exclude<ForgeWebhook, { kind: "ping" | "push" }>;
+
+type ReviewRevision = Pick<
+  ForgeChange,
+  "number" | "headSha" | "baseSha" | "mergeBase" | "startSha"
+>;
 
 type Observation = {
   event: ChangeEvent;
@@ -68,6 +74,22 @@ function sameChange(repositoryId: string, number?: number) {
     number === undefined
       ? undefined
       : sql`${reviewTriggers.change}->>'number' = ${String(number)}`,
+  );
+}
+
+/** Public fully automatic reviews require an explicit case-insensitive match for the forge's PR author. */
+export function allowsAutomaticAuthor(
+  visibility: RepositoryMetadata["visibility"] | undefined,
+  author: string | null | undefined,
+  senders: string[],
+) {
+  if (visibility !== "public")
+    return visibility === "private" || visibility === "internal";
+  const login = author?.toLowerCase();
+  return (
+    !!login &&
+    login !== "*" &&
+    senders.some((sender) => sender.toLowerCase() === login)
   );
 }
 
@@ -212,6 +234,63 @@ export async function reviewTriggerSession(
   };
 }
 
+/**
+ * Find the latest code review of the same PR and diff, including older source-only records.
+ * Admission may retry a failed run. Refresh must respect a newer failed run as well.
+ */
+export async function latestRevisionReview(
+  tx: Transaction,
+  repositoryId: string,
+  change: ReviewRevision,
+  includeFailed: boolean,
+) {
+  const [latest] = await tx
+    .select({
+      id: reviews.id,
+      status: reviews.status,
+      origin: reviewTriggers.origin,
+    })
+    .from(reviews)
+    .leftJoin(reviewTriggers, eq(reviews.id, reviewTriggers.reviewId))
+    .where(
+      and(
+        eq(reviews.repositoryId, repositoryId),
+        eq(reviews.headSha, change.headSha),
+        eq(reviews.baseSha, change.mergeBase),
+        or(
+          and(
+            sameChange(repositoryId, change.number),
+            sql`${reviewTriggers.change}->>'baseSha' = ${change.baseSha}`,
+            sql`${reviewTriggers.change}->>'startSha' is not distinct from ${change.startSha ?? null}`,
+          ),
+          and(
+            isNull(reviewTriggers.reviewId),
+            sql`${reviews.source}->'pullRequest'->>'number' = ${String(change.number)} and ${reviews.source}->'pullRequest'->>'baseSha' = ${change.baseSha}`,
+          ),
+        ),
+        sql`${reviews.source}->>'conversation' is null`,
+        includeFailed
+          ? undefined
+          : inArray(reviews.status, ["queued", "running", "completed"]),
+      ),
+    )
+    .orderBy(desc(reviews.createdAt), desc(reviews.publicId))
+    .limit(1);
+  return latest;
+}
+
+/** Reoffer the latest completed automatic result after refresh verifies its revision and policy eligibility. */
+export async function rearmRefreshedPublication(
+  tx: Transaction,
+  repositoryId: string,
+  change: ReviewRevision,
+  generation: number,
+) {
+  const latest = await latestRevisionReview(tx, repositoryId, change, true);
+  if (latest?.status === "completed" && latest.origin === "automatic")
+    await rearmStalePublication(tx, latest.id, generation);
+}
+
 /** Snapshot a verified provider change and route both origins through the same immutable attempt and publication pipeline. */
 async function queueReview(
   tx: Transaction,
@@ -228,36 +307,7 @@ async function queueReview(
   // fences runner reservation: only an unstarted review may receive a new revision.
   let queued: typeof reviews.$inferSelect | undefined;
   if (automatic) {
-    const [existing] = await tx
-      .select({
-        id: reviews.id,
-        status: reviews.status,
-        triggerId: reviewTriggers.id,
-      })
-      .from(reviews)
-      .leftJoin(reviewTriggers, eq(reviews.id, reviewTriggers.reviewId))
-      .where(
-        and(
-          eq(reviews.repositoryId, repo.id),
-          eq(reviews.headSha, change.headSha),
-          eq(reviews.baseSha, change.mergeBase),
-          or(
-            and(
-              sameChange(repo.id, change.number),
-              sql`${reviewTriggers.change}->>'baseSha' = ${change.baseSha}`,
-              sql`${reviewTriggers.change}->>'startSha' is not distinct from ${change.startSha ?? null}`,
-            ),
-            and(
-              isNull(reviewTriggers.reviewId),
-              sql`${reviews.source}->'pullRequest'->>'number' = ${String(change.number)} and ${reviews.source}->'pullRequest'->>'baseSha' = ${change.baseSha}`,
-            ),
-          ),
-          sql`${reviews.source}->>'conversation' is null`,
-          inArray(reviews.status, ["queued", "running", "completed"]),
-        ),
-      )
-      .orderBy(desc(reviews.createdAt), desc(reviews.publicId))
-      .limit(1);
+    const existing = await latestRevisionReview(tx, repo.id, change, false);
     if (existing) {
       await supersedeQueuedAutomaticReviews(
         tx,
@@ -265,7 +315,7 @@ async function queueReview(
         change.number,
         existing.id,
       );
-      if (existing.status === "completed" && existing.triggerId)
+      if (existing.status === "completed" && existing.origin)
         await rearmStalePublication(tx, existing.id, generation);
       return undefined;
     }
