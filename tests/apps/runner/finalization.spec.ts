@@ -781,6 +781,79 @@ test("failed verification is retained even when the model claims full merge read
   );
 });
 
+for (const recover of [true, false]) {
+  test(
+    recover
+      ? "complete pinned exec output recovers a failed source read"
+      : "partial and unrelated exec output preserve a failed source read",
+    async (t) => {
+      const f = await fixture(t, "openai", [
+        () => {
+          renameSync(tree, tree + ".offline");
+          return {
+            call: {
+              name: "read_file",
+              id: "interrupted",
+              args: { path: "source.ts" },
+            },
+          };
+        },
+        (payload) => {
+          const observation = toolBlocks("openai", payload).at(-1);
+          assert.match(String(observation?.output), /\(failed;.*Tool error:/s);
+          renameSync(tree + ".offline", tree);
+          return {
+            call: {
+              id: "baseline",
+              argv: ["git", "show", f.files.base + ":source.ts"],
+            },
+          };
+        },
+        () => ({ call: { id: "other-file", argv: ["cat", "related.ts"] } }),
+        () => ({
+          call: {
+            id: "source",
+            argv: recover
+              ? ["git", "show", f.files.head + ":source.ts"]
+              : ["head", "-n", "1", "source.ts"],
+          },
+        }),
+        (payload) => {
+          const outputs = toolBlocks("openai", payload).filter(
+            (item) =>
+              item.type === "function_call_output" &&
+              item.call_id !== "interrupted",
+          );
+          assert.equal(outputs.length, 3);
+          for (const output of outputs)
+            assert.match(String(output.output), /"ok":true,/);
+          return {
+            text: JSON.stringify({
+              ...result,
+              mergeAssessment: readyAssessment,
+            }),
+          };
+        },
+      ]);
+      const tree = await fixtureObjectPath(
+        f.files.repository,
+        f.files.head + "^{tree}",
+      );
+      const returned = await f.review({
+        mergePolicy: { version: 1, policy: mergePolicySchema.parse({}) },
+      });
+      if (recover) assert.deepEqual(returned.mergeAssessment, readyAssessment);
+      else {
+        assert.equal(returned.mergeAssessment?.reviewComplete, false);
+        assert.match(
+          returned.mergeAssessment!.verificationGaps.join(" "),
+          /read_file tool failed/,
+        );
+      }
+    },
+  );
+}
+
 for (const scenario of [
   "partial diff",
   "full diff by exec",

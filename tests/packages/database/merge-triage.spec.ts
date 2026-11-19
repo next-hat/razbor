@@ -642,13 +642,14 @@ test(
         throw new ForgeOperationError("unavailable", true);
       },
     );
+    let approvalChecks: ForgeMergeState = {
+      state: "ready",
+      reason: "approval_ready",
+    };
     t.mock.method(
       ForgejoInteractions.prototype,
       "inspectApproval",
-      async () => ({
-        state: "ready",
-        reason: "approval_ready",
-      }),
+      async () => approvalChecks,
     );
     t.mock.method(
       ForgejoInteractions.prototype,
@@ -778,12 +779,13 @@ test(
         )
       ).rows[0];
     }
-    /** Advance the retry clock of this specific test PR without timing-dependent sleeps. */
-    async function due(pr: string) {
-      await db.pool.query(
-        "update pull_requests set merge_after=now() where public_id=$1",
+    /** Make this PR due immediately and return the deadline consumed by the next dispatch. */
+    async function due(pr: string): Promise<Date> {
+      const result = await db.pool.query<{ merge_after: Date }>(
+        "update pull_requests set merge_after=now() where public_id=$1 returning merge_after",
         [pr],
       );
+      return result.rows[0].merge_after;
     }
     /** Inspect the durable redispatch deadline without advancing the test clock. */
     async function deadline(pr: string): Promise<Date | null> {
@@ -963,15 +965,19 @@ test(
     assert.equal(nextOrdinaryNote, 201);
     // A development HTTP setting must never send a triage preflight or retain
     // the old eligible preview when the configured origin cannot be trusted.
-    for (const forgeType of ["forgejo", "gitlab"]) {
+    for (const [forgeType, apiUrl, webUrl] of [
+      ["forgejo", "http://forge.invalid/api", origin],
+      ["gitlab", "http://forge.invalid/api", origin],
+      ["forgejo", config.forges.test.api_url, "http://forge.invalid"],
+    ]) {
       assert.deepEqual(await decision(clean), {
         status: "auto_merge_eligible",
         action: "dry_run",
       });
       const callsBeforeHttp = providerRequests.mock.callCount();
       await db.pool.query(
-        "update forge_instances set type=$1, api_url='http://forge.invalid/api', allow_http=true where config_key='test'",
-        [forgeType],
+        "update forge_instances set type=$1, api_url=$2, web_url=$3, allow_http=true where config_key='test'",
+        [forgeType, apiUrl, webUrl],
       );
       await due(second);
       await processMergeTriage(restart);
@@ -981,8 +987,8 @@ test(
         action: null,
       });
       await db.pool.query(
-        "update forge_instances set type='forgejo', api_url=$1, allow_http=false where config_key='test'",
-        [config.forges.test.api_url],
+        "update forge_instances set type='forgejo', api_url=$1, web_url=$2, allow_http=false where config_key='test'",
+        [config.forges.test.api_url, config.forges.test.web_url],
       );
       await due(second);
       await processMergeTriage(db);
@@ -1228,11 +1234,39 @@ test(
     await processMergeTriage(db);
     assert.equal((await decision(beforeOptIn)).status, "stale");
     assert.equal(approve.mock.callCount(), 0);
+    const votingReview = await complete(votePr, 96);
+    checks = { state: "blocked", reason: "github_schedule_owner_unbound" };
+    for (const code of [
+      "required_check_pending",
+      "required_check_unverified",
+    ]) {
+      approvalChecks = { state: "awaiting_checks", reason: code };
+      const started = Date.now();
+      await processMergeTriage(restart);
+      assert.equal(approve.mock.callCount(), 0);
+      const listed = (await listPullRequests(db, [repo.id])).find(
+        (entry) => entry.id === votePr,
+      );
+      assert.deepEqual(
+        listed?.merge?.decision.reasons.map((r) => r.code),
+        code === "required_check_unverified"
+          ? [checks.reason, code]
+          : [checks.reason],
+      );
+      if (code === "required_check_unverified") {
+        assert.equal(await deadline(votePr), null);
+        assert.match(
+          bodyFor(8),
+          /cannot match a required GitHub ruleset check/,
+        );
+      } else assert.ok((await deadline(votePr))!.getTime() >= started + 60_000);
+      await due(votePr);
+    }
+    approvalChecks = { state: "ready", reason: "approval_ready" };
     checks = {
       state: "blocked",
       reason: "forgejo_schedule_does_not_pin_reviewed_head",
     };
-    const votingReview = await complete(votePr, 96);
     const escalatedAgain = await complete(first, 100);
     await processMergeTriage(db);
     assert.deepEqual(voteWrites, [8]);
@@ -1858,17 +1892,15 @@ test(
     const scheduledPr = await pull(19);
     const scheduledReview = await complete(scheduledPr, 95);
     checks = { state: "ready", reason: "provider_ready" };
-    await processMergeTriage(db);
     for (const [guardState, reason] of [
       ["awaiting_checks", "pipeline_pending"],
       ["blocked", "pipeline_failed"],
       ["blocked", "merge_restrictions"],
     ] as const) {
-      if (reason !== "pipeline_pending") {
+      if (reason !== "pipeline_pending")
         checks = { state: "scheduled", guardState, reason };
-        await due(scheduledPr);
-        await processMergeTriage(restart);
-      }
+      const dueAt = await due(scheduledPr);
+      await processMergeTriage(restart);
       assert.deepEqual(await decision(scheduledReview), {
         status: guardState,
         action: "scheduled",
@@ -1882,7 +1914,11 @@ test(
         listed.decision.reasons.map((item) => item.code),
         [reason, "provider_scheduled"],
       );
-      assert.ok(await deadline(scheduledPr));
+      const nextPoll = await deadline(scheduledPr);
+      assert.ok(
+        nextPoll && nextPoll > dueAt && nextPoll.getTime() > Date.now(),
+        `Expected a future poll deadline after ${reason}`,
+      );
     }
     pauseInspection = async (request) => {
       if (request.number === 19) throw new ForgeOperationError("unavailable");

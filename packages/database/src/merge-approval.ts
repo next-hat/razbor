@@ -16,7 +16,11 @@ import { hasRetiringApproval } from "@database/src/merge-recovery.js";
 import { pullRequests, repositories, reviews } from "@database/src/schema.js";
 import type { triageForge } from "@database/src/webhooks.js";
 
-type ApprovalResult = { status: ReviewApprovalStatus; retryAt?: Date };
+type ApprovalResult = {
+  status: ReviewApprovalStatus;
+  reason?: "required_check_unverified";
+  retryAt?: Date;
+};
 
 /** Cast at most one exact-head vote. A lost write can only be reconciled by reading the forge. */
 export async function syncReviewApproval(
@@ -66,6 +70,12 @@ export async function syncReviewApproval(
     try {
       if (!saved) {
         const state = await api.inspectApproval(request, bot);
+        // The ruleset needs operator attention. Resume on a later triage trigger.
+        if (
+          state.state === "awaiting_checks" &&
+          state.reason === "required_check_unverified"
+        )
+          return { status: "unavailable", reason: state.reason };
         if (state.state !== "ready")
           return {
             status: "unavailable",

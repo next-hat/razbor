@@ -31,6 +31,12 @@ type LineRange = { start: number; end: number };
 
 type SourceReads = { supplied: LineRange[]; clipped: LineRange[] };
 
+type FailedRead = {
+  path: string;
+  revision: "head" | "baseline";
+  ranges: LineRange[];
+};
+
 /** Check whether the returned pages cover a requested interval, including out-of-order reads. */
 function coversLines(pages: LineRange[], range: LineRange) {
   let next = range.start;
@@ -42,10 +48,16 @@ function coversLines(pages: LineRange[], range: LineRange) {
   return false;
 }
 
+/** Identify exact UTF-8 source text independently of the repository's object format. */
+function sourceDigest(content: string) {
+  return createHash("sha256").update(content).digest("hex");
+}
+
 export class RepositoryTools {
   private readonly sourceReads = new Map<string, SourceReads>();
-  private readonly failedReads = new Map<string, LineRange[]>();
+  private readonly failedReads = new Map<string, FailedRead>();
   private readonly completeExecSources = new Set<string>();
+  private longestExecSourceBytes = 0;
 
   /** Remember an identifiable failed request on this pinned comparison. Malformed requests cannot be reconciled. */
   recordFailedRead(input: unknown) {
@@ -56,9 +68,13 @@ export class RepositoryTools {
     const end = endLine ?? start + 399;
     if (end < start) return false;
     const key = JSON.stringify([path, revision ?? "head"]);
-    const ranges = this.failedReads.get(key) ?? [];
-    ranges.push({ start, end });
-    this.failedReads.set(key, ranges);
+    const request = this.failedReads.get(key) ?? {
+      path,
+      revision: revision ?? "head",
+      ranges: [],
+    };
+    request.ranges.push({ start, end });
+    this.failedReads.set(key, request);
     return true;
   }
 
@@ -75,11 +91,11 @@ export class RepositoryTools {
     ),
   ) {
     const key = JSON.stringify([read.path, read.revision]);
-    const ranges = this.failedReads.get(key);
-    if (!ranges) return;
+    const request = this.failedReads.get(key);
+    if (!request) return;
     const remaining: LineRange[] = [];
     if (read.state === "available") {
-      for (const { start, end } of ranges) {
+      for (const { start, end } of request.ranges) {
         // EOF proves any lines beyond the blob are absent. Within the file,
         // preserve the portions of each failed range on either side of this page.
         const last = Math.min(end, read.totalLines);
@@ -90,19 +106,45 @@ export class RepositoryTools {
           remaining.push({ start: afterStart, end: last });
       }
     }
-    if (remaining.length) this.failedReads.set(key, remaining);
+    if (remaining.length) request.ranges = remaining;
     else this.failedReads.delete(key);
   }
 
-  /** Whether any valid failed file request still lacks its requested source evidence. */
-  hasFailedReads() {
-    return this.failedReads.size > 0;
+  /** Check outstanding ranges against complete exec output, including when the pinned tree was unavailable at read time. */
+  async hasFailedReads() {
+    if (!this.completeExecSources.size) return this.failedReads.size > 0;
+    for (const { path, revision } of this.failedReads.values()) {
+      try {
+        const entry = await this.sourceEntry(path, revision);
+        if (
+          entry?.type !== "blob" ||
+          !["100644", "100755"].includes(entry.mode)
+        )
+          return true;
+        // A larger blob cannot match any delivered output. Git requires a positive buffer limit even for an empty blob.
+        const content = await git(
+          this.repository,
+          ["cat-file", "blob", entry.oid],
+          this.signal,
+          false,
+          Math.max(1, this.longestExecSourceBytes),
+        );
+        if (!this.completeExecSources.has(sourceDigest(content))) return true;
+      } catch {
+        this.signal?.throwIfAborted();
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Match a complete command result against immutable file contents, independent of path aliases. */
   observeExec(stdout: string) {
-    this.completeExecSources.add(
-      createHash("sha256").update(stdout).digest("hex"),
+    if (stdout.includes("\0")) return;
+    this.completeExecSources.add(sourceDigest(stdout));
+    this.longestExecSourceBytes = Math.max(
+      this.longestExecSourceBytes,
+      Buffer.byteLength(stdout),
     );
   }
 
@@ -272,7 +314,7 @@ export class RepositoryTools {
       });
     const page = sourcePage(content, metadata, endLine);
     if (page.state === "available") {
-      const digest = createHash("sha256").update(content).digest("hex");
+      const digest = sourceDigest(content);
       const reads = this.sourceReads.get(digest) ?? {
         supplied: [],
         clipped: [],

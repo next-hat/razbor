@@ -523,7 +523,9 @@ export const forgeMergeReasonMessages = {
   required_check_failed:
     "A required GitHub check finished without a successful conclusion.",
   required_check_pending:
-    "A successful GitHub Check Run for every required context is still needed on the reviewed commit.",
+    "A passing result for each required GitHub check is still needed on the reviewed commit.",
+  required_check_unverified:
+    "Razbor is withholding its approval because it cannot match a required GitHub ruleset check to a result on the reviewed commit. Verify the rule in GitHub before approving.",
   retired_eligibility_check:
     "The existing GitHub eligibility check has already finished and cannot authorize this operation.",
   revision_changed:

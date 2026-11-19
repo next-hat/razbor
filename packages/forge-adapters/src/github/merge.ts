@@ -187,6 +187,9 @@ async function enforcedRuleset(api: GithubApi, rulesetId: string) {
 // These ref, history and file rules do not create CI requirements. Other active
 // rules, such as required workflows, can require results without listing job names.
 const rulesWithoutChecks = new Set([
+  // Merge-group checks apply after queue admission. Approval independently
+  // rejects a PR that is already queued or has auto-merge enabled.
+  "merge_queue",
   "creation",
   "update",
   "deletion",
@@ -259,35 +262,6 @@ export async function rulesetChecks(
     }
   }
   return { required, dismissesStaleReviews, hasUnmappedChecks };
-}
-
-/** Verify every configured CI check apart from Razbor's separate merge gate on this exact commit. */
-export function requiredCheckState(
-  requirements: { context: string; app: { databaseId: string } | null }[],
-  runs: z.infer<typeof check>[],
-  eligibilityAppId: string | undefined,
-) {
-  const required = requirements.filter(
-    (s) =>
-      s.context !== eligibilityCheck ||
-      !eligibilityAppId ||
-      s.app?.databaseId !== eligibilityAppId,
-  );
-  for (const criterion of required) {
-    const matching = runs.filter(
-      (r) =>
-        r.name === criterion.context &&
-        (!criterion.app || criterion.app.databaseId === r.app.id),
-    );
-    if (!matching.length || matching.some((r) => r.status !== "completed"))
-      return mergeState("awaiting_checks", "required_check_pending");
-    if (
-      matching.some(
-        (r) => !["success", "neutral", "skipped"].includes(r.conclusion ?? ""),
-      )
-    )
-      return mergeState("blocked", "required_check_failed");
-  }
 }
 
 /** Read terminal outcomes and identify old schedules and checks for retirement. No read authorizes a release. */

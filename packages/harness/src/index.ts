@@ -736,6 +736,7 @@ export async function reviewRepository(
       let failed = false;
       let sourceRead:
         Parameters<typeof rtools.observeSourceRead>[0] | undefined;
+      let completeExecOutput: string | undefined;
       let execution: Pick<
         NonNullable<ReviewProgress["tool"]>,
         "exitCode" | "timedOut" | "cancelled"
@@ -752,13 +753,8 @@ export async function reviewRepository(
             "exitCode" in output &&
             output.ok &&
             !output.truncated
-          ) {
-            rtools.observeExec(output.stdout);
-            prepared.observeExec(
-              (call.arguments as { argv?: unknown }).argv,
-              output.stdout,
-            );
-          }
+          )
+            completeExecOutput = output.stdout;
           if (call.name === "exec" && "exitCode" in output)
             execution = {
               exitCode: output.exitCode,
@@ -844,6 +840,13 @@ export async function reviewRepository(
         result = bounded;
         message = messageFor(result);
       } else if (sourceRead) rtools.observeSourceRead(sourceRead);
+      else if (completeExecOutput !== undefined) {
+        rtools.observeExec(completeExecOutput);
+        prepared.observeExec(
+          (call.arguments as { argv?: unknown }).argv,
+          completeExecOutput,
+        );
+      }
       evidenceIds.add(evidenceId);
       if (call.name === "read_diff") reportContext();
       progress(
@@ -1145,7 +1148,7 @@ export async function reviewRepository(
         }
         const { binaryFiles, unsupportedFiles } = prepared.coverage();
         const uninspectedFiles = prepared.uninspectedFiles();
-        if (rtools.hasFailedReads()) failedTools.add("read_file");
+        if (await rtools.hasFailedReads()) failedTools.add("read_file");
         const observed = [
           ...verificationLimitations,
           ...capabilities.limitations,

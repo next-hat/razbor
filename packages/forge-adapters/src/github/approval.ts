@@ -9,7 +9,6 @@ import {
   lockFields,
   lockRule,
   retiredEligibilityCheck,
-  requiredCheckState,
   rulesetChecks,
   type GithubApi,
 } from "@forge-adapters/src/github/merge.js";
@@ -43,7 +42,7 @@ const approvalSelection = `repository(owner:$owner,name:$name) {
       id number state isDraft author{login} headRefOid baseRefOid baseRefName
       isInMergeQueue autoMergeRequest{enabledAt} mergeable mergeStateStatus reviewDecision
       headRepository{databaseId} headRef{branchProtectionRule{${lockFields}}}
-      commits(last:1){nodes{commit{oid status{contexts{context state}}}}}
+      commits(last:1){nodes{commit{oid status{contexts{context state isRequired(pullRequestNumber:$number) creator{__typename ... on Bot{databaseId login}}}}}}}
       baseRef{refUpdateRule{viewerAllowedToDismissReviews} branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}
       reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved}}
       latestOpinionatedReviews(first:100){pageInfo{hasNextPage} nodes{state}}
@@ -81,6 +80,19 @@ const voteOnPull = markedVote.extend({
   pullRequest: z.object({ id: z.string() }),
 });
 
+const commitStatus = z.object({
+  context: z.string(),
+  state: z.string(),
+  isRequired: z.boolean(),
+  creator: z
+    .object({
+      __typename: z.string(),
+      databaseId: mergeId.nullish(),
+      login: z.string().optional(),
+    })
+    .nullable(),
+});
+
 const approvalRepository = z.object({
   databaseId: mergeId,
   defaultBranchRef: z.object({ name: z.string() }),
@@ -110,9 +122,7 @@ const approvalRepository = z.object({
               oid: commitSha,
               status: z
                 .object({
-                  contexts: z
-                    .array(z.object({ context: z.string(), state: z.string() }))
-                    .max(2000),
+                  contexts: z.array(commitStatus).max(2000),
                 })
                 .nullable(),
             }),
@@ -129,7 +139,7 @@ const approvalRepository = z.object({
           isAdminEnforced: z.boolean(),
           requiresApprovingReviews: z.boolean(),
           dismissesStaleReviews: z.boolean(),
-          requiresStatusChecks: z.boolean(),
+          requiresStatusChecks: z.boolean().nullable(),
           requiredStatusChecks: z
             .array(
               z.object({
@@ -177,6 +187,42 @@ const votePage = approvalRepository.extend({
     reviews: true,
   }),
 });
+
+/** Bind a legacy status creator's immutable bot account to the App ID behind its current slug. */
+async function statusAppId(
+  api: GithubApi,
+  creator: z.infer<typeof commitStatus>["creator"],
+) {
+  const slug =
+    creator?.__typename === "Bot" &&
+    creator.databaseId &&
+    creator.login?.match(/^([a-z0-9-]+)\[bot\]$/i)?.[1].toLowerCase();
+  if (!slug) return;
+  const login = `${slug}[bot]`;
+  try {
+    const bot = z
+      .object({ id: mergeId, login: z.string(), type: z.string() })
+      .parse(await api.transport.request(`users/${encodeURIComponent(login)}`));
+    if (
+      bot.type !== "Bot" ||
+      bot.id !== creator.databaseId ||
+      bot.login.toLowerCase() !== login
+    )
+      return;
+    const app = z
+      .object({ id: mergeId, slug: z.string() })
+      .parse(await api.transport.request(`apps/${encodeURIComponent(slug)}`));
+    if (app.slug.toLowerCase() === slug) return app.id;
+  } catch (error) {
+    // Private or retired Apps may have no visible public identity.
+    if (!(
+      error instanceof ForgeOperationError &&
+      [403, 404].includes(error.status ?? 0) &&
+      error.retryAt === undefined
+    ))
+      throw error;
+  }
+}
 
 /** Reject a page for a different PR, revision or destination, including a PR that closed or became a draft. */
 function votePageRestriction(
@@ -343,7 +389,10 @@ export async function inspectGithubApproval(
     !rules.dismissesStaleReviews
   )
     return { decision: mergeState("blocked", "approval_unsupported") };
-  if (classic?.requiresStatusChecks && classic.requiredStatusChecks === null)
+  if (
+    classic?.requiresStatusChecks === null ||
+    (classic?.requiresStatusChecks && classic.requiredStatusChecks === null)
+  )
     return {
       decision: mergeState("awaiting_checks", "required_check_pending"),
     };
@@ -351,29 +400,62 @@ export async function inspectGithubApproval(
     ...(classic?.requiredStatusChecks ?? []),
     ...rules.required,
   ];
-  const gateRequired = required.some(
+  const approvalChecks = required.filter(
     (rule) =>
-      rule.context === eligibilityCheck &&
-      rule.app?.databaseId === api.app?.appId,
+      !(
+        rule.context === eligibilityCheck &&
+        rule.app &&
+        rule.app.databaseId === api.app?.appId
+      ),
   );
-  const checkAll = request.requirePassingChecks || rules.hasUnmappedChecks;
-  const requiredNames = new Set(
-    required.map((rule) => rule.context.toLowerCase()),
-  );
-  /** A matching name can require both a Check Run and a case-insensitive legacy status. */
-  function relevantCheck(name: string) {
-    return checkAll || requiredNames.has(name.toLowerCase());
+  const gateRequired = approvalChecks.length !== required.length;
+  /** Match a required Check Run's exact name and, when configured, its immutable App ID. */
+  function matchesRun(
+    rule: (typeof required)[number],
+    run: { name: string; app: { id: string } },
+  ) {
+    return (
+      rule.context === run.name &&
+      (!rule.app || rule.app.databaseId === run.app.id)
+    );
   }
   // An approval never releases Razbor's own native-merge gate.
   const runs = (await checks(api, request)).filter(
     (run) =>
-      relevantCheck(run.name) &&
+      (request.requirePassingChecks ||
+        approvalChecks.some((rule) => matchesRun(rule, run))) &&
       (run.app.id !== api.app?.appId ||
         ![eligibilityCheck, retiredEligibilityCheck].includes(run.name)),
   );
-  const statuses = (tip.status?.contexts ?? []).filter((status) =>
-    relevantCheck(status.context),
-  );
+  const statusApps = new Map<string, string | undefined>();
+  const statuses: { name: string; state: string; appId?: string }[] = [];
+  for (const status of tip.status?.contexts ?? []) {
+    const name = status.context.toLowerCase();
+    const named = approvalChecks.filter(
+      (rule) => rule.context.toLowerCase() === name,
+    );
+    const creatorId =
+      status.creator?.__typename === "Bot" ? status.creator.databaseId : null;
+    let appId: string | undefined;
+    if (status.isRequired && named.some((rule) => rule.app) && creatorId) {
+      if (!statusApps.has(creatorId))
+        statusApps.set(creatorId, await statusAppId(api, status.creator));
+      appId = statusApps.get(creatorId);
+    }
+    // Unknown provenance can block an explicitly required status, but only a
+    // verified App can satisfy its pin. A new PR-specific requirement can also
+    // be visible on the commit before the branch rules list the context.
+    if (
+      request.requirePassingChecks ||
+      (status.isRequired && !named.length) ||
+      named.some(
+        (rule) =>
+          !rule.app ||
+          (status.isRequired && (!appId || appId === rule.app.databaseId)),
+      )
+    )
+      statuses.push({ name, state: status.state, appId });
+  }
   if (
     runs.some(
       (run) =>
@@ -383,8 +465,14 @@ export async function inspectGithubApproval(
     statuses.some((status) => ["FAILURE", "ERROR"].includes(status.state))
   )
     return { decision: mergeState("blocked", "required_check_failed") };
+  // Workflow rules identify source files, repositories and revisions. The
+  // check-run list has no such identity, even when every job is green.
+  if (rules.hasUnmappedChecks)
+    return {
+      decision: mergeState("awaiting_checks", "required_check_unverified"),
+    };
   if (
-    (checkAll &&
+    (request.requirePassingChecks &&
       !runs.some((run) => run.conclusion === "success") &&
       !statuses.some((status) => status.state === "SUCCESS")) ||
     runs.some((run) => run.status !== "completed") ||
@@ -393,20 +481,22 @@ export async function inspectGithubApproval(
     return {
       decision: mergeState("awaiting_checks", "required_check_pending"),
     };
-  const unmet = requiredCheckState(
-    required.filter(
-      (rule) =>
-        rule.app ||
-        !statuses.some(
-          (status) =>
-            status.context.toLowerCase() === rule.context.toLowerCase() &&
-            status.state === "SUCCESS",
-        ),
-    ),
-    runs,
-    api.app.appId,
-  );
-  if (unmet) return { decision: unmet };
+  for (const rule of approvalChecks) {
+    if (runs.some((run) => matchesRun(rule, run))) continue;
+    // Failed or pending runs and statuses on either required channel already
+    // returned above. A passing legacy status can supply a missing Check Run.
+    if (
+      statuses.some(
+        (s) =>
+          s.name === rule.context.toLowerCase() &&
+          (!rule.app || s.appId === rule.app.databaseId),
+      )
+    )
+      continue;
+    return {
+      decision: mergeState("awaiting_checks", "required_check_pending"),
+    };
+  }
   if (
     pr.mergeStateStatus === "BLOCKED" &&
     pr.reviewDecision !== "REVIEW_REQUIRED" &&

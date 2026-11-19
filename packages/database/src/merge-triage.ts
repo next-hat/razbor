@@ -908,6 +908,19 @@ async function triagePullRequest(database: Database, prId: string) {
         approval = undefined;
       }
     }
+    // Keep the native decision primary and explain an independent vote preflight on the same revision.
+    const approvalReason = approval?.reason;
+    if (
+      approvalReason &&
+      ["blocked", "awaiting_checks", "auto_merge_eligible"].includes(
+        decision.status,
+      ) &&
+      !decision.reasons.some(({ code }) => code === approvalReason)
+    )
+      decision.reasons.push({
+        code: approvalReason,
+        message: forgeMergeReason(approvalReason),
+      });
     const send =
       decision.status === "auto_merge_eligible" &&
       withdrawalPending === undefined &&
