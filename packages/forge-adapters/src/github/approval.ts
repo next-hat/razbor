@@ -44,7 +44,7 @@ const approvalSelection = `repository(owner:$owner,name:$name) {
       isInMergeQueue autoMergeRequest{enabledAt} mergeable mergeStateStatus reviewDecision
       headRepository{databaseId} headRef{branchProtectionRule{${lockFields}}}
       commits(last:1){nodes{commit{oid status{contexts{context state}}}}}
-      baseRef{refUpdateRule{viewerAllowedToDismissReviews} branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiredStatusChecks{context app{databaseId}}}}
+      baseRef{refUpdateRule{viewerAllowedToDismissReviews} branchProtectionRule{isAdminEnforced requiresApprovingReviews dismissesStaleReviews requiresStatusChecks requiredStatusChecks{context app{databaseId}}}}
       reviewThreads(first:100){pageInfo{hasNextPage} nodes{isResolved}}
       latestOpinionatedReviews(first:100){pageInfo{hasNextPage} nodes{state}}
       reviews(last:100,author:$bot)${voteFields}
@@ -129,6 +129,7 @@ const approvalRepository = z.object({
           isAdminEnforced: z.boolean(),
           requiresApprovingReviews: z.boolean(),
           dismissesStaleReviews: z.boolean(),
+          requiresStatusChecks: z.boolean(),
           requiredStatusChecks: z
             .array(
               z.object({
@@ -342,6 +343,10 @@ export async function inspectGithubApproval(
     !rules.dismissesStaleReviews
   )
     return { decision: mergeState("blocked", "approval_unsupported") };
+  if (classic?.requiresStatusChecks && classic.requiredStatusChecks === null)
+    return {
+      decision: mergeState("awaiting_checks", "required_check_pending"),
+    };
   const required = [
     ...(classic?.requiredStatusChecks ?? []),
     ...rules.required,
@@ -351,13 +356,24 @@ export async function inspectGithubApproval(
       rule.context === eligibilityCheck &&
       rule.app?.databaseId === api.app?.appId,
   );
-  // An approval never releases Razbor's own native-merge gate. Ignore only gate runs from this App.
+  const checkAll = request.requirePassingChecks || rules.hasUnmappedChecks;
+  const requiredNames = new Set(
+    required.map((rule) => rule.context.toLowerCase()),
+  );
+  /** A matching name can require both a Check Run and a case-insensitive legacy status. */
+  function relevantCheck(name: string) {
+    return checkAll || requiredNames.has(name.toLowerCase());
+  }
+  // An approval never releases Razbor's own native-merge gate.
   const runs = (await checks(api, request)).filter(
     (run) =>
-      run.app.id !== api.app?.appId ||
-      ![eligibilityCheck, retiredEligibilityCheck].includes(run.name),
+      relevantCheck(run.name) &&
+      (run.app.id !== api.app?.appId ||
+        ![eligibilityCheck, retiredEligibilityCheck].includes(run.name)),
   );
-  const statuses = tip.status?.contexts ?? [];
+  const statuses = (tip.status?.contexts ?? []).filter((status) =>
+    relevantCheck(status.context),
+  );
   if (
     runs.some(
       (run) =>
@@ -368,7 +384,7 @@ export async function inspectGithubApproval(
   )
     return { decision: mergeState("blocked", "required_check_failed") };
   if (
-    (request.requirePassingChecks &&
+    (checkAll &&
       !runs.some((run) => run.conclusion === "success") &&
       !statuses.some((status) => status.state === "SUCCESS")) ||
     runs.some((run) => run.status !== "completed") ||
@@ -383,7 +399,8 @@ export async function inspectGithubApproval(
         rule.app ||
         !statuses.some(
           (status) =>
-            status.context === rule.context && status.state === "SUCCESS",
+            status.context.toLowerCase() === rule.context.toLowerCase() &&
+            status.state === "SUCCESS",
         ),
     ),
     runs,

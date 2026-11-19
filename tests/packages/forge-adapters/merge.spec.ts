@@ -806,6 +806,7 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
         isAdminEnforced: true,
         requiresApprovingReviews: true,
         dismissesStaleReviews: true,
+        requiresStatusChecks: true,
         requiredStatusChecks: [
           { context: checkName, app: { databaseId: 1 } },
           { context: "legacy", app: null },
@@ -826,7 +827,16 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   let loseResponse = false;
   let checkpoints = 0;
   let pendingApp = 1;
-  let optionalConclusion = "skipped";
+  let showOptionalRun = true;
+  const optionalRun = {
+    id: 5,
+    name: "Optional",
+    app: { id: 5 },
+    head_sha: headSha,
+    external_id: null,
+    conclusion: "skipped" as string | null,
+  };
+  const branchRules: Record<string, unknown>[] = [];
   let graphqlRejection: Response | undefined;
   let historyFault:
     | "stale head"
@@ -956,13 +966,14 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     if (path.includes("/rules/branches/main?"))
       return enforcedRuleset
         ? [
+            ...branchRules,
             {
               type: "pull_request",
               ruleset_id: 12,
               parameters: { dismiss_stale_reviews_on_push: true },
             },
           ]
-        : [];
+        : branchRules;
     if (path.endsWith("/rulesets/12"))
       return {
         id: 12,
@@ -970,30 +981,27 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
         enforcement: "active",
         current_user_can_bypass: bypass,
       };
-    if (path.includes("/check-runs?"))
-      return {
-        total_count: 2,
-        check_runs: [
-          {
-            id: 4,
-            name: checkName,
-            app: { id: pendingApp },
-            head_sha: headSha,
-            external_id: null,
-            status: "in_progress",
-            conclusion: null,
-          },
-          {
-            id: 5,
-            name: "Optional",
-            app: { id: 5 },
-            head_sha: headSha,
-            external_id: null,
-            status: "completed",
-            conclusion: optionalConclusion,
-          },
-        ],
-      };
+    if (path.includes("/check-runs?")) {
+      const runs = showOptionalRun
+        ? [
+            {
+              ...optionalRun,
+              status:
+                optionalRun.conclusion === null ? "in_progress" : "completed",
+            },
+          ]
+        : [];
+      runs.unshift({
+        id: 4,
+        name: checkName,
+        app: { id: pendingApp },
+        head_sha: headSha,
+        external_id: null,
+        status: "in_progress",
+        conclusion: null,
+      });
+      return { total_count: runs.length, check_runs: runs };
+    }
     if (path.includes("/check-suites?"))
       return { total_count: 1, check_suites: [{ head_sha: headSha }] };
     throw new Error(path);
@@ -1022,12 +1030,150 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     "awaiting_checks",
   );
   pr.mergeable = "MERGEABLE";
+  const requiredOnly = { ...request, requirePassingChecks: false };
+  const contexts = pr.commits.nodes[0].commit.status.contexts;
+  const optionalStatus = {
+    context: "Optional legacy status",
+    state: "SUCCESS",
+  };
+  contexts.push(optionalStatus);
+  // Either type of optional result can fail or remain pending independently.
+  for (const [conclusion, status, strictReason] of [
+    ["success", "ERROR", "required_check_failed"],
+    ["failure", "SUCCESS", "required_check_failed"],
+    [null, "SUCCESS", "required_check_pending"],
+    ["success", "PENDING", "required_check_pending"],
+  ] as const) {
+    optionalRun.conclusion = conclusion;
+    optionalStatus.state = status;
+    assert.equal(
+      (await api.inspectApproval(request, approvalBot)).reason,
+      strictReason,
+    );
+    assert.equal(
+      (await api.inspectApproval(requiredOnly, approvalBot)).state,
+      "ready",
+    );
+  }
+  contexts.pop();
+  // When both channels provide an unpinned required name, neither channel can mask the other.
+  optionalRun.name = "legacy";
+  for (const [conclusion, status, reason] of [
+    ["failure", "SUCCESS", "required_check_failed"],
+    [null, "SUCCESS", "required_check_pending"],
+    ["success", "FAILURE", "required_check_failed"],
+    ["success", "PENDING", "required_check_pending"],
+    ["neutral", "SUCCESS", "approval_ready"],
+  ] as const) {
+    optionalRun.conclusion = conclusion;
+    contexts[0].state = status;
+    assert.equal(
+      (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+      reason,
+    );
+  }
+  optionalRun.name = "Optional";
+  branchRules.push({
+    type: "required_status_checks",
+    ruleset_id: 12,
+    parameters: {
+      required_status_checks: [
+        { context: optionalRun.name, integration_id: 5 },
+      ],
+    },
+  });
+  optionalStatus.context = optionalRun.name;
+  optionalStatus.state = "SUCCESS";
+  contexts.push(optionalStatus);
+  optionalRun.conclusion = "success";
+  optionalRun.app.id = 9;
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "required_check_pending",
+  );
+  optionalRun.app.id = 5;
+  for (const [conclusion, reason] of [
+    [null, "required_check_pending"],
+    ["failure", "required_check_failed"],
+    ["skipped", "approval_ready"],
+  ] as const) {
+    optionalRun.conclusion = conclusion;
+    assert.equal(
+      (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+      reason,
+    );
+  }
+  optionalStatus.context = optionalRun.name.toLowerCase();
+  optionalStatus.state = "FAILURE";
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "required_check_failed",
+  );
+  contexts.pop();
+  branchRules.pop();
+  // A workflow requirement does not enumerate its individual jobs by check name.
+  branchRules.push({
+    type: "workflows",
+    ruleset_id: 12,
+    parameters: {
+      workflows: [
+        {
+          repository_id: 10,
+          path: ".github/workflows/required.yml",
+          ref: "refs/heads/main",
+        },
+      ],
+    },
+  });
+  for (const [conclusion, reason] of [
+    ["failure", "required_check_failed"],
+    [null, "required_check_pending"],
+    ["success", "approval_ready"],
+  ] as const) {
+    optionalRun.conclusion = conclusion;
+    assert.equal(
+      (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+      reason,
+    );
+  }
+  const hiddenStatus = contexts.pop()!;
+  const hiddenRule =
+    pr.baseRef.branchProtectionRule.requiredStatusChecks.pop()!;
+  showOptionalRun = false;
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "required_check_pending",
+  );
+  branchRules.pop();
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).state,
+    "ready",
+  );
+  showOptionalRun = true;
+  contexts.push(hiddenStatus);
+  pr.baseRef.branchProtectionRule.requiredStatusChecks.push(hiddenRule);
+  const classic = pr.baseRef.branchProtectionRule;
+  const savedChecks = classic.requiredStatusChecks;
+  Object.assign(classic, { requiredStatusChecks: null });
+  assert.notEqual(
+    (await api.inspectApproval(requiredOnly, approvalBot)).state,
+    "ready",
+  );
+  classic.requiresStatusChecks = false;
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).state,
+    "ready",
+  );
+  Object.assign(classic, {
+    requiresStatusChecks: true,
+    requiredStatusChecks: savedChecks,
+  });
   pr.baseRef.branchProtectionRule.requiredStatusChecks.push({
     context: "Optional",
     app: { databaseId: 5 },
   });
   for (const passing of ["neutral", "skipped"]) {
-    optionalConclusion = passing;
+    optionalRun.conclusion = passing;
     assert.equal(
       (await api.inspectApproval(request, approvalBot)).state,
       "ready",
@@ -1037,6 +1183,10 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     0,
     1,
   );
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "required_check_pending",
+  );
   const [legacyRule] =
     pr.baseRef.branchProtectionRule.requiredStatusChecks.splice(1, 1);
   assert.equal(
@@ -1044,20 +1194,28 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
     "awaiting_checks",
   );
   assert.equal(
-    (
-      await api.inspectApproval(
-        { ...request, requirePassingChecks: false },
-        approvalBot,
-      )
-    ).state,
+    (await api.inspectApproval(requiredOnly, approvalBot)).state,
     "ready",
   );
   pr.commits.nodes[0].commit.status.contexts.push(legacyStatus);
   pr.baseRef.branchProtectionRule.requiredStatusChecks.pop();
   pr.baseRef.branchProtectionRule.requiredStatusChecks.push(legacyRule);
+  pr.baseRef.branchProtectionRule.requiredStatusChecks.push({
+    context: checkName,
+    app: { databaseId: 99 },
+  });
+  assert.equal(
+    (await api.inspectApproval(requiredOnly, approvalBot)).reason,
+    "required_check_pending",
+  );
+  pr.baseRef.branchProtectionRule.requiredStatusChecks.pop();
   pr.isInMergeQueue = true;
   assert.equal(
     await api.approveReview(request, approvalBot, false, checkpoint),
+    "unsupported",
+  );
+  assert.equal(
+    await api.approveReview(requiredOnly, approvalBot, false, checkpoint),
     "unsupported",
   );
   pr.isInMergeQueue = false;
@@ -1165,10 +1323,14 @@ test("GitHub approves a pinned revision separately from merge, reconciles the ex
   }
   graphqlRejection = undefined;
   loseResponse = true;
+  optionalRun.conclusion = "failure";
+  contexts.push({ context: "Unrelated advisory", state: "PENDING" });
   await assert.rejects(
-    api.approveReview(request, approvalBot, false, checkpoint),
+    api.approveReview(requiredOnly, approvalBot, false, checkpoint),
     { uncertain: true },
   );
+  contexts.pop();
+  optionalRun.conclusion = "skipped";
   assert.equal(
     await api.approveReview(request, approvalBot, true, checkpoint),
     "approved",

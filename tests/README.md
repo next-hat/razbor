@@ -101,6 +101,8 @@ The runner finalization fixture temporarily removes a Git object before a file r
 
 The GitLab schedule fixtures change the pipeline and merge restrictions on an existing bot-owned schedule. The adapter, dispatcher and console tests check the current decision, continued tracking of the schedule and the absence of a second submission.
 
+GitHub approval fixtures exercise optional check runs and commit statuses with `requirePassingChecks` enabled and disabled. They also check a required context reported by both APIs and a required check bound to a specific GitHub App.
+
 ## Autonomous review harness
 
 Run the focused agent-loop, budget, context, relay and evaluation regressions:

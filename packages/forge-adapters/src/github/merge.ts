@@ -184,7 +184,27 @@ async function enforcedRuleset(api: GithubApi, rulesetId: string) {
   );
 }
 
-/** Collect required checks and verify whether stale approvals must be dismissed for this App. */
+// These ref, history and file rules do not create CI requirements. Other active
+// rules, such as required workflows, can require results without listing job names.
+const rulesWithoutChecks = new Set([
+  "creation",
+  "update",
+  "deletion",
+  "non_fast_forward",
+  "required_linear_history",
+  "required_signatures",
+  "branch_name_pattern",
+  "tag_name_pattern",
+  "commit_message_pattern",
+  "commit_author_email_pattern",
+  "committer_email_pattern",
+  "file_path_restriction",
+  "max_file_path_length",
+  "file_extension_restriction",
+  "max_file_size",
+]);
+
+/** Collect named CI requirements, identify rules with unknown check names and verify stale-review dismissal for this App. */
 export async function rulesetChecks(
   api: GithubApi,
   request: ForgeMergeRequest,
@@ -195,6 +215,7 @@ export async function rulesetChecks(
   const required: { context: string; app: { databaseId: string } | null }[] =
     [];
   let dismissesStaleReviews = false;
+  let hasUnmappedChecks = false;
   for (const value of all) {
     const type = z.object({ type: z.string() }).parse(value).type;
     if (type === "pull_request") {
@@ -211,8 +232,12 @@ export async function rulesetChecks(
         (await enforcedRuleset(api, rule.ruleset_id))
       )
         dismissesStaleReviews = true;
+      continue;
     }
-    if (type !== "required_status_checks") continue;
+    if (type !== "required_status_checks") {
+      if (!rulesWithoutChecks.has(type)) hasUnmappedChecks = true;
+      continue;
+    }
     const rule = z
       .object({
         ruleset_id: mergeId,
@@ -233,7 +258,7 @@ export async function rulesetChecks(
       });
     }
   }
-  return { required, dismissesStaleReviews };
+  return { required, dismissesStaleReviews, hasUnmappedChecks };
 }
 
 /** Verify every configured CI check apart from Razbor's separate merge gate on this exact commit. */
