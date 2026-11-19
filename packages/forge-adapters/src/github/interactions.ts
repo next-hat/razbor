@@ -15,6 +15,7 @@ import {
   reviewRevision,
   verifyStatusComment,
   type Forge,
+  type ForgeActor,
   type ForgeChange,
   type ForgeMergeCheckpoint,
   type ForgeMergeRequest,
@@ -29,6 +30,10 @@ import {
   webhookEndpoint,
 } from "@forge-adapters/src/transport.js";
 import { resolveReviewer } from "@forge-adapters/src/merge.js";
+import {
+  approveGithubReview,
+  inspectGithubApproval,
+} from "@forge-adapters/src/github/approval.js";
 import {
   inspectGithubMerge,
   scheduleGithubMerge,
@@ -311,6 +316,30 @@ export class GithubForge implements Forge {
   /** Read native branch protection, review and revocable eligibility evidence. */
   async inspectMerge(request: ForgeMergeRequest) {
     return (await inspectGithubMerge(this.mergeApi(), request)).decision;
+  }
+
+  /** Check review and CI readiness independently of native merge permissions. */
+  async inspectApproval(request: ForgeMergeRequest, bot: ForgeActor) {
+    return (await inspectGithubApproval(this.mergeApi(), request, bot))
+      .decision;
+  }
+
+  /** Reconcile this App's review or submit a first vote on the immutable PR and commit. */
+  approveReview(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    reconcileOnly: boolean,
+    beforeWrite: () => Promise<void>,
+    acknowledged = false,
+  ) {
+    return approveGithubReview(
+      this.mergeApi(),
+      request,
+      bot,
+      reconcileOnly,
+      beforeWrite,
+      acknowledged,
+    );
   }
 
   /** Enable native auto-merge while the exact revision's check is pending. */

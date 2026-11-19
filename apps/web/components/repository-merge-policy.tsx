@@ -13,6 +13,7 @@ import { Button } from "@web/components/ui/button.js";
 import { Checkbox } from "@web/components/ui/checkbox.js";
 import {
   Field,
+  FieldContent,
   FieldDescription,
   FieldLabel,
 } from "@web/components/ui/field.js";
@@ -28,7 +29,8 @@ import { Textarea } from "@web/components/ui/textarea.js";
 
 const switches = {
   enabled: "Enable merge automation",
-  dryRun: "Dry run · record eligible merges without scheduling",
+  dryRun: "Dry run · post confidence and reasons, keep merge scheduling off",
+  autoApprove: "Automatically approve eligible revisions on the forge",
   requirePassingChecks: "Require passing provider checks",
 } as const;
 
@@ -230,11 +232,23 @@ export function RepositoryMergePolicy({
           <Field key={key} orientation="horizontal">
             <Checkbox
               id={id + key}
+              aria-describedby={
+                key === "autoApprove" ? id + "-approval-help" : undefined
+              }
               checked={draft[key]}
               disabled={disabled}
               onCheckedChange={(checked) => change({ [key]: checked })}
             />
-            <FieldLabel htmlFor={id + key}>{switches[key]}</FieldLabel>
+            <FieldContent>
+              <FieldLabel htmlFor={id + key}>{switches[key]}</FieldLabel>
+              {key === "autoApprove" && (
+                <FieldDescription id={id + "-approval-help"}>
+                  With automation enabled, Razbor can submit a real approval in
+                  dry run or live mode. This can satisfy a provider approval
+                  rule.
+                </FieldDescription>
+              )}
+            </FieldContent>
           </Field>
         ))}
         <p className="text-xs text-muted-foreground">

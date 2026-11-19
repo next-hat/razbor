@@ -253,6 +253,13 @@
       "when": 1790000000036,
       "tag": "0035_merge_write_stage",
       "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "7",
+      "when": 1790000000037,
+      "tag": "0036_forge_approval",
+      "breakpoints": true
     }
   ]
 }

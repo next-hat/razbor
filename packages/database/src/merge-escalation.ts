@@ -4,6 +4,7 @@ import {
   MAX_ESCALATION_MENTIONS,
   renderMergeEscalation,
   type MergeDecision,
+  type ReviewApprovalStatus,
 } from "@razbor/contracts";
 import { ForgeOperationError } from "@razbor/forge-adapters";
 
@@ -35,6 +36,8 @@ export async function syncEscalation(
   review: Review,
   decision: MergeDecision,
   client: ProviderClient,
+  reportDryRun = false,
+  approval?: ReviewApprovalStatus,
 ) {
   const snapshot = review.source.mergePolicy;
   if (!snapshot) return;
@@ -49,6 +52,7 @@ export async function syncEscalation(
     snapshot.version === repo.mergePolicyVersion &&
     snapshot.policy.enabled &&
     pr.state === "open";
+  const publish = human || reportDryRun;
 
   /** Commit the chosen provider ID or mention intent before an external write can survive a restart. */
   async function save(value: EscalationComment) {
@@ -129,7 +133,7 @@ export async function syncEscalation(
     };
     if (!(await save(saved))) return;
   }
-  if (!current && human) current = pending[0];
+  if (!current && publish) current = pending[0];
   if (current && current.id !== saved.remoteId) {
     saved = {
       ...saved,
@@ -148,7 +152,7 @@ export async function syncEscalation(
     }
   }
   if (!current) {
-    if (!human) return;
+    if (!publish) return;
     if (saved.reservationRetryAt && saved.reservationRetryAt > Date.now())
       throw new ForgeOperationError("unavailable", true);
     const previousPending = saved.pendingReservations ?? 0;
@@ -210,7 +214,8 @@ export async function syncEscalation(
     headSha: review.headSha,
     marker,
     decision: { ...decision, reviewers },
-    assessment: human ? review.result?.mergeAssessment : undefined,
+    assessment: publish ? review.result?.mergeAssessment : undefined,
+    approval,
   };
   const withMentions = renderMergeEscalation(options);
   const mention = human && !saved.mentioned && reviewers.length > 0;

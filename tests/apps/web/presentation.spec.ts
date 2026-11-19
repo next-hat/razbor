@@ -432,6 +432,9 @@ test("managed settings explain the fixed destination while allowing edits to sup
     }),
   );
   assert.match(html, /Enable merge automation/);
+  assert.match(html, /Dry run · post confidence and reasons/);
+  assert.match(html, /Automatically approve eligible revisions on the forge/);
+  assert.match(html, /submit a real approval in dry run or live mode/);
   assert.match(html, /Save merge policy/);
   assert.match(
     html,

@@ -271,6 +271,16 @@ export class ForgejoInteractions implements Forge {
     });
   }
 
+  /** The PR API cannot establish that voting will not release a pending native merge. */
+  async inspectApproval() {
+    return mergeState("blocked", "approval_unsupported");
+  }
+
+  /** A Forgejo review commit is recorded even when the current PR head has already changed. */
+  async approveReview(): Promise<"unsupported"> {
+    return "unsupported";
+  }
+
   /** Both inspected Forgejo releases persist a PR ID without its reviewed head in scheduled merges. */
   async inspectMerge(request: ForgeMergeRequest) {
     mergeRequestSchema.parse(request);

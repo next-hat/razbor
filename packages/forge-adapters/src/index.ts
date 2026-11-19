@@ -89,6 +89,8 @@ export { verifyForgejoRegistration } from "@forge-adapters/src/forgejo/index.js"
 
 export type {
   Forge,
+  ForgeActor,
+  ForgeApprovalResult,
   ForgeChange,
   ForgeMergeCheckpoint,
   ForgeMergeRequest,

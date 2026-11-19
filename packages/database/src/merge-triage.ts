@@ -15,6 +15,7 @@ import {
 import { logger } from "@razbor/harness/logger";
 
 import type { Database } from "@database/src/connection.js";
+import { syncReviewApproval } from "@database/src/merge-approval.js";
 import { syncEscalation } from "@database/src/merge-escalation.js";
 import {
   latestMergeReview,
@@ -105,6 +106,24 @@ async function writeGuardedMerge(
         if (!armed || armed.stage !== stage) return false;
         /** Durably fence every mutating step before sending its HTTP request. */
         async function checkpoint(next: ForgeMergeWriteStage) {
+          if (
+            review.source.mergePolicy?.policy.autoApprove &&
+            (next === "submitting" || next === "releasing")
+          ) {
+            const currentVote = await api.approveReview(
+              request,
+              bot,
+              true,
+              async () => {
+                throw new Error(
+                  "Merge dispatch may only verify an existing approval",
+                );
+              },
+              true,
+            );
+            if (currentVote !== "approved")
+              throw new ForgeOperationError("permission");
+          }
           const changed = await database.db
             .update(reviews)
             .set({ mergeWriteStage: next })
@@ -357,6 +376,8 @@ async function triagePullRequest(database: Database, prId: string) {
   let retry = decision.status === "review_in_progress";
   let client: ProviderClient | undefined;
   let state: ForgeMergeState | undefined;
+  let approval: Awaited<ReturnType<typeof syncReviewApproval>>;
+  let nativeRetryAt: Date | undefined;
   /** Resolve the trusted forge identity lazily, including console-triggered reviews without a webhook. */
   async function provider() {
     return (client ??= await triageForge(database, repo.id));
@@ -489,7 +510,49 @@ async function triagePullRequest(database: Database, prId: string) {
             api,
             review,
           ));
-        state = await api.inspectMerge(request);
+        input.outstandingFindingsAudited = true;
+        if (
+          snapshot.policy.enabled &&
+          snapshot.policy.autoApprove &&
+          snapshot.version === repo.mergePolicyVersion &&
+          input.revisionCurrent &&
+          !input.humanEscalated &&
+          !input.outstandingFindings &&
+          input.baseBranch === input.defaultBranch
+        ) {
+          approval = await syncReviewApproval(
+            database,
+            repo,
+            pr,
+            review,
+            request,
+            input,
+            { api, bot },
+            fenced,
+          );
+        }
+        try {
+          state = await api.inspectMerge(request);
+        } catch (error) {
+          if (
+            fenced ||
+            !(snapshot.policy.dryRun || snapshot.policy.autoApprove)
+          )
+            throw error;
+          // A native merge capability read is independent from an exact-revision
+          // vote and the confidence comment. It cannot grant merge authority.
+          if (
+            !(error instanceof ForgeOperationError) ||
+            (error.reason !== "permission" && error.reason !== "unsupported") ||
+            error.retryAt
+          )
+            nativeRetryAt = new Date(
+              error instanceof ForgeOperationError && error.retryAt
+                ? error.retryAt
+                : Date.now() + 300_000,
+            );
+          state = { state: "blocked", reason: "guard_unavailable" };
+        }
         const pendingReview = state.pendingCheckReviewId;
         if (
           !fenced &&
@@ -511,7 +574,6 @@ async function triagePullRequest(database: Database, prId: string) {
           // Retiring an old check grants no authority. Recheck all provider requirements.
           state = await api.inspectMerge(request);
         }
-        input.outstandingFindingsAudited = true;
         input.provider = providerFacts(state);
         if (state.state === "stale") input.revisionCurrent = false;
         decision = evaluateMergeDecision(input);
@@ -519,7 +581,35 @@ async function triagePullRequest(database: Database, prId: string) {
           decision.reasons = [
             { code: state.reason, message: forgeMergeReason(state.reason) },
           ];
-        if (decision.status === "human_review_required" && fenced) {
+        if (
+          fenced &&
+          snapshot.policy.autoApprove &&
+          approval?.status !== "approved" &&
+          state.state !== "merged" &&
+          decision.status !== "human_review_required"
+        ) {
+          if (
+            review.mergeWriteStage === "prepared" &&
+            review.mergeAction === "writing"
+          ) {
+            // Nothing was submitted. A withdrawn vote retires this intent locally;
+            // a failed read retains it for a read-only retry.
+            if (!approval?.retryAt) action = "refused";
+            decision = reason(
+              "blocked",
+              "approval_required",
+              "The configured forge approval is required before submitting a native merge.",
+            );
+          } else {
+            if (await retireMerge(database, repo, pr, review, async () => api))
+              return;
+            decision = reason(
+              "blocked",
+              "approval_required",
+              "The earlier merge request requires reconciliation because its approval could not be confirmed.",
+            );
+          }
+        } else if (decision.status === "human_review_required" && fenced) {
           const retired = await retireMerge(
             database,
             repo,
@@ -593,15 +683,50 @@ async function triagePullRequest(database: Database, prId: string) {
       );
       retry = false;
     }
+    if (
+      decision.reasons[0]?.code === "approval_required" &&
+      review.mergeWriteStage === "prepared"
+    )
+      retry = false;
     if (action === "dry_run" && decision.status !== "auto_merge_eligible")
       action = null;
-    if (decision.status === "auto_merge_eligible" && snapshot?.policy.dryRun)
+    if (decision.status === "auto_merge_eligible" && snapshot?.policy.dryRun) {
       action = "dry_run";
+      retry = false;
+    }
+    if (!fenced && snapshot?.policy.dryRun && state?.state === "blocked")
+      retry = false;
+    if (
+      !fenced &&
+      !snapshot?.policy.dryRun &&
+      snapshot?.policy.autoApprove &&
+      decision.status === "auto_merge_eligible" &&
+      approval?.status !== "approved"
+    ) {
+      decision = reason(
+        "blocked",
+        "approval_required",
+        "The requested approval has not been confirmed for this revision.",
+      );
+      retry = false;
+    }
     let human =
       decision.status === "human_review_required" &&
       snapshot?.policy.enabled &&
       snapshot.version === repo.mergePolicyVersion;
-    if (human) {
+    let reportDryRun = Boolean(
+      snapshot?.policy.enabled &&
+      snapshot.policy.dryRun &&
+      snapshot.version === repo.mergePolicyVersion &&
+      request &&
+      repo.verifiedAt &&
+      input.open &&
+      !input.draft &&
+      input.revisionCurrent &&
+      review.status === "completed" &&
+      !["stale", "merged"].includes(decision.status),
+    );
+    if (human || reportDryRun) {
       try {
         const fresh = await (await provider()).api.change(pr.number);
         if (
@@ -616,27 +741,36 @@ async function triagePullRequest(database: Database, prId: string) {
             "The provider revision or draft state changed. A current review is required.",
           );
           human = false;
+          reportDryRun = false;
         }
       } catch (error) {
         human = false;
-        retry = true;
-        decision =
+        reportDryRun = false;
+        const closed =
           error instanceof ForgeOperationError &&
-          error.reason === "change-closed"
-            ? reason(
-                "stale",
-                "change_closed",
-                "The provider reports that the pull request has closed.",
-              )
-            : reason(
-                "blocked",
-                "provider_unavailable",
-                "The provider could not confirm the revision for human escalation.",
-              );
+          error.reason === "change-closed";
+        retry = !closed;
+        decision = closed
+          ? reason(
+              "stale",
+              "change_closed",
+              "The provider reports that the pull request has closed.",
+            )
+          : reason(
+              "blocked",
+              "provider_unavailable",
+              "The provider could not confirm the revision for the review comment.",
+            );
+      }
+      if (decision.status === "stale") {
+        retry = false;
+        nativeRetryAt = undefined;
+        approval = undefined;
       }
     }
     const send =
       decision.status === "auto_merge_eligible" &&
+      (!snapshot?.policy.autoApprove || approval?.status === "approved") &&
       action !== "dry_run" &&
       action !== "scheduled" &&
       state?.state === "ready";
@@ -669,7 +803,11 @@ async function triagePullRequest(database: Database, prId: string) {
           .set({
             ...(human ? { humanEscalated: true } : {}),
             mergeAfter:
-              retry || human || pr.escalationComment
+              retry ||
+              human ||
+              reportDryRun ||
+              pr.escalationComment ||
+              approval?.retryAt
                 ? new Date(Date.now() + retryMs)
                 : null,
           })
@@ -689,18 +827,59 @@ async function triagePullRequest(database: Database, prId: string) {
         !!state?.resume,
         client.bot.id,
       );
-    if ((human || pr.escalationComment) && snapshot) {
+    if ((human || reportDryRun || pr.escalationComment) && snapshot) {
       const remote = await provider();
-      await syncEscalation(database, repo, pr, review, decision, remote);
-      if (!retry && action !== "uncertain")
-        await withCurrentMergeReview(database, repo, pr, review, async (tx) => {
-          await tx
-            .update(pullRequests)
-            .set({ mergeAfter: nextEscalationCheck(Boolean(human)) })
-            .where(eq(pullRequests.id, pr.id));
-        });
+      await syncEscalation(
+        database,
+        repo,
+        pr,
+        review,
+        decision,
+        remote,
+        reportDryRun,
+        approval?.status,
+      );
+    }
+    if (
+      !retry &&
+      action !== "uncertain" &&
+      (human ||
+        reportDryRun ||
+        pr.escalationComment ||
+        approval?.retryAt ||
+        nativeRetryAt)
+    ) {
+      // Successful dry-run delivery sleeps until a real state change. Keep
+      // separate deadlines for unsettled external approval and comment writes.
+      const next = nextEscalationCheck(Boolean(human));
+      await withCurrentMergeReview(database, repo, pr, review, async (tx) => {
+        await tx
+          .update(pullRequests)
+          .set({
+            mergeAfter: sql`least(${next}, ${approval?.retryAt?.toISOString() ?? null}::timestamptz, ${nativeRetryAt?.toISOString() ?? null}::timestamptz)`,
+          })
+          .where(eq(pullRequests.id, pr.id));
+      });
     }
   } catch (error) {
+    if (
+      !fenced &&
+      snapshot?.policy.dryRun &&
+      error instanceof ForgeOperationError &&
+      (error.retryAt !== undefined || error.reason === "permission")
+    ) {
+      // A locked comment or denied credential needs a slower recheck. Keep the
+      // durable vote and comment intents intact and honor provider rate limits.
+      const retryAt = new Date(
+        Math.max(Date.now() + retryMs, error.retryAt ?? Date.now() + 3_600_000),
+      );
+      await withCurrentMergeReview(database, repo, pr, review, async (tx) => {
+        await tx
+          .update(pullRequests)
+          .set({ mergeAfter: retryAt })
+          .where(eq(pullRequests.id, pr.id));
+      });
+    }
     if (
       !fenced &&
       (decision.reasons[0]?.code === "guard_unavailable" ||

@@ -2,6 +2,10 @@ import type { ForgeType } from "@forge-adapters/src/types.js";
 
 export type ForgeActor = { id: string; login: string };
 
+/** An absent result permits read-only reconciliation of a potentially delayed vote. */
+export type ForgeApprovalResult =
+  "approved" | "absent" | "unsupported" | "stale" | "dismissed";
+
 export type ForgeChange = {
   number: number;
   /** Only an explicit false from the provider authorizes an automatic review. */
@@ -289,6 +293,19 @@ export interface Forge {
   };
   /** Read authoritative revisions, native restrictions, and the existing schedule without writing. */
   inspectMerge(request: ForgeMergeRequest): Promise<ForgeMergeState>;
+  /** Inspect the reviewed revision for a bot vote independently of native merge configuration. */
+  inspectApproval(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+  ): Promise<ForgeMergeState>;
+  /** Reconcile this actor's vote, fencing a first submission immediately before the provider call. */
+  approveReview(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    reconcileOnly: boolean,
+    beforeWrite: () => Promise<void>,
+    acknowledged?: boolean,
+  ): Promise<ForgeApprovalResult>;
   /** Revalidate immediately and schedule only a guarded, non-bypassing native operation. */
   scheduleMerge(
     request: ForgeMergeRequest,

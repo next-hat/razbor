@@ -26,6 +26,7 @@ import {
 import {
   ForgejoInteractions,
   ForgeOperationError,
+  type ForgeActor,
   type ForgeMergeState,
   type ForgeMergeCheckpoint,
   type ForgeMergeRequest,
@@ -74,10 +75,10 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
   );
   const migrations = path.resolve(dir, "../migrations");
   const phase2 = (await readdir(migrations))
-    .filter((f) => /^\d{4}_.*\.sql$/.test(f) && f < "0032_")
+    .filter((f) => /^\d{4}_.*\.sql$/.test(f) && f < "0033_")
     .sort();
-  assert.equal(phase2.length, 32);
-  assert.equal(phase2.at(-1), "0031_deferred_open_deliveries.sql");
+  assert.equal(phase2.length, 33);
+  assert.equal(phase2.at(-1), "0032_gitlab_session_boundaries.sql");
   for (const file of phase2)
     await upgrade.pool.query(
       await readFile(path.join(migrations, file), "utf8"),
@@ -87,9 +88,13 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
   await upgrade.pool.query(`create schema drizzle;
     create table drizzle.__drizzle_migrations (id serial primary key, hash text not null, created_at bigint)`);
   const ledger =
-    "select hash,created_at from drizzle.__drizzle_migrations order by created_at";
+    "select hash,created_at from drizzle.__drizzle_migrations order by created_at,hash";
   const current = (await fixture.administrator.query(ledger)).rows;
   assert.equal(current[31].created_at, "1790000000031");
+  assert.equal(
+    current[32].hash,
+    "7d712b4f6b4633bd26adb8dad343ec24f23325855a96b8c5121f8ff428e18e43",
+  );
   await upgrade.pool.query(
     "insert into drizzle.__drizzle_migrations (hash,created_at) select hash,created_at from json_to_recordset($1) as entry(hash text,created_at bigint)",
     [JSON.stringify(current.slice(0, phase2.length))],
@@ -136,7 +141,7 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
   );
   const [row] = (
     await upgrade.pool.query(
-      "select r.merge_policy, r.merge_policy_version, v.merge_pull_request_id, v.source,v.result,v.merge_action,v.merge_write_stage from repositories r join reviews v on v.repository_id=r.id",
+      "select r.merge_policy, r.merge_policy_version, v.merge_pull_request_id, v.source,v.result,v.merge_action,v.merge_write_stage,v.forge_approval from repositories r join reviews v on v.repository_id=r.id",
     )
   ).rows;
   assert.deepEqual(row.merge_policy, mergePolicySchema.parse({}));
@@ -146,37 +151,89 @@ test("Phase 2 data upgrades without authorizing a historical result", async (t) 
   assert.equal(row.result.summary, "Legacy");
   assert.equal(row.merge_action, null);
   assert.equal(row.merge_write_stage, null);
+  assert.equal(row.forge_approval, null);
 
-  // Restore the published preview's policy schema and ledger. Policy records
-  // already in use must survive while 0032 installs the missing PR #5 columns.
+  // The last PR #6 preview already had merge_policy and merge_write_stage.
+  // Its earlier high-water mark skips GitLab boundaries unless the upgrade repairs them.
+  const dropBoundary = `drop trigger record_deferred_boundary on webhook_deliveries;
+     drop function razbor_record_deferred_boundary();
+     alter table webhook_deliveries drop column boundary_number, drop column boundary_at`;
+  await upgrade.pool.query(dropBoundary);
+  await upgrade.pool.query(`alter table reviews drop column forge_approval;
+     delete from drizzle.__drizzle_migrations where created_at in (1790000000032,1790000000037);
+     update repositories set merge_policy_version=8, merge_policy=jsonb_set(merge_policy-'autoApprove','{policyMarkdown}','"Preview policy"')`);
+  await upgrade.pool.query(
+    `with hook as (
+       insert into repository_webhooks(public_id, repository_id, managed_by, enabled, callback_base, secret, senders)
+       values ('hook_0123456789abcdef', $1, 'file', true, '', '{}','[]') returning id)
+     insert into webhook_deliveries(webhook_id,delivery_id,pending_open) select id,'pending-boundary',
+       '{"kind":"reopened","number":7,"occurredAt":"2026-11-14T10:00:00Z"}' from hook`,
+    [repo],
+  );
+  await migrate(url.href);
+  await migrate(url.href);
+  assert.deepEqual((await upgrade.pool.query(ledger)).rows, current);
+  const repaired = (
+    await upgrade.pool
+      .query(`select boundary_number, boundary_at, r.merge_policy_version,
+    r.merge_policy->'autoApprove' as approve from webhook_deliveries cross join repositories r`)
+  ).rows[0];
+  assert.equal(repaired.boundary_number, 7);
+  assert.equal(repaired.boundary_at.toISOString(), "2026-11-14T10:00:00.000Z");
+  assert.equal(repaired.merge_policy_version, 8);
+  assert.equal(repaired.approve, false);
+
+  // The original preview could have installed its own observation migration at
+  // the same timestamp as Phase 2's GitLab boundary migration. Keep both records.
   const previewHash =
     "7708f6b258ac9c27160054b61e554311e97110557368b43f2475f208d96d7dbd";
+  await upgrade.pool.query(dropBoundary);
   await upgrade.pool.query(
     `alter table webhook_deliveries drop column pending_open, drop column open_retry_after;
-     alter table reviews drop column merge_write_stage;
+     alter table reviews drop column merge_write_stage, drop column forge_approval;
      delete from drizzle.__drizzle_migrations where created_at > 1790000000031;
-     update repositories set merge_policy_version=8, merge_policy=jsonb_set(merge_policy,'{policyMarkdown}','"Preview policy"')`,
+     update repositories set merge_policy=merge_policy-'autoApprove'`,
   );
   await upgrade.pool.query(
     "update drizzle.__drizzle_migrations set hash=$1 where created_at=1790000000031",
     [previewHash],
   );
+  await upgrade.pool.query(
+    "insert into drizzle.__drizzle_migrations(created_at,hash) values (1790000000032,'unknown')",
+  );
+  await assert.rejects(
+    migrate(url.href),
+    /Unrecognized migration history at 0032/,
+  );
+  await upgrade.pool.query(
+    "update drizzle.__drizzle_migrations set hash=$1 where created_at=1790000000032",
+    [current[34].hash],
+  );
   await migrate(url.href);
   await migrate(url.href);
   const previewLedger = (await upgrade.pool.query(ledger)).rows;
-  assert.deepEqual(previewLedger.slice(32), current.slice(32));
+  const legacyObservation = previewLedger.find(
+    (entry) =>
+      entry.created_at === "1790000000032" && entry.hash === current[34].hash,
+  );
+  assert.ok(legacyObservation);
+  assert.deepEqual(
+    previewLedger.slice(32).filter((entry) => entry !== legacyObservation),
+    current.slice(32),
+  );
   assert.equal(previewLedger[31].hash, previewHash);
   const preview = (
     await upgrade.pool.query(
-      "select r.merge_policy_version,r.merge_policy->>'policyMarkdown' as guidance,v.merge_pull_request_id,v.merge_write_stage from repositories r join reviews v on v.repository_id=r.id",
+      "select r.merge_policy_version,r.merge_policy->>'policyMarkdown' as guidance,v.merge_pull_request_id,v.merge_write_stage,v.forge_approval from repositories r join reviews v on v.repository_id=r.id",
     )
   ).rows[0];
   assert.equal(preview.merge_policy_version, 8);
   assert.equal(preview.guidance, "Preview policy");
   assert.equal(preview.merge_pull_request_id, pr);
   assert.equal(preview.merge_write_stage, null);
+  assert.equal(preview.forge_approval, null);
   await upgrade.pool.query(
-    "select pending_open,open_retry_after from webhook_deliveries limit 0",
+    "select pending_open,open_retry_after,boundary_number,boundary_at from webhook_deliveries limit 0",
   );
   assert.equal(
     (
@@ -273,6 +330,11 @@ test(
     );
     const remoteComments = new Map<string, string>();
     const closingComments = new Map<string, string>();
+    const noteStores = new Map([
+      [1, remoteComments],
+      [4, closingComments],
+    ]);
+    let nextOrdinaryNote = 200;
     const patchBodies: string[] = [];
     const priorFinding = {
       path: "guide.md",
@@ -327,7 +389,7 @@ test(
             is_admin: false,
             active: true,
           });
-        const pullRoute = /^repos\/team\/repo\/pulls\/(1|4)$/.exec(route);
+        const pullRoute = /^repos\/team\/repo\/pulls\/(\d+)$/.exec(route);
         if (pullRoute)
           return Response.json({
             number: Number(pullRoute[1]),
@@ -335,20 +397,26 @@ test(
             merged: false,
             draft: false,
             title: "One",
-            user: bot,
+            user: { id: 7, login: "contributor" },
             html_url: origin + "/team/repo/pulls/" + pullRoute[1],
             base: { sha: baseSha, ref: "main" },
             head: { sha: headSha, ref: "docs" },
             merge_base: baseSha,
           });
-        const collection = /^repos\/team\/repo\/issues\/(1|4)\/comments$/.exec(
+        const collection = /^repos\/team\/repo\/issues\/(\d+)\/comments$/.exec(
           route,
         );
-        const stored =
-          collection?.[1] === "4" ? closingComments : remoteComments;
+        const number = Number(collection?.[1]);
+        const stored = noteStores.get(number) ?? new Map<string, string>();
+        if (collection) noteStores.set(number, stored);
         if (collection && init?.method === "POST") {
-          posts++;
           const body = JSON.parse(String(init.body)).body;
+          if (number !== 1 && number !== 4) {
+            const id = nextOrdinaryNote++;
+            stored.set(String(id), body);
+            return Response.json({ id });
+          }
+          posts++;
           if (collection[1] === "4") {
             closedReservation = body;
             throw new Error("reservation POST delayed past closure");
@@ -376,9 +444,9 @@ test(
           );
         if (route.startsWith("repos/team/repo/issues/comments/")) {
           const id = route.split("/").at(-1)!;
-          const onClosedPr = closingComments.has(id);
-          const comments = onClosedPr ? closingComments : remoteComments;
-          if (!comments.has(id)) return new Response(null, { status: 404 });
+          const owner = [...noteStores].find(([, notes]) => notes.has(id));
+          if (!owner) return new Response(null, { status: 404 });
+          const [number, comments] = owner;
           if (init?.method === "DELETE") {
             comments.delete(id);
             return new Response(null, { status: 204 });
@@ -389,7 +457,7 @@ test(
               rejectedMention = true;
               return new Response(null, { status: 403 });
             }
-            patchBodies.push(body);
+            if (number === 1 || number === 4) patchBodies.push(body);
             if (!delayedMention && body.includes("@alice")) {
               delayedMention = body;
               throw new Error("mention PATCH delayed");
@@ -400,8 +468,7 @@ test(
             id: Number(id),
             body: comments.get(id),
             user: bot,
-            pull_request_url:
-              origin + "/team/repo/pulls/" + (onClosedPr ? 4 : 1),
+            pull_request_url: origin + "/team/repo/pulls/" + number,
             issue_url: "",
           });
         }
@@ -417,10 +484,78 @@ test(
     let writes = 0;
     let nextRateLimit: number | undefined;
     let denyNextSubmission = false;
+    const inspections: number[] = [];
+    const voteWrites: number[] = [];
+    const liveApprovalEvents: string[] = [];
+    let visibleVote: "absent" | "approved" | "dismissed" = "absent";
+    const approve = t.mock.method(
+      ForgejoInteractions.prototype,
+      "approveReview",
+      async (
+        request: ForgeMergeRequest,
+        bot: ForgeActor,
+        reconcileOnly: boolean,
+        beforeWrite: () => Promise<void>,
+        acknowledged?: boolean,
+      ) => {
+        assert.equal(request.headSha, headSha);
+        assert.equal(request.baseSha, baseSha);
+        assert.equal(bot.id, "1");
+        if (request.number === 12) {
+          assert.equal(request.reviewId, liveApprovedReview);
+          assert.equal(request.externalRepositoryId, "2");
+          assert.equal(request.baseBranch, "main");
+          if (reconcileOnly) {
+            assert.equal(acknowledged, true);
+            assert.equal(await voteStatus(request.reviewId), "approved");
+            liveApprovalEvents.push("read approved vote");
+          }
+        }
+        if (reconcileOnly) return visibleVote;
+        await beforeWrite();
+        assert.equal(await voteStatus(request.reviewId), "uncertain");
+        voteWrites.push(request.number);
+        if (request.number === 12) {
+          visibleVote = "approved";
+          liveApprovalEvents.push("cast approval");
+          return "approved";
+        }
+        if (request.number === 9)
+          throw new ForgeOperationError("permission", false, 403);
+        if (request.number === 10) {
+          // Source or policy edits and PR revisions must wait across the wire write.
+          await assert.rejects(
+            restart.pool.query(
+              "select id from repositories where public_id=$1 for update nowait",
+              [repo.id],
+            ),
+            { code: "55P03" },
+          );
+          await assert.rejects(
+            restart.pool.query(
+              "select p.id from pull_requests p join repositories r on r.id=p.repository_id where r.public_id=$1 and p.number=$2 for update of p nowait",
+              [repo.id, request.number],
+            ),
+            { code: "55P03" },
+          );
+          return "approved";
+        }
+        throw new ForgeOperationError("unavailable", true);
+      },
+    );
+    t.mock.method(
+      ForgejoInteractions.prototype,
+      "inspectApproval",
+      async () => ({
+        state: "ready",
+        reason: "approval_ready",
+      }),
+    );
     t.mock.method(
       ForgejoInteractions.prototype,
       "inspectMerge",
       async (request: ForgeMergeRequest) => {
+        inspections.push(request.number);
         if (pauseInspection) await pauseInspection(request);
         return checks;
       },
@@ -429,10 +564,22 @@ test(
       ForgejoInteractions.prototype,
       "scheduleMerge",
       async (
-        _request: ForgeMergeRequest,
+        request: ForgeMergeRequest,
         _resumeOnly: boolean,
         checkpoint: ForgeMergeCheckpoint,
       ) => {
+        if (request.number === 12) {
+          assert.equal(request.reviewId, liveApprovedReview);
+          await checkpoint("creating_check");
+          await checkpoint("submitting");
+          liveApprovalEvents.push("submit native merge");
+          writes++;
+          await checkpoint("armed");
+          await checkpoint("releasing");
+          liveApprovalEvents.push("release eligibility check");
+          await checkpoint("acknowledged");
+          return "merged";
+        }
         if (nextRateLimit !== undefined) {
           const retryAt = nextRateLimit;
           nextRateLimit = undefined;
@@ -520,6 +667,30 @@ test(
         [pr],
       );
     }
+    /** Inspect the durable redispatch deadline without advancing the test clock. */
+    async function deadline(pr: string): Promise<Date | null> {
+      return (
+        await db.pool.query(
+          "select merge_after from pull_requests where public_id=$1",
+          [pr],
+        )
+      ).rows[0].merge_after;
+    }
+    /** The provider has exactly one durable status comment on this PR. */
+    function bodyFor(number: number) {
+      const notes = noteStores.get(number);
+      assert.equal(notes?.size, 1);
+      return [...notes!.values()][0];
+    }
+    /** Read the vote recorded against the immutable review even after a worker restart. */
+    async function voteStatus(id: string) {
+      return (
+        await db.pool.query(
+          "select forge_approval->>'status' as status from reviews where public_id=$1",
+          [id],
+        )
+      ).rows[0].status;
+    }
     const first = await pull(1);
     const second = await pull(2);
     const human = await complete(first, 72);
@@ -563,6 +734,29 @@ test(
       action: "dry_run",
     });
     assert.equal(writes, 0);
+    assert.equal(approve.mock.callCount(), 0);
+    const dryBody = bodyFor(2);
+    assert.match(dryBody, /90\/100/);
+    assert.match(dryBody, /threshold: 90\/100/);
+    assert.match(dryBody, /[Nn]o actionable or outstanding/);
+    assert.match(dryBody, /disabled for this dry run/);
+    assert.ok(dryBody.includes(headSha));
+    assert.ok(!dryBody.includes(policy.policyMarkdown));
+    assert.ok(!dryBody.includes(assessment.reasons[0]));
+    assert.doesNotMatch(
+      dryBody,
+      /@(alice|unknown)|provider confirmed Razbor’s approval/,
+    );
+    assert.equal(await deadline(second), null);
+    const checkedBeforeIdle = inspections.filter(
+      (number) => number === 2,
+    ).length;
+    await processMergeTriage(restart);
+    assert.equal(
+      inspections.filter((number) => number === 2).length,
+      checkedBeforeIdle,
+    );
+    assert.equal(nextOrdinaryNote, 201);
     assert.equal((await decision(human)).status, "human_review_required");
     assert.equal(posts, 1);
     assert.doesNotMatch(delayedReservation, /@alice/);
@@ -620,7 +814,8 @@ test(
     assert.equal(
       (
         await db.pool.query(
-          "select count(*)::int n from merge_escalation_history",
+          "select count(*)::int n from merge_escalation_history h join pull_requests p on p.id=h.pull_request_id where p.public_id=$1",
+          [first],
         )
       ).rows[0].n,
       1,
@@ -741,6 +936,117 @@ test(
     assert.equal(posts, postsAtClose);
     assert.equal(patchBodies.length, editsAtClose);
 
+    const votePr = await pull(8);
+    const beforeOptIn = await complete(votePr, 96);
+    config.repositories.project.mergePolicy = { ...policy, autoApprove: true };
+    await applyRegistry(db, config);
+    await processMergeTriage(db);
+    assert.equal((await decision(beforeOptIn)).status, "stale");
+    assert.equal(approve.mock.callCount(), 0);
+    checks = {
+      state: "blocked",
+      reason: "forgejo_schedule_does_not_pin_reviewed_head",
+    };
+    const votingReview = await complete(votePr, 96);
+    const escalatedAgain = await complete(first, 100);
+    await processMergeTriage(db);
+    assert.deepEqual(voteWrites, [8]);
+    assert.equal(writes, 0);
+    assert.equal(
+      (await decision(escalatedAgain)).status,
+      "human_review_required",
+    );
+    assert.equal(await voteStatus(votingReview), "uncertain");
+    assert.ok((await deadline(votePr))!.getTime() > Date.now() + 30_000);
+    assert.match(bodyFor(8), /96\/100/);
+    assert.match(bodyFor(8), /not confirmed whether Razbor’s approval/);
+    const replacementVoteReview = await complete(votePr, 97);
+    await processMergeTriage(restart);
+    assert.deepEqual(voteWrites, [8]);
+    assert.equal(await voteStatus(replacementVoteReview), null);
+    visibleVote = "approved";
+    await due(votePr);
+    await processMergeTriage(restart);
+    assert.deepEqual(voteWrites, [8]);
+    assert.equal(await voteStatus(votingReview), "approved");
+    assert.equal(await deadline(votePr), null);
+    const approvedBody = bodyFor(8);
+    assert.match(approvedBody, /97\/100/);
+    assert.match(approvedBody, /provider confirmed Razbor’s approval/);
+    assert.match(approvedBody, /disabled for this dry run/);
+    assert.equal((await decision(replacementVoteReview)).status, "blocked");
+    visibleVote = "dismissed";
+    await due(votePr);
+    await processMergeTriage(restart);
+    assert.deepEqual(voteWrites, [8]);
+    assert.equal(await voteStatus(votingReview), "dismissed");
+    assert.match(bodyFor(8), /approval was dismissed/);
+    const deniedVotePr = await pull(9);
+    const deniedVoteReview = await complete(deniedVotePr, 96);
+    await processMergeTriage(db);
+    assert.equal(await voteStatus(deniedVoteReview), "unavailable");
+    await due(deniedVotePr);
+    await processMergeTriage(restart);
+    assert.deepEqual(voteWrites, [8, 9]);
+    assert.equal(writes, 0);
+    assert.equal(await deadline(deniedVotePr), null);
+    assert.match(bodyFor(9), /could not approve/);
+    checks = { state: "ready", reason: "provider_ready" };
+    const acknowledgedPr = await pull(10);
+    const acknowledgedVote = await complete(acknowledgedPr, 98);
+    await Promise.all([processMergeTriage(db), processMergeTriage(restart)]);
+    assert.deepEqual(voteWrites, [8, 9, 10]);
+    assert.equal(await voteStatus(acknowledgedVote), "approved");
+    assert.equal(await deadline(acknowledgedPr), null);
+    assert.deepEqual(await decision(acknowledgedVote), {
+      status: "auto_merge_eligible",
+      action: "dry_run",
+    });
+    assert.match(bodyFor(10), /provider confirmed Razbor’s approval/);
+    assert.equal(writes, 0);
+
+    config.repositories.project.mergePolicy = {
+      ...policy,
+      dryRun: false,
+      autoApprove: true,
+    };
+    await applyRegistry(db, config);
+    const liveApprovalPr = await pull(11);
+    const preparedAfterApproval = await complete(liveApprovalPr, 98);
+    await db.pool.query(
+      `update reviews set merge_action='writing', merge_write_stage='prepared',
+         forge_approval=$2 where public_id=$1`,
+      [preparedAfterApproval, { botId: "1", status: "approved" }],
+    );
+    // The forge withdrew a confirmed vote while the dispatcher was stopped.
+    visibleVote = "dismissed";
+    await processMergeTriage(restart);
+    assert.equal(
+      writes,
+      0,
+      "a withdrawn approval cannot release a prepared merge",
+    );
+    assert.equal(await voteStatus(preparedAfterApproval), "dismissed");
+    assert.equal((await decision(preparedAfterApproval)).status, "blocked");
+    assert.deepEqual(voteWrites, [8, 9, 10]);
+    const readyForBoth = await pull(12);
+    const liveApprovedReview = await complete(readyForBoth, 99);
+    await processMergeTriage(db);
+    assert.deepEqual(liveApprovalEvents, [
+      "cast approval",
+      "read approved vote",
+      "submit native merge",
+      "read approved vote",
+      "release eligibility check",
+    ]);
+    assert.equal(await voteStatus(liveApprovedReview), "approved");
+    assert.deepEqual(await decision(liveApprovedReview), {
+      status: "merged",
+      action: "merged",
+    });
+    assert.deepEqual(voteWrites, [8, 9, 10, 12]);
+    assert.equal(writes, 1);
+
     config.repositories.project.mergePolicy = {
       ...policy,
       dryRun: false,
@@ -749,15 +1055,15 @@ test(
     await applyRegistry(db, config);
     await processMergeTriage(db);
     assert.equal((await decision(clean)).status, "stale");
-    assert.equal(writes, 0);
-    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 2);
+    assert.equal(writes, 1);
+    assert.equal((await getRepository(db, repo.id))?.mergePolicyVersion, 4);
     assert.equal(
       (await getRepository(db, repos.find((r) => r.configKey === "other")!.id))
         ?.mergePolicyVersion,
       1,
     );
     await assert.rejects(
-      updateRepositoryMergePolicy(db, repo.id, { version: 2, policy }),
+      updateRepositoryMergePolicy(db, repo.id, { version: 4, policy }),
       /registry file/,
     );
     const live = await complete(second, 95);
@@ -795,14 +1101,14 @@ test(
       }
     }
     await whileInspectionPaused(() => processMergeTriage(restart));
-    assert.equal(writes, 1);
+    assert.equal(writes, 2);
     assert.deepEqual(await decision(live), {
       status: "blocked",
       action: "uncertain",
     });
     await due(second);
     await processMergeTriage(restart);
-    assert.equal(writes, 1);
+    assert.equal(writes, 2);
     checks = { state: "merged", reason: "verified" };
     await due(second);
     await processMergeTriage(restart);
@@ -810,7 +1116,7 @@ test(
       status: "merged",
       action: "merged",
     });
-    assert.equal(writes, 1);
+    assert.equal(writes, 2);
     const third = await pull(3);
     const superseded = await complete(third, 95);
     checks = { state: "ready", reason: "verified" };
@@ -826,7 +1132,7 @@ test(
     });
     await processMergeTriage(db);
     assert.equal((await decision(superseded)).status, "stale");
-    assert.equal(writes, 1);
+    assert.equal(writes, 2);
 
     const previewPr = await pull(5);
     const oldCheck = await complete(previewPr, 95);
@@ -884,11 +1190,11 @@ test(
     await processMergeTriage(restart);
     assert.equal(cancelPreview.mock.callCount(), 1);
     assert.equal((await decision(newest)).status, "awaiting_checks");
-    assert.equal(writes, 1);
+    assert.equal(writes, 2);
     checks = { state: "ready", reason: "provider_ready" };
     await due(previewPr);
     await processMergeTriage(restart);
-    assert.equal(writes, 2);
+    assert.equal(writes, 3);
 
     const limitedPr = await pull(6);
     const limited = await complete(limitedPr, 95);
@@ -909,7 +1215,7 @@ test(
     );
     assert.equal(limitedRow.merge_after.getTime(), retryAt);
     await processMergeTriage(restart);
-    assert.equal(writes, 2);
+    assert.equal(writes, 3);
     // Make the next observation explicitly report that an uncertain create is still unseen.
     checks = { state: "blocked", reason: "eligibility_check_unconfirmed" };
     await due(limitedPr);
@@ -929,7 +1235,7 @@ test(
       missing.merge_decision.reasons[0].message,
       /operator recovery/,
     );
-    assert.equal(writes, 2);
+    assert.equal(writes, 3);
 
     const deniedPr = await pull(7);
     const denied = await complete(deniedPr, 95);
@@ -950,7 +1256,7 @@ test(
     );
     await due(deniedPr);
     await processMergeTriage(restart);
-    assert.equal(writes, 2);
+    assert.equal(writes, 3);
     const afterDenial = await complete(deniedPr, 95);
     expectedCheckOwner = denied;
     checks = {
@@ -961,7 +1267,7 @@ test(
     await processMergeTriage(restart);
     assert.equal(cancelPreview.mock.callCount(), 2);
     assert.equal((await decision(afterDenial)).status, "awaiting_checks");
-    assert.equal(writes, 2);
+    assert.equal(writes, 3);
 
     // Ten older PRs share a busy repository. The unrelated repository must get
     // a dispatch slot in this same batch, even if its own review queue is empty.

@@ -2,6 +2,16 @@
 
 Merge automation starts disabled and in dry run. Use a repository administrator’s authorized installation or service account. The adapter reads current provider state before each action. An eligible dry run publishes neither a merge request to the provider nor a successful eligibility check. [Configure repository policy](merge-policy.md).
 
+## Optional approval
+
+With an enabled policy and `autoApprove = true`, Razbor may cast one real vote on the reviewed revision. Leave `dryRun = true` to use approval without scheduling native merges. The provider must confirm the repository, author, revision, default destination, discussions and checks. A PR that Razbor escalated to human review stays in the human workflow. Razbor checks for an existing queue entry or native merge schedule before voting. An independent integration can still schedule a merge concurrently or react to the vote.
+
+- **GitHub.** Use an installed GitHub App with pull-request write access and read access to the checks and protection settings. Configure enforced stale-review dismissal on the destination, or lock the source branch against changes. Razbor submits the PR node ID and reviewed commit OID and verifies the returned review. A missing human approval alone allows Razbor to cast its own vote. [GitHub pull request reviews](https://docs.github.com/en/graphql/reference/pulls#addpullrequestreviewinput) · [GitHub branch protection](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches).
+- **GitLab.** Use a bot account eligible to approve and a project exposing the approval configuration API. Enable full approval reset on push, disable selective Code Owner resets and leave merge trains off. Razbor submits to the numeric project and MR with the reviewed SHA. GitLab’s approval list identifies voters without reporting the SHA of their vote. After a lost response Razbor keeps the vote unconfirmed unless it can establish the outcome. [GitLab approval configuration and SHA precondition](https://docs.gitlab.com/api/merge_request_approvals/).
+- **Forgejo.** Dry runs publish the confidence report. The supported Forgejo API cannot guarantee that an approval applies only to the requested revision, so Razbor reports native approval as unavailable.
+
+Razbor records a vote intent before submission. A timeout triggers read-only reconciliation. If GitLab cannot tie a lost response to the reviewed SHA, the confidence comment reports the approval as unconfirmed. A maintainer can review and complete the MR in GitLab. A new source commit can receive its own review and vote. A dismissed vote is left for a person to review. When live merge scheduling and automatic approval are both enabled, the dispatcher checks the vote again before submission or release. The forge controls how a recorded approval counts after later pushes or equivalent rebases.
+
 ## GitHub
 
 Guarded GitHub auto-merge requires an organization-owned repository with classic push restrictions available on its plan. Personal repositories can use Razbor’s human triage. [GitHub branch restrictions](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#restrict-who-can-push-to-matching-branches).

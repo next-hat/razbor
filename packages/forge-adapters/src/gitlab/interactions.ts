@@ -13,6 +13,7 @@ import {
   reviewRevision,
   verifyStatusComment,
   type Forge,
+  type ForgeActor,
   type ForgeChange,
   type ForgeMergeCheckpoint,
   type ForgeMergeRequest,
@@ -29,6 +30,10 @@ import {
   webhookEndpoint,
 } from "@forge-adapters/src/transport.js";
 import { resolveReviewer } from "@forge-adapters/src/merge.js";
+import {
+  approveGitlabReview,
+  inspectGitlabApproval,
+} from "@forge-adapters/src/gitlab/approval.js";
 import {
   inspectGitlabMerge,
   scheduleGitlabMerge,
@@ -368,6 +373,32 @@ export class GitlabForge implements Forge {
   /** Inspect the protected target and merge request checks using this project's credential. */
   inspectMerge(request: ForgeMergeRequest) {
     return inspectGitlabMerge(this.transport, this.route, request);
+  }
+
+  /** Evaluate the reviewed MR for a native bot vote even when its human approvals are pending. */
+  async inspectApproval(request: ForgeMergeRequest, bot: ForgeActor) {
+    return (
+      await inspectGitlabApproval(this.transport, this.route, request, bot)
+    ).decision;
+  }
+
+  /** Verify an acknowledged SHA-bound vote, or submit one first approval using the MR head guard. */
+  approveReview(
+    request: ForgeMergeRequest,
+    bot: ForgeActor,
+    reconcileOnly: boolean,
+    beforeWrite: () => Promise<void>,
+    acknowledged = false,
+  ) {
+    return approveGitlabReview(
+      this.transport,
+      this.route,
+      request,
+      bot,
+      reconcileOnly,
+      beforeWrite,
+      acknowledged,
+    );
   }
 
   /** Submit the native SHA-guarded merge-when-checks-pass request. */

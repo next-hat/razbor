@@ -71,6 +71,7 @@ test("merge policy defaults are inert and repository thresholds use inclusive in
   assert.deepEqual(mergePolicySchema.parse({}), {
     enabled: false,
     dryRun: true,
+    autoApprove: false,
     minimumConfidence: 90,
     mergeMethod: "squash",
     requirePassingChecks: true,
@@ -102,6 +103,26 @@ test("merge policy defaults are inert and repository thresholds use inclusive in
     mergePolicySnapshotSchema.safeParse({
       version: 1,
       policy: { enabled: true },
+    }).success,
+    false,
+  );
+  const { autoApprove, ...legacy } = policy;
+  assert.equal(autoApprove, false);
+  assert.deepEqual(
+    mergePolicySnapshotSchema.parse({ version: 2, policy: legacy }).policy,
+    policy,
+  );
+  const optIn = mergePolicySchema.parse({ enabled: true, autoApprove: true });
+  assert.equal(optIn.dryRun, true);
+  assert.equal(
+    mergePolicySnapshotSchema.parse({ version: 3, policy: optIn }).policy
+      .autoApprove,
+    true,
+  );
+  assert.equal(
+    mergePolicySnapshotSchema.safeParse({
+      version: 2,
+      policy: { ...legacy, autoApprove: "true" },
     }).success,
     false,
   );
@@ -382,6 +403,64 @@ test("member decisions replace stored native and triage messages and discard unk
     },
   ]);
   assert.equal(stored.reasons[0].message, privateNote);
+});
+
+test("dry-run comments explain the score and native approval independently of merge eligibility", () => {
+  const privateNote = "Private reviewer instructions @private-team";
+  const opts = {
+    snapshot: {
+      version: 1,
+      policy: { ...policy, autoApprove: true, policyMarkdown: privateNote },
+    },
+    assessment: {
+      ...assessment,
+      reasons: [privateNote],
+      suggestedReviewers: [privateNote],
+    },
+    headSha: "a".repeat(40),
+    marker: "<!-- razbor:pr_example:escalation -->",
+  };
+  const eligible = evaluateMergeDecision(input);
+  const eligibleBody = renderMergeEscalation({ ...opts, decision: eligible });
+  assert.match(eligibleBody, /Dry-run assessment/);
+  assert.match(eligibleBody, /Merge confidence: 90\/100/);
+  assert.match(eligibleBody, /Required threshold: 90\/100/);
+  assert.match(eligibleBody, /Risk: low/);
+  assert.match(
+    eligibleBody,
+    /No actionable or outstanding review findings remain/,
+  );
+  assert.match(eligibleBody, /required provider checks passed/);
+  assert.doesNotMatch(eligibleBody, /confirmed Razbor’s approval/);
+  assert.ok(!eligibleBody.includes(privateNote));
+  assert.ok(
+    eligibleBody.includes(opts.headSha) && eligibleBody.endsWith(opts.marker),
+  );
+  const decision = {
+    status: "awaiting_checks" as const,
+    reasons: [{ code: "required_check_pending", message: privateNote }],
+    reviewers: ["private-team"],
+  };
+  const approved = renderMergeEscalation({
+    ...opts,
+    decision,
+    approval: "approved",
+  });
+  assert.match(approved, /confirmed Razbor’s approval/);
+  assert.match(approved, /still needed on the reviewed commit/);
+  assert.doesNotMatch(
+    approved,
+    /checks passed|meets the configured merge requirements|private-team|Private reviewer/,
+  );
+  for (const [approval, wording] of [
+    ["uncertain", /not confirmed whether/],
+    ["dismissed", /approval was dismissed/],
+    ["unavailable", /could not approve/],
+  ] as const)
+    assert.match(
+      renderMergeEscalation({ ...opts, decision, approval }),
+      wording,
+    );
 });
 
 test("reviewer selection, fallback, and comment reconciliation only mention bounded configured identities", () => {

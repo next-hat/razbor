@@ -19,11 +19,11 @@ import {
 import type { HttpForgeTransport } from "@forge-adapters/src/transport.js";
 import type { ForgeConnection } from "@forge-adapters/src/types.js";
 
-const eligibilityCheck = "Razbor / merge eligibility";
+export const eligibilityCheck = "Razbor / merge eligibility";
 
-const retiredEligibilityCheck = "Razbor / retired merge eligibility";
+export const retiredEligibilityCheck = "Razbor / retired merge eligibility";
 
-const lockFields = `pattern lockBranch lockAllowsFetchAndMerge allowsDeletions allowsForcePushes isAdminEnforced`;
+export const lockFields = `pattern lockBranch lockAllowsFetchAndMerge allowsDeletions allowsForcePushes isAdminEnforced`;
 
 const query = `query RazborMerge($owner:String!, $name:String!, $number:Int!) {
   repository(owner:$owner,name:$name) {
@@ -40,7 +40,7 @@ const query = `query RazborMerge($owner:String!, $name:String!, $number:Int!) {
   }
 }`;
 
-const lockRule = z.object({
+export const lockRule = z.object({
   pattern: z.string(),
   lockBranch: z.boolean(),
   lockAllowsFetchAndMerge: z.boolean(),
@@ -176,7 +176,7 @@ const checkPage = z.object({
   check_runs: z.array(check).max(checkPageSize),
 });
 
-type GithubApi = {
+export type GithubApi = {
   route: string;
   owner: string;
   name: string;
@@ -196,7 +196,7 @@ type Inspection = {
 };
 
 /** Retargeting cannot move an armed request to a writable feature branch. */
-function locked(rule: z.infer<typeof lockRule> | null | undefined) {
+export function locked(rule: z.infer<typeof lockRule> | null | undefined) {
   return (
     !!rule &&
     rule.lockBranch &&
@@ -213,7 +213,7 @@ function externalId(request: ForgeMergeRequest) {
 }
 
 /** Read every reported run for this head, including historical runs when retiring a check. */
-async function checks(
+export async function checks(
   api: GithubApi,
   request: ForgeMergeRequest,
   eligibilityName?: string,
@@ -288,7 +288,11 @@ async function enforcedRuleset(api: GithubApi, rulesetId: string) {
 }
 
 /** Collect active ruleset checks, recording the actor-specific bypass decision for the eligibility rule. */
-async function rulesetChecks(api: GithubApi, request: ForgeMergeRequest) {
+export async function rulesetChecks(
+  api: GithubApi,
+  request: ForgeMergeRequest,
+  forApproval = false,
+) {
   const all = await api.transport.list(
     `${api.route}/rules/branches/${encodeURIComponent(request.baseBranch)}`,
   );
@@ -296,6 +300,7 @@ async function rulesetChecks(api: GithubApi, request: ForgeMergeRequest) {
     [];
   let pinned = false;
   let conversations = false;
+  let dismissesStaleReviews = false;
   for (const value of all) {
     const type = z.object({ type: z.string() }).parse(value).type;
     if (type === "pull_request") {
@@ -304,14 +309,20 @@ async function rulesetChecks(api: GithubApi, request: ForgeMergeRequest) {
           ruleset_id: mergeId,
           parameters: z.object({
             required_review_thread_resolution: z.boolean().optional(),
+            dismiss_stale_reviews_on_push: z.boolean().optional(),
           }),
         })
         .parse(value);
       if (
-        rule.parameters.required_review_thread_resolution &&
+        (rule.parameters.required_review_thread_resolution ||
+          (forApproval && rule.parameters.dismiss_stale_reviews_on_push)) &&
         (await enforcedRuleset(api, rule.ruleset_id))
-      )
-        conversations = true;
+      ) {
+        if (rule.parameters.required_review_thread_resolution)
+          conversations = true;
+        if (forApproval && rule.parameters.dismiss_stale_reviews_on_push)
+          dismissesStaleReviews = true;
+      }
     }
     if (type !== "required_status_checks") continue;
     const rule = z
@@ -340,7 +351,35 @@ async function rulesetChecks(api: GithubApi, request: ForgeMergeRequest) {
       if (await enforcedRuleset(api, rule.ruleset_id)) pinned = true;
     }
   }
-  return { required, pinned, conversations };
+  return { required, pinned, conversations, dismissesStaleReviews };
+}
+
+/** Verify every configured CI check apart from Razbor's separate merge gate on this exact commit. */
+export function requiredCheckState(
+  requirements: { context: string; app: { databaseId: string } | null }[],
+  runs: z.infer<typeof check>[],
+  requireVerification: boolean,
+  eligibilityAppId: string | undefined,
+) {
+  const required = requirements.filter(
+    (s) =>
+      s.context !== eligibilityCheck ||
+      !eligibilityAppId ||
+      s.app?.databaseId !== eligibilityAppId,
+  );
+  if (requireVerification && !required.length)
+    return mergeState("blocked", "verification_check_required");
+  for (const criterion of required) {
+    const matching = runs.filter(
+      (r) =>
+        r.name === criterion.context &&
+        (!criterion.app || criterion.app.databaseId === r.app.id),
+    );
+    if (!matching.length || matching.some((r) => r.status !== "completed"))
+      return mergeState("awaiting_checks", "required_check_pending");
+    if (matching.some((r) => r.conclusion !== "success"))
+      return mergeState("blocked", "required_check_failed");
+  }
 }
 
 /** Inspect native rules and status evidence without publishing or enabling anything. */
@@ -461,13 +500,17 @@ export async function inspectGithubMerge(
   )
     return { decision: mergeState("blocked", "existing_schedule") };
   if (
-    pr.mergeable !== "MERGEABLE" ||
-    !["CLEAN", "BLOCKED", "UNSTABLE", "HAS_HOOKS"].includes(
+    !["MERGEABLE", "UNKNOWN"].includes(pr.mergeable) ||
+    !["CLEAN", "BLOCKED", "UNSTABLE", "HAS_HOOKS", "UNKNOWN"].includes(
       pr.mergeStateStatus,
     ) ||
     (pr.reviewDecision && pr.reviewDecision !== "APPROVED")
   )
     return { decision: mergeState("blocked", "merge_restrictions") };
+  if (pr.mergeable === "UNKNOWN" || pr.mergeStateStatus === "UNKNOWN")
+    return {
+      decision: mergeState("awaiting_checks", "required_check_pending"),
+    };
   const runs = await checks(api, request);
   if (
     runs.some(
@@ -515,24 +558,13 @@ export async function inspectGithubMerge(
       };
     return { decision: mergeState("blocked", "retired_eligibility_check") };
   }
-  const required = [...base.requiredStatusChecks, ...enforced.required].filter(
-    (s) => s.context !== eligibilityCheck,
+  const verification = requiredCheckState(
+    [...base.requiredStatusChecks, ...enforced.required],
+    runs,
+    request.requirePassingChecks,
+    api.app.appId,
   );
-  if (request.requirePassingChecks && !required.length)
-    return { decision: mergeState("blocked", "verification_check_required") };
-  for (const criterion of required) {
-    const matching = runs.filter(
-      (r) =>
-        r.name === criterion.context &&
-        (!criterion.app || criterion.app.databaseId === r.app.id),
-    );
-    if (!matching.length || matching.some((r) => r.status !== "completed"))
-      return {
-        decision: mergeState("awaiting_checks", "required_check_pending"),
-      };
-    if (matching.some((r) => r.conclusion !== "success"))
-      return { decision: mergeState("blocked", "required_check_failed") };
-  }
+  if (verification) return { decision: verification };
   if (!pr.autoMergeRequest && !pr.viewerCanEnableAutoMerge)
     return { decision: mergeState("blocked", "native_auto_merge_unavailable") };
   return {

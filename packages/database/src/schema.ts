@@ -23,6 +23,7 @@ import {
   type MergeDecision,
   type MergePolicy,
   type MergePolicySnapshot,
+  type ReviewApprovalStatus,
   type ModelProvider,
   type ReasoningEffort,
   type ResourceKind,
@@ -755,6 +756,10 @@ export const reviews = pgTable(
       { onDelete: "set null" },
     ),
     mergeWriteStage: text("merge_write_stage").$type<ForgeMergeWriteStage>(),
+    forgeApproval: jsonb("forge_approval").$type<{
+      botId: string;
+      status: ReviewApprovalStatus;
+    }>(),
     mergeDecision: jsonb("merge_decision").$type<MergeDecision>(),
     mergeAction: text("merge_action").$type<
       "dry_run" | "writing" | "scheduled" | "merged" | "uncertain" | "refused"

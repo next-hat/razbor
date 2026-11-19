@@ -2,14 +2,17 @@
 
 Open **Repository → Settings → Merge Policy** with repository management access. Choose the confidence threshold, merge method and candidate reviewers, write the Markdown policy, and save. File-managed repositories display their settings read-only. Review triggering remains a separate setting. A console request, an authorized comment command and an automatic code review all use the repository policy captured at admission. Conversational replies cannot authorize a merge.
 
-Automation starts disabled. Enable it with **Dry run** selected to evaluate real provider requirements and publish human escalations while making zero merge mutations. An eligible result appears as **Dry run · would schedule**. Configure and verify provider protection before turning dry run off. Every policy change creates a new version, including switching out of dry run. Request a fresh review before expecting the new version to authorize a merge.
+Automation starts disabled. Enable it with **Dry run** selected to post a confidence report for a completed review of a verified repository's current, open, ready-for-review PR. Razbor updates one bot-owned comment with the reviewed commit, confidence score, threshold, risk, and reasons for its decision. A settled dry run sleeps until the review, revision, or policy changes. Pending checks and unconfirmed writes have their own retry deadlines.
+
+For approval without merge scheduling, leave **Dry run** on and select **Automatically approve eligible revisions on the forge**. This casts a real vote on a supported forge after the review and approval checks pass. The comment reports the approval separately from merge eligibility. Keep automatic approval off for comment-only dry runs. To enable native merge scheduling, configure the provider protections and turn dry run off. When both actions are enabled, Razbor requires a confirmed approval and separately checks native merge eligibility before it schedules the merge. Every policy change requires a fresh review.
 
 ## Settings
 
 | Setting                | Default | Effect                                                                                                                                     |
 | ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `enabled`              | false   | Permits escalation comments and guarded automatic merging. The console can still present review assessments while disabled.                |
-| `dryRun`               | true    | Records eligibility without scheduling a merge or releasing a provider check.                                                              |
+| `enabled`              | false   | Enables triage comments and the selected approval and merge actions. The console can still show assessments while disabled.                |
+| `dryRun`               | true    | Publishes confidence and reasons. Native merge scheduling and eligibility-check release stay off.                                          |
+| `autoApprove`          | false   | Authorizes the forge bot to approve the reviewed revision under an enabled policy, including in dry run.                                   |
 | `minimumConfidence`    | 90      | Inclusive integer threshold from 0 through 100.                                                                                            |
 | `mergeMethod`          | squash  | Requested provider method. An unavailable method blocks automation.                                                                        |
 | `requirePassingChecks` | true    | Requires verified passing checks. Provider rules and the adapter’s safeguards apply for either setting.                                    |
@@ -23,6 +26,7 @@ For a file-managed repository, add the following to its **trusted deployment reg
 [repositories.platform.mergePolicy]
 enabled = true
 dryRun = true
+autoApprove = false
 minimumConfidence = 95
 mergeMethod = "squash"
 requirePassingChecks = true
@@ -53,7 +57,7 @@ The global PR page counts open requests needing human review. Both PR lists prio
 
 ## Persistence and recovery
 
-Migration `0032_merge_policy.sql` adds the repository policy and its version after the Phase 2 deferred-delivery migration (`0031`). Migration `0033` refines when provider observations invalidate a review, and `0034` records the stage of each native merge write for recovery. Reviews reference their PR and retain immutable policy and PR revision snapshots. PostgreSQL keeps review decisions, native write state, decision transitions, confirmed escalation comment revisions and the next reconciliation deadline. The dispatcher shares the publication lock with triage and commits a write intent before contacting a forge.
+Phase 2 ends with `0032_gitlab_session_boundaries.sql`. Phase 3 adds policy and version snapshots in `0033_merge_policy.sql`, refines review invalidation in `0034`, and records native merge write stages in `0035`. Migration `0036` stores the approval operation separately on the review and defaults existing repositories to automatic approval off. The migrator recognizes both previously published Phase 3 histories by SQL hash and applies their missing GitLab boundary migration under the migration lock. Reviews reference their PR and retain immutable policy and PR revision snapshots. PostgreSQL keeps review decisions, native write state, decision transitions, confirmed escalation comment revisions and the next reconciliation deadline. The dispatcher shares the publication lock with triage and commits a write intent before contacting a forge.
 
 A timeout after a mutation leaves the action unconfirmed. Razbor reads back the exact reviewed operation and owned comment before proceeding. It never treats an empty response as proof that a merge failed. An unresolved write can require an operator to inspect the provider. If a policy save or replacement review reports a pending native request, settle that request in the provider and retry. Retry ordinary provider read failures by restoring credentials or connectivity; the dispatcher resumes from PostgreSQL. Inspect the decision’s reason on the PR or review page.
 

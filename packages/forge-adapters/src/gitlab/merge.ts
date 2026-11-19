@@ -78,6 +78,17 @@ function onlyDestination(
   );
 }
 
+/** GitLab is still calculating the MR's CI, revisions or review state and requires a later read. */
+export function pendingGitlabMergeStatus(state: string) {
+  return [
+    "checking",
+    "preparing",
+    "unchecked",
+    "ci_still_running",
+    "approvals_syncing",
+  ].includes(state);
+}
+
 /** Check the native scheduler, project merge strategy, target protection and pipeline against the saved review. */
 export async function inspectGitlabMerge(
   transport: HttpForgeTransport,
@@ -230,11 +241,14 @@ export async function inspectGitlabMerge(
       "created",
       "preparing",
       "waiting_for_resource",
+      "scheduled",
     ].includes(mr.head_pipeline.status)
   )
     return mergeState("awaiting_checks", "pipeline_pending");
   if (mr.head_pipeline.status !== "success")
     return mergeState("blocked", "pipeline_failed");
+  if (pendingGitlabMergeStatus(mr.detailed_merge_status))
+    return mergeState("awaiting_checks", "pipeline_pending");
   if (mr.detailed_merge_status !== "mergeable")
     return mergeState("blocked", "merge_restrictions");
   return mergeState("ready", "provider_ready");

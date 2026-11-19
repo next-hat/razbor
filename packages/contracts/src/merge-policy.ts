@@ -53,6 +53,7 @@ const humanReviewers = z
 export const mergePolicySchema = z.strictObject({
   enabled: z.boolean().default(false),
   dryRun: z.boolean().default(true),
+  autoApprove: z.boolean().default(false),
   minimumConfidence: z.number().int().min(0).max(100).default(90),
   mergeMethod: z.enum(["squash", "merge", "rebase"]).default("squash"),
   requirePassingChecks: z.boolean().default(true),
@@ -65,8 +66,10 @@ export type MergePolicy = z.infer<typeof mergePolicySchema>;
 
 export const mergePolicySnapshotSchema = z.strictObject({
   version: z.number().int().positive().safe(),
-  // Configuration defaults apply at save time. Partial snapshots cannot authorize a review.
-  policy: mergePolicySchema.required(),
+  // Older complete snapshots predate native approval and never authorize it.
+  policy: mergePolicySchema.required().extend({
+    autoApprove: mergePolicySchema.shape.autoApprove,
+  }),
 });
 
 export type MergePolicySnapshot = z.infer<typeof mergePolicySnapshotSchema>;
@@ -104,6 +107,9 @@ export type MergeDecision = {
   reasons: { code: string; message: string }[];
   reviewers: string[];
 };
+
+export type ReviewApprovalStatus =
+  "approved" | "uncertain" | "unavailable" | "dismissed";
 
 export type MergeDecisionInput = {
   snapshot?: MergePolicySnapshot | null;
@@ -363,6 +369,16 @@ function commentLiteral(text: string): string {
 }
 
 export const forgeMergeReasonMessages = {
+  approval_unsupported:
+    "The provider cannot safely approve this reviewed revision.",
+  approval_actor_unavailable:
+    "The provider could not confirm an eligible approval identity for this pull request.",
+  approval_ready:
+    "The provider confirmed that Razbor can approve the reviewed revision.",
+  approval_unconfirmed:
+    "The provider could not confirm the current approval conditions.",
+  approval_required:
+    "The repository policy requires a confirmed Razbor approval before merge scheduling.",
   shared_head_check:
     "GitHub could not establish that this PR is the only open request using the reviewed head. A commit-wide eligibility check could release another PR.",
   app_pinned_strict_check_required:
@@ -532,6 +548,7 @@ export function renderMergeEscalation(input: {
   headSha: string;
   marker: string;
   mention?: boolean;
+  approval?: ReviewApprovalStatus;
 }): string {
   const { decision, snapshot } = input;
   const parsed = mergeAssessmentSchema.safeParse(input.assessment);
@@ -542,10 +559,13 @@ export function renderMergeEscalation(input: {
   )
     throw new Error("Invalid escalation revision or marker.");
   const human = decision.status === "human_review_required";
+  const dryRun = snapshot.policy.enabled && snapshot.policy.dryRun;
   const lines = [
     human
       ? "**Razbor — Human review required**"
-      : "**Razbor — Review decision updated**",
+      : dryRun
+        ? "**Razbor — Dry-run assessment**"
+        : "**Razbor — Review decision updated**",
     "",
     ...(assessment
       ? [
@@ -557,8 +577,47 @@ export function renderMergeEscalation(input: {
     "",
     ...(!human ? [`Decision: ${decision.status}`, ""] : []),
   ];
-  const reasons = publicReasons(decision, publicEscalationReasons);
+  const reasons = publicReasons(
+    decision,
+    dryRun ? publicReasonMessages : publicEscalationReasons,
+  );
   lines.push("Reasons:", ...reasons.map(({ message }) => "- " + message));
+  if (
+    dryRun &&
+    assessment?.reviewComplete &&
+    !assessment.criticalAreas.length &&
+    !assessment.verificationGaps.length
+  )
+    lines.push(
+      "- The review is complete and identified no critical areas or verification gaps.",
+    );
+  if (dryRun && decision.status === "auto_merge_eligible") {
+    lines.push("- No actionable or outstanding review findings remain.");
+    if (snapshot.policy.requirePassingChecks)
+      lines.push(
+        "- The required provider checks passed on the reviewed revision.",
+      );
+  }
+  if (dryRun) {
+    if (assessment)
+      lines.push(
+        "",
+        "Repository managers can read the detailed assessment notes on the review in Razbor.",
+      );
+    lines.push("", "Merge scheduling: disabled for this dry run.");
+  }
+  if (input.approval) {
+    const approval = {
+      approved:
+        "The provider confirmed Razbor’s approval for the reviewed commit.",
+      uncertain:
+        "The provider has not confirmed whether Razbor’s approval reached it.",
+      unavailable:
+        "Razbor could not approve the reviewed commit under the current provider conditions.",
+      dismissed: "The provider reports that Razbor’s approval was dismissed.",
+    };
+    lines.push("", approval[input.approval]);
+  }
   const allowed = new Set(
     snapshot.policy.humanReviewers.map((candidate) => candidate.username),
   );
