@@ -24,6 +24,7 @@ import {
   type ForgeWebhook,
   type RepositoryMetadata,
   ForgeOperationError,
+  ForgeReadError,
 } from "@razbor/forge-adapters";
 
 import {
@@ -961,6 +962,7 @@ async function handlePullRequest(
     event.number,
     row.forge.type === "gitlab" ? h.id : undefined,
   );
+  setStage?.("verify-repository");
   const { api, metadata } = await openAdapter(database, row, 30000, true);
   setStage?.("read-pull-request");
   let change: ForgeChange | undefined;
@@ -2796,7 +2798,25 @@ export async function processInteraction(database: Database, reviewId: string) {
   });
 }
 
-/** Resume one authenticated GitLab delivery after its open MR's diff becomes available. */
+/** Identify definitive rejections while verifying a deferred delivery's repository or MR. */
+function deferredRejection(stage: string, error: unknown) {
+  if (stage === "verify-repository") {
+    // openAdapter rejects a changed external repository ID before opening the client.
+    if (error instanceof ForgeOperationError && error.reason === "permission")
+      return "repository-identity-mismatch";
+    if (error instanceof ForgeReadError && error.reason === "invalid-response")
+      return "invalid-repository-response";
+  }
+  if (stage === "read-pull-request" && error instanceof ForgeOperationError) {
+    if (error.reason === "invalid-response")
+      return "invalid-pull-request-response";
+    // A 404 can mask missing access. Only discard requests the provider definitively rejects.
+    if ([400, 405, 410, 422].includes(error.status ?? 0))
+      return "pull-request-read-rejected";
+  }
+}
+
+/** Resume one authenticated GitLab delivery, retiring rejected observations and leaving temporary failures due for retry. */
 export async function processDeferredOpen(database: Database) {
   const due = sql`${webhookDeliveries.openRetryAfter} <= now()`;
   const [row] = await database.db
@@ -2822,28 +2842,57 @@ export async function processDeferredOpen(database: Database) {
   if (!row?.receipt.pendingOpen) return;
   const { receipt, repo, hook, forge } = row;
   const event = row.receipt.pendingOpen;
-  // Settings and registration changes revoke this delivery's original binding.
-  if (
-    !hook.enabled ||
-    hook.updatedAt.toISOString() !== event.hookUpdatedAt ||
-    repo.status !== "active" ||
-    forge.type !== "gitlab" ||
-    repo.externalRepositoryId !== event.repositoryId
-  ) {
-    await database.db
-      .update(webhookDeliveries)
-      .set({ pendingOpen: null, openRetryAfter: null })
-      .where(eq(webhookDeliveries.id, receipt.id));
-    return;
-  }
-  // Set the next attempt before provider I/O. A restarted dispatcher can pick
-  // up this receipt again, and admission consumes it atomically with the job.
-  const [claimed] = await database.db
+  // Claim before provider I/O so the next dispatcher can recover an interrupted read.
+  const [claim] = await database.db
     .update(webhookDeliveries)
     .set({ openRetryAfter: sql`now() + interval '30 seconds'` })
     .where(and(eq(webhookDeliveries.id, receipt.id), due))
+    .returning({ version: sql<string>`xmin::text` });
+  if (!claim) return;
+  let reason = "delivery-binding-changed";
+  if (
+    hook.enabled &&
+    hook.updatedAt.toISOString() === event.hookUpdatedAt &&
+    repo.status === "active" &&
+    forge.type === "gitlab" &&
+    repo.externalRepositoryId === event.repositoryId
+  ) {
+    let stage = "read-session";
+    try {
+      const [status, outcome] = await handlePullRequest(
+        database,
+        row,
+        event,
+        (next) => {
+          stage = next;
+        },
+      );
+      // Admission owns successful outcomes; pending diffs, conflicts and outages may retry.
+      if (status !== 403) return;
+      reason = outcome;
+    } catch (error) {
+      const rejected = deferredRejection(stage, error);
+      if (!rejected) throw error;
+      reason = rejected;
+    }
+  }
+  // Preserve the authenticated receipt and session boundary. A redelivery or a
+  // newer claim changes xmin and owns the outcome of its own observation.
+  const [retired] = await database.db
+    .update(webhookDeliveries)
+    .set({ pendingAction: null, pendingOpen: null, openRetryAfter: null })
+    .where(
+      and(
+        eq(webhookDeliveries.id, receipt.id),
+        sql`xmin = ${claim.version}::xid`,
+      ),
+    )
     .returning({ id: webhookDeliveries.id });
-  if (claimed) await handlePullRequest(database, row, event);
+  if (retired)
+    logger.warn(
+      { hookId: hook.publicId, deliveryId: receipt.deliveryId, reason },
+      "deferred merge request delivery retired",
+    );
 }
 
 /**

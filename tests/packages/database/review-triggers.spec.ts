@@ -617,6 +617,10 @@ test(
     let start = target;
     let iid = 27;
     let diffReady = false;
+    let detailResponse: "valid" | "foreign" | "unavailable" = "valid";
+    let providerRequests = 0;
+    const foreignRead = barrier();
+    const releaseForeign = barrier();
     let draft = false;
     let closed = false;
     let draftNote: { id: number; author_id: number; note: string } | undefined;
@@ -639,6 +643,7 @@ test(
     let hookUrl: string | undefined;
     let origin = "";
     const server = createServer(async (req, res) => {
+      providerRequests++;
       const path = decodeURIComponent(
         new URL(req.url!, "http://localhost").pathname,
       );
@@ -688,8 +693,21 @@ test(
               ? [mr]
               : [],
           );
+        if (detailResponse === "unavailable") {
+          res.writeHead(503);
+          return send({ message: "Temporarily unavailable" });
+        }
+        const webUrl =
+          detailResponse === "foreign"
+            ? origin + "/other/project/-/merge_requests/" + iid
+            : mr.web_url;
+        if (detailResponse === "foreign") {
+          foreignRead.resolve();
+          await releaseForeign.promise;
+        }
         return send({
           ...mr,
+          web_url: webUrl,
           diff_refs: diffReady
             ? { start_sha: start, base_sha: base, head_sha: head }
             : {},
@@ -823,14 +841,71 @@ test(
           object_attributes: { ...payload.object_attributes, action: "open" },
         }),
       );
-      assert.equal(
-        await acceptWebhook(database, hook.id, opening, {
+      /** Deliver the signed opening with its independent GitLab delivery identity. */
+      const open = (deliveryId: string) =>
+        acceptWebhook(database, hook.id, opening, {
           "x-gitlab-token": secret,
           "x-gitlab-event": "Merge Request Hook",
-          "webhook-id": "mr-open",
-        }),
-        202,
-      );
+          "webhook-id": deliveryId,
+        });
+      /** Read the durable dispatcher state for one authenticated delivery. */
+      const receiptFor = async (deliveryId: string) =>
+        (
+          await database.pool.query(
+            "select pending_open, open_retry_after from webhook_deliveries where delivery_id = $1",
+            [deliveryId],
+          )
+        ).rows[0];
+      /** Make an existing retry immediately eligible without changing its pending event. */
+      const retryNow = (deliveryId: string) =>
+        database.pool.query(
+          "update webhook_deliveries set open_retry_after = now() where delivery_id = $1 and pending_open is not null returning open_retry_after",
+          [deliveryId],
+        );
+      assert.equal(await open("mr-foreign"), 202);
+      diffReady = true;
+      detailResponse = "foreign";
+      const olderWorker = processDeferredOpen(database);
+      try {
+        await Promise.race([
+          foreignRead.promise,
+          olderWorker.then(() => {
+            throw new Error(
+              "Dispatcher returned before reading the deferred MR",
+            );
+          }),
+        ]);
+        // A later claim sees a pending diff while the older foreign response is still in flight.
+        await retryNow("mr-foreign");
+        detailResponse = "valid";
+        diffReady = false;
+        await processDeferredOpen(database);
+      } finally {
+        releaseForeign.resolve();
+        await olderWorker;
+      }
+      const currentClaim = await receiptFor("mr-foreign");
+      assert.ok(currentClaim.pending_open);
+      assert.ok(currentClaim.open_retry_after instanceof Date);
+      diffReady = true;
+      detailResponse = "foreign";
+      await retryNow("mr-foreign");
+      await processDeferredOpen(database);
+      assert.deepEqual(await receiptFor("mr-foreign"), {
+        pending_open: null,
+        open_retry_after: null,
+      });
+      const requestsAfterRejection = providerRequests;
+      await retryNow("mr-foreign");
+      await processDeferredOpen(database);
+      assert.equal(providerRequests, requestsAfterRejection);
+      assert.equal((await listReviews(database)).length, 0);
+
+      detailResponse = "valid";
+      assert.equal(await open("mr-foreign"), 202);
+      assert.equal((await listReviews(database)).length, 0);
+      diffReady = false;
+      assert.equal(await open("mr-open"), 202);
       await processDeferredOpen(database);
       assert.equal((await listReviews(database)).length, 0);
       const restarted = connectDatabase(fixture.url);
@@ -838,11 +913,24 @@ test(
         // Reapply identical webhook settings and confirm that the owned hook is still ready.
         await applyWebhookSettings(restarted, config);
         assert.equal((await webhookView(restarted, repo.id))?.setup, "ready");
-        // Make the saved retry due without waiting for the dispatcher interval.
-        await restarted.pool.query(
-          "update webhook_deliveries set open_retry_after = now() where delivery_id = 'mr-open' and pending_open is not null",
-        );
+        const {
+          rows: [due],
+        } = await retryNow("mr-open");
         diffReady = true;
+        detailResponse = "unavailable";
+        await assert.rejects(processDeferredOpen(restarted), {
+          reason: "unavailable",
+          status: 503,
+        });
+        const retry = await receiptFor("mr-open");
+        assert.ok(retry.pending_open);
+        assert.ok(
+          retry.open_retry_after instanceof Date &&
+            retry.open_retry_after > due.open_retry_after,
+        );
+        assert.equal((await listReviews(restarted)).length, 0);
+        detailResponse = "valid";
+        await retryNow("mr-open");
         await processDeferredOpen(restarted);
         assert.equal((await listReviews(restarted)).length, 1);
       } finally {

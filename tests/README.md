@@ -50,7 +50,9 @@ databases. They exercise source-only and indexed policy decisions with simulated
 attempts and controlled results. The GitLab fork fixture opens an MR before its
 diff refs exist. It checks that the dispatcher recovers the first review after
 a restart, retries source and readiness changes, and ends old opt-ins while a diff
-is pending. Webhook settings edits revoke deferred work and retain the timestamp
+is pending. A temporary GitLab outage preserves the deferred delivery. A response
+pointing to a different project retires it and stops further provider reads.
+Webhook settings edits revoke deferred work and retain the timestamp
 that prevents a pre-reopen command from activating a new continuous session.
 The fixture also holds a closed-command lookup open while an untracked MR
 reopens, then checks that a post-reopen command enables review of the next push.

@@ -161,7 +161,7 @@ export async function resetRepositoryReviewTriggers(
   // A later policy applies to new deliveries, including when the previous one has not obtained its diff yet.
   await tx
     .update(webhookDeliveries)
-    .set({ pendingOpen: null, openRetryAfter: null })
+    .set({ pendingAction: null, pendingOpen: null, openRetryAfter: null })
     .where(
       and(
         sql`${webhookDeliveries.openRetryAfter} is not null`,
@@ -464,10 +464,12 @@ export async function acceptReviewTrigger(
             observation.unseenBoundaryCount))
     )
       return { retry: true } as const;
+    // A deferred worker can retire this receipt without taking the webhook lock.
     let [receipt] = await tx
       .select()
       .from(webhookDeliveries)
-      .where(triggerDelivery(hook.id, event));
+      .where(triggerDelivery(hook.id, event))
+      .for("update");
     if (
       receipt?.pendingOpen &&
       (event.kind !== receipt.pendingOpen.kind ||
