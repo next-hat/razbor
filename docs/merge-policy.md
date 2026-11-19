@@ -45,11 +45,15 @@ pathPatterns = ["db/**"]
 riskCategories = ["persistence"]
 ```
 
+Source patterns are case-sensitive and relative to the repository root. Within one path component, `*` matches any number of characters and `?` matches one. A whole `**` component spans directories, including hidden ones. For example, `db/*.sql` covers SQL files directly under `db/`, and `db/**` covers every file below it.
+
 ## How a decision is made
 
 The model receives the saved policy and allowlist in both indexed and source-only reviews. Confidence is an **uncalibrated model assessment of merge readiness**. A score of 95 is not a 95% probability of correctness. Repository managers can inspect the detailed assessment evidence, commands and verification gaps on the review. Members see the score, risk and service-generated decision reasons. Forge escalation comments use service-generated reasons and the verified reviewer names. A complete, low-risk review still needs a matching policy version and revisions, no actionable or outstanding findings, and provider permission to merge. New code reviews include a structured assessment. Historical results without one cannot authorize merging.
 
 The server reconciles published findings, including open and uncertain findings from earlier runs, before checking the forge. High or critical risk, affected critical areas, incomplete investigation, and an explicit request for human review all require a human. Markdown can explain project criticality. The server owns authorization and enforces the saved structured policy and provider protections.
+
+Razbor ranks owners whose patterns match the pinned Git comparison first. A deleted file uses its original path, and a rename can select owners of both paths. The next candidates are allowlisted people suggested by the model or matched by a risk category. Configuration order breaks ties within each group. Reviews completed before path matching was available use their recorded assessments; a fresh review computes path ownership.
 
 Razbor can mention up to three configured individual accounts in its durable escalation comment. It checks ranked candidates against the provider until three accounts are verified. If none resolve, it tries a configured fallback. The bot updates its original comment with the reviewed commit and reasons. Repeated observations of the same decision do not generate another mention. Once escalated under an enabled policy, the PR stays in the provider’s human-controlled workflow. Razbor withdraws any earlier vote, including on the same commit, and reports when the forge cannot confirm its withdrawal. Keep the PR in human review until that vote has been settled.
 

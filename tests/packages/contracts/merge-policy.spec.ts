@@ -3,6 +3,7 @@ import { test } from "node:test";
 
 import {
   evaluateMergeDecision,
+  matchPathOwners,
   mergeAssessmentSchema,
   mergePolicySchema,
   mergePolicySnapshotSchema,
@@ -476,6 +477,86 @@ test("reviewer selection, fallback, and comment reconciliation only mention boun
     { username: "dana", responsibilities: "Owns the UI" },
   ];
   const saved = { ...policy, humanReviewers };
+  const owners = matchPathOwners(saved, [
+    "src/auth/.config",
+    "src/auth/nested/module.ts",
+  ]);
+  assert.deepEqual(owners, ["alice"]);
+  assert.deepEqual(
+    matchPathOwners(saved, [
+      "src/auth",
+      "src/authentication/login.ts",
+      "src/Auth/a.ts",
+    ]),
+    [],
+  );
+  const specialized = {
+    ...policy,
+    humanReviewers: [
+      { username: "general", responsibilities: "Triage" },
+      {
+        username: "database",
+        responsibilities: "Schema",
+        pathPatterns: ["/db/**/*.sql"],
+      },
+      {
+        username: "api",
+        responsibilities: "Handlers",
+        pathPatterns: ["./api/v?/handler.*"],
+      },
+      {
+        username: "dotfiles",
+        responsibilities: "Configuration",
+        pathPatterns: ["**/.config"],
+      },
+    ],
+  };
+  assert.deepEqual(
+    matchPathOwners(specialized, [
+      "api/v1/handler.ts",
+      "db/deep/change.sql",
+      ".config",
+    ]),
+    ["database", "api", "dotfiles"],
+  );
+  assert.deepEqual(matchPathOwners(specialized, ["db/initial.sql"]), [
+    "database",
+  ]);
+  assert.deepEqual(matchPathOwners(specialized, ["api/v🍏/handler.ts"]), [
+    "api",
+  ]);
+  assert.deepEqual(
+    matchPathOwners(specialized, [
+      "db/../other/fake.sql",
+      "/db/file.sql",
+      "api/v12/handler.ts",
+      "api/v1/handler/x",
+      "copy/db/file.sql",
+    ]),
+    [],
+  );
+  assert.deepEqual(
+    selectMergeReviewers(specialized, {
+      ...assessment,
+      suggestedReviewers: ["general", "database"],
+      pathOwners: ["API", "unconfigured", "database"],
+    }),
+    ["database", "api", "general"],
+  );
+  assert.deepEqual(
+    selectMergeReviewers(saved, {
+      ...assessment,
+      criticalAreas: ["Changes to the AUTH boundary."],
+    }),
+    ["alice"],
+  );
+  assert.deepEqual(
+    selectMergeReviewers(saved, {
+      ...assessment,
+      criticalAreas: ["Author attribution changed."],
+    }),
+    ["bob"],
+  );
   for (const name of [
     "@org/team",
     "all",
@@ -562,6 +643,7 @@ test("reviewer selection, fallback, and comment reconciliation only mention boun
     criticalAreas: [privateNote],
     verificationGaps: [privateNote],
     suggestedReviewers: [privateNote],
+    pathOwners: ["private-path-owner"],
   };
   const oldDecision = {
     ...comment.decision,
@@ -606,6 +688,7 @@ test("reviewer selection, fallback, and comment reconciliation only mention boun
     !JSON.stringify(publicMergeAssessment(evidence)).includes(privateNote),
   );
   assert.equal(publicMergeAssessment(evidence).confidence, evidence.confidence);
+  assert.equal(publicMergeAssessment(evidence).pathOwners, undefined);
   const long = renderMergeEscalation({
     ...comment,
     decision: { ...comment.decision, reviewers: [longLogin] },

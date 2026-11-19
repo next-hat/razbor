@@ -86,6 +86,8 @@ export const mergeAssessmentSchema = z.strictObject({
   verificationGaps: z.array(description).max(12),
   // Preserve old assessment feedback; only legal, configured IDs can become candidates.
   suggestedReviewers: z.array(textValue.trim().min(1).max(100)).max(24),
+  // The harness derives these from the pinned comparison and the saved policy.
+  pathOwners: z.array(reviewerUsernameSchema).max(24).optional(),
 });
 
 export type MergeAssessment = z.infer<typeof mergeAssessmentSchema>;
@@ -136,7 +138,89 @@ export type MergeDecisionInput = {
   };
 };
 
-/** Rank configured candidates by model recommendation and matching ownership, then use the first general reviewer or configured candidate. */
+/** Match a sequence with a zero-or-more wildcard. Only the latest wildcard can need another element. */
+function matchSequence(
+  pattern: string | readonly string[],
+  value: string | readonly string[],
+  wildcard: string,
+  matches: (part: string, actual: string) => boolean,
+): boolean {
+  let term = 0;
+  let position = 0;
+  let lastWildcard = -1;
+  let wildcardEnd = 0;
+  while (position < value.length) {
+    if (pattern[term] === wildcard) {
+      lastWildcard = term++;
+      wildcardEnd = position;
+    } else if (
+      term < pattern.length &&
+      matches(pattern[term], value[position])
+    ) {
+      term++;
+      position++;
+    } else if (lastWildcard >= 0) {
+      term = lastWildcard + 1;
+      position = ++wildcardEnd;
+    } else return false;
+  }
+  while (pattern[term] === wildcard) term++;
+  return term === pattern.length;
+}
+
+/** Match one case-sensitive Git path component, including names beginning with a dot. */
+function matchPathComponent(pattern: string, value: string): boolean {
+  if (!pattern.includes("*") && !pattern.includes("?"))
+    return pattern === value;
+  const codePoints = pattern.includes("?") && /[\uD800-\uDBFF]/.test(value);
+  return matchSequence(
+    codePoints ? Array.from(pattern) : pattern,
+    codePoints ? Array.from(value) : value,
+    "*",
+    (part, actual) => part === "?" || part === actual,
+  );
+}
+
+/** Match root-relative policy patterns against both sides of the pinned changes supplied by the harness. */
+export function matchPathOwners(
+  policy: MergePolicy,
+  changedPaths: readonly string[],
+): string[] {
+  if (
+    !policy.humanReviewers.some((candidate) => candidate.pathPatterns?.length)
+  )
+    return [];
+  const paths = changedPaths
+    .map((path) => path.split("/"))
+    .filter((parts) =>
+      parts.every((part) => part && part !== "." && part !== ".."),
+    );
+  return policy.humanReviewers
+    .filter((candidate) =>
+      candidate.pathPatterns?.some((glob) => {
+        const parts = glob.replace(/^(?:\.\/|\/)/, "").split("/");
+        // A trailing slash or globstar covers files beneath the directory.
+        if (parts.at(-1) === "") parts[parts.length - 1] = "**";
+        if (parts.at(-1) === "**") parts.push("*");
+        return paths.some((path) =>
+          matchSequence(parts, path, "**", matchPathComponent),
+        );
+      }),
+    )
+    .map((candidate) => candidate.username);
+}
+
+/** Match a configured category as a literal word or phrase in critical-area descriptions. */
+function mentionsCategory(areas: readonly string[], category: string): boolean {
+  const literal = category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const phrase = new RegExp(
+    `(?:^|[^\\p{L}\\p{N}_])${literal}(?![\\p{L}\\p{N}_])`,
+    "iu",
+  );
+  return areas.some((area) => phrase.test(area));
+}
+
+/** Rank path owners first, then configured model or risk matches; retain a general reviewer for unmatched changes. */
 export function selectMergeReviewers(
   policy: MergePolicy,
   assessment?: MergeAssessment,
@@ -146,16 +230,25 @@ export function selectMergeReviewers(
       .filter((name) => reviewerUsernameSchema.safeParse(name).success)
       .map((name) => name.toLowerCase()),
   );
-  const areas = new Set(
-    assessment?.criticalAreas.map((area) => area.toLowerCase()),
+  const owners = new Set(
+    assessment?.pathOwners?.map((name) => name.toLowerCase()),
   );
-  if (assessment) areas.add(assessment.riskLevel);
-  const matches = policy.humanReviewers.filter(
-    (candidate) =>
+  const areas = assessment
+    ? [...assessment.criticalAreas, assessment.riskLevel]
+    : [];
+  const matches = new Set<string>();
+  for (const candidate of policy.humanReviewers)
+    if (owners.has(candidate.username.toLowerCase()))
+      matches.add(candidate.username);
+  for (const candidate of policy.humanReviewers)
+    if (
       suggestions.has(candidate.username.toLowerCase()) ||
-      candidate.riskCategories?.some((area) => areas.has(area.toLowerCase())),
-  );
-  if (matches.length) return matches.map((candidate) => candidate.username);
+      candidate.riskCategories?.some((category) =>
+        mentionsCategory(areas, category),
+      )
+    )
+      matches.add(candidate.username);
+  if (matches.size) return [...matches];
   const fallback =
     policy.humanReviewers.find(
       (candidate) =>
@@ -183,7 +276,7 @@ const humanReasons = {
     "This pull request was escalated to the provider's human-controlled merge workflow.",
 };
 
-/** Expose the recorded score and readiness signals without the model's private policy-derived prose. */
+/** Expose the score and readiness signals while keeping detailed notes and reviewer identities private. */
 export function publicMergeAssessment(
   assessment: MergeAssessment,
 ): MergeAssessment {

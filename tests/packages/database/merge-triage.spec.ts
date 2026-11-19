@@ -323,18 +323,19 @@ test(
       enabled: true,
       policyMarkdown: "Use human review for migrations.",
       humanReviewers: [
+        "fallback",
         "missing1",
         "missing2",
         "missing3",
-        "alice",
         "extra1",
+        "alice",
         "extra2",
         "excess",
-        "fallback",
       ].map((username) => ({
         username,
         responsibilities: "Data",
-        riskCategories: username === "fallback" ? [] : ["low"],
+        riskCategories: ["fallback", "alice"].includes(username) ? [] : ["low"],
+        pathPatterns: username === "alice" ? ["db/**"] : [],
       })),
     });
     const config = registrySchema.parse({
@@ -691,7 +692,11 @@ test(
       return id;
     }
     /** Submit through normal review admission and complete the real durable lease with a local assessment. */
-    async function complete(pr: string, score: number) {
+    async function complete(
+      pr: string,
+      score: number,
+      routing?: Pick<MergeAssessment, "suggestedReviewers" | "pathOwners">,
+    ) {
       const review = await submitReview(
         db,
         { repositoryId: repo.id, baseSha, headSha },
@@ -708,7 +713,7 @@ test(
       await finishAttempt(db, review.id, attempt.attemptId, "test", {
         summary: "Read the guide",
         findings: [],
-        mergeAssessment: { ...assessment, confidence: score },
+        mergeAssessment: { ...assessment, confidence: score, ...routing },
       });
       return review.id;
     }
@@ -754,7 +759,10 @@ test(
     }
     const first = await pull(1);
     const second = await pull(2);
-    const human = await complete(first, 72);
+    const human = await complete(first, 72, {
+      suggestedReviewers: ["unknown"],
+      pathOwners: ["alice"],
+    });
     priorReviewId = await complete(second, 90);
     await db.pool.query(
       "update reviews set result=jsonb_set(result,'{findings}',$1::jsonb) where public_id=$2",
@@ -819,6 +827,13 @@ test(
     );
     assert.equal(nextOrdinaryNote, 201);
     assert.equal((await decision(human)).status, "human_review_required");
+    const [escalation] = (
+      await db.pool.query(
+        "select merge_decision->'reviewers' as reviewers from reviews where public_id=$1",
+        [human],
+      )
+    ).rows;
+    assert.equal(escalation.reviewers[0], "alice");
     assert.equal(posts, 1);
     assert.doesNotMatch(delayedReservation, /@alice/);
     assert.equal(remoteComments.size, 0);

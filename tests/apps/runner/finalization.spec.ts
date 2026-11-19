@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, mkdir, rename } from "node:fs/promises";
 import path from "node:path";
 import { test, type TestContext } from "node:test";
 import { isDeepStrictEqual } from "node:util";
@@ -419,7 +419,7 @@ const readyAssessment: MergeAssessment = {
 for (const indexed of [false, true]) {
   test(
     (indexed ? "indexed" : "source-only") +
-      " review receives the saved Markdown and candidate list and requires the assessment",
+      " review requires the policy assessment and derives rename owners from the pinned Git comparison",
     async (t) => {
       const graph = t.mock.method(
         RemoteMemory.prototype,
@@ -450,11 +450,20 @@ for (const indexed of [false, true]) {
           return {
             text: JSON.stringify({
               ...result,
-              mergeAssessment: readyAssessment,
+              mergeAssessment: {
+                ...readyAssessment,
+                pathOwners: indexed ? ["security-owner"] : "security-owner",
+              },
             }),
           };
         },
       ]);
+      await mkdir(path.join(f.files.repository, "db"));
+      await rename(
+        path.join(f.files.repository, "related.ts"),
+        path.join(f.files.repository, "db/schema.sql"),
+      );
+      f.files.head = await f.files.commit();
       const returned = await f.review({
         mergePolicy: {
           version: 7,
@@ -464,6 +473,17 @@ for (const indexed of [false, true]) {
               {
                 username: "security-owner",
                 responsibilities: "Provider credentials",
+                pathPatterns: ["credentials/**"],
+              },
+              {
+                username: "database-owner",
+                responsibilities: "Database schemas",
+                pathPatterns: ["db/**"],
+              },
+              {
+                username: "previous-owner",
+                responsibilities: "Changes to the original module",
+                pathPatterns: ["related.ts"],
               },
             ],
           }),
@@ -487,7 +507,10 @@ for (const indexed of [false, true]) {
             : {}),
         },
       });
-      assert.deepEqual(returned.mergeAssessment, readyAssessment);
+      assert.deepEqual(returned.mergeAssessment, {
+        ...readyAssessment,
+        pathOwners: ["database-owner", "previous-owner"],
+      });
       assert.equal(graph.mock.callCount(), indexed ? 1 : 0);
       assert.equal(f.calls, 2);
     },

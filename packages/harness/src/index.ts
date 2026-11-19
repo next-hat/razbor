@@ -2,6 +2,7 @@ import type { ModelMessage } from "ai";
 import type OpenAI from "openai";
 
 import {
+  matchPathOwners,
   reviewResultSchema,
   reviewMaxTurnsSchema,
   MAX_REVIEW_FINDINGS,
@@ -335,7 +336,14 @@ function parseReview(
   config: ReviewConfig,
 ) {
   if (tokenLimitReached) throw new Error("Incomplete review output");
-  const review = reviewResultSchema.parse(JSON.parse(text));
+  const candidate = JSON.parse(text);
+  // Only the harness's pinned Git comparison can supply ownership matches.
+  if (
+    candidate?.mergeAssessment &&
+    typeof candidate.mergeAssessment === "object"
+  )
+    delete candidate.mergeAssessment.pathOwners;
+  const review = reviewResultSchema.parse(candidate);
   validateFindingChecks(review, config.previousFindings, !!config.conversation);
   if (config.mergePolicy && !config.conversation && !review.mergeAssessment)
     throw new Error(
@@ -1107,6 +1115,19 @@ export async function reviewRepository(
         review.summary +=
           "\n\nCapability limitations: " + capabilities.limitations.join(" ");
       if (review.mergeAssessment && !config.conversation) {
+        if (
+          config.mergePolicy?.policy.humanReviewers.some(
+            (person) => person.pathPatterns?.length,
+          )
+        ) {
+          const paths = prepared.files.flatMap(({ path, previousPath }) =>
+            previousPath ? [previousPath, path] : [path],
+          );
+          review.mergeAssessment.pathOwners = matchPathOwners(
+            config.mergePolicy.policy,
+            paths,
+          );
+        }
         const { binaryFiles, unsupportedFiles } = prepared.coverage();
         const observed = [
           ...verificationLimitations,
