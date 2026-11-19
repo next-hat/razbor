@@ -528,21 +528,20 @@ export function RepositorySetup({
           </section>
         )}
         <Alert>
-          <AlertTitle>Request your first review</AlertTitle>
+          <AlertTitle>Your first review</AlertTitle>
           <AlertDescription>
-            {repo?.reviewCommand ? (
+            {repo?.reviewTriggerMode === "automatic" ? (
+              "Once the webhook is ready, Razbor reviews ready pull or merge requests and subsequent source changes. On public repositories, the author must be named in the permitted senders list."
+            ) : repo?.reviewCommand ? (
               <>
-                Once{" "}
-                {memoryDisabled
-                  ? "the webhook is ready"
-                  : "the webhook and index are ready"}{" "}
-                and a runner is available with a configured reviewer, open a
-                pull or merge request and comment{" "}
-                <code>{repo.reviewCommand}</code> as a permitted user. The bot
-                ignores its own comments.
+                Open a pull or merge request and comment{" "}
+                <code>{repo.reviewCommand}</code> as a permitted user once the
+                webhook is ready.{" "}
+                {repo.reviewTriggerMode === "opt_in_continuous" &&
+                  "This also enables automatic reviews of later commits until the request closes."}
               </>
             ) : (
-              "The review command will appear when repository access is available."
+              "Review instructions will appear when repository access is available."
             )}
           </AlertDescription>
         </Alert>

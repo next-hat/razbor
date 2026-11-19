@@ -23,6 +23,7 @@ import {
   type ReasoningEffort,
   type ResourceKind,
   type ReviewResult,
+  type ReviewTriggerMode,
   type ReviewEvaluation,
   type PreviousFinding,
   type ReviewConversation,
@@ -40,6 +41,7 @@ import type {
   ForgeType,
   ForgeChange,
   ForgePublicationProgress,
+  ForgeWebhook,
   InlineComment,
 } from "@razbor/forge-adapters";
 
@@ -274,6 +276,10 @@ export const repositories = pgTable(
     setupError: text("setup_error"),
     indexOwner: text("index_owner").notNull(),
     persistent: boolean("persistent").notNull(),
+    reviewTriggerMode: text("review_trigger_mode")
+      .$type<ReviewTriggerMode>()
+      .notNull()
+      .default("manual"),
     codebaseMemoryEnabled: boolean("codebase_memory_enabled")
       .notNull()
       .default(true),
@@ -285,6 +291,10 @@ export const repositories = pgTable(
       .on(t.contextId, t.configKey)
       .nullsNotDistinct(),
     check("repository_status", sql`${t.status} in ('active','deleting')`),
+    check(
+      "repository_review_trigger_mode",
+      sql`${t.reviewTriggerMode} in ('manual','opt_in_continuous','automatic')`,
+    ),
     check(
       "repository_guidance_object",
       sql`${t.guidance} is null or jsonb_typeof(${t.guidance}) = 'object'`,
@@ -315,6 +325,16 @@ export const pullRequests = pgTable(
       .notNull()
       .references(() => repositories.id, { onDelete: "cascade" }),
     number: integer("number").notNull(),
+    draft: boolean("draft"),
+    mergeBase: text("merge_base"),
+    startSha: text("start_sha"),
+    continuousReviewSince: timestamp("continuous_review_since", {
+      withTimezone: true,
+    }),
+    reviewSessionResetAt: timestamp("review_session_reset_at", {
+      withTimezone: true,
+    }),
+    triggerGeneration: integer("trigger_generation").notNull().default(0),
     title: text("title").notNull(),
     url: text("url").notNull(),
     state: text("state").$type<"open" | "closed">().notNull(),
@@ -927,6 +947,20 @@ export const legacyRevocations = pgTable(
   (t) => [check("legacy_revocation_hash", sql`${t.hash} ~ '^[a-f0-9]{64}$'`)],
 );
 
+export type ReviewStatusComment = {
+  botId: string;
+  /** Hook identity observed while the credential could not mutate the saved owner's comment. */
+  checkedHookBotId?: string | null;
+  /** Persist the exact bytes before creation, so an uncertain POST is never repeated. */
+  creatingBody?: string;
+  /** A complete listing during retirement found no matching bot-owned marker. */
+  missingOnRetirement?: boolean;
+  remoteId?: string;
+  shown?: "queued" | "running" | "completed" | "failed";
+  headSha?: string;
+  error?: string;
+};
+
 export const dispatchOutbox = pgTable("dispatch_outbox", {
   id: uuid("id").primaryKey().defaultRandom(),
   reviewId: uuid("review_id")
@@ -944,6 +978,8 @@ export const dispatchOutbox = pgTable("dispatch_outbox", {
     error?: string;
   }>(),
   publication: jsonb("publication").$type<Publication>(),
+  statusComment: jsonb("status_comment").$type<ReviewStatusComment>(),
+  statusAfter: timestamp("status_after", { withTimezone: true }),
   interactionAfter: timestamp("interaction_after", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -951,7 +987,13 @@ export const dispatchOutbox = pgTable("dispatch_outbox", {
 
 export type Publication = {
   state:
-    "pending" | "publishing" | "published" | "failed" | "uncertain" | "stale";
+    | "pending"
+    | "publishing"
+    | "published"
+    | "failed"
+    | "uncertain"
+    | "unconfirmed"
+    | "stale";
   remoteId?: string;
   inlineIds?: string[];
   providerProgress?: ForgePublicationProgress;
@@ -968,6 +1010,11 @@ export type Publication = {
   writing?: boolean;
   mode?: "review" | "comment" | "recap";
   stale?: boolean;
+  /** An identical reviewed revision became current again after a stale decision. */
+  rearmed?: boolean;
+  staleNoticeId?: string;
+  /** PR observation fenced before a stale notice, including across uncertain response recovery. */
+  staleGeneration?: number;
 };
 
 export const repositoryWebhooks = pgTable(
@@ -1017,11 +1064,25 @@ export const reviewTriggers = pgTable(
       .notNull()
       .unique()
       .references(() => reviews.id),
-    commentId: text("comment_id").notNull(),
+    origin: text("origin")
+      .$type<"manual" | "automatic">()
+      .notNull()
+      .default("manual"),
+    commentId: text("comment_id"),
     change: jsonb("change").$type<ForgeChange>().notNull(),
   },
   (t) => [
     uniqueIndex("trigger_comment_identity").on(t.repositoryId, t.commentId),
+    index("trigger_revision").on(
+      t.repositoryId,
+      sql`(${t.change}->>'number')`,
+      sql`(${t.change}->>'headSha')`,
+      sql`(${t.change}->>'baseSha')`,
+    ),
+    check(
+      "trigger_origin_identity",
+      sql`(${t.origin} = 'manual' and ${t.commentId} is not null) or (${t.origin} = 'automatic' and ${t.commentId} is null)`,
+    ),
   ],
 );
 
@@ -1033,9 +1094,32 @@ export const webhookDeliveries = pgTable(
       .notNull()
       .references(() => repositoryWebhooks.id),
     deliveryId: text("delivery_id").notNull(),
+    closedCommandId: text("closed_command_id"),
+    boundaryNumber: integer("boundary_number"),
+    boundaryAt: timestamp("boundary_at", { withTimezone: true }),
+    pendingOpen: jsonb("pending_open").$type<
+      Exclude<ForgeWebhook, { kind: "ping" | "push" | "comment" }> & {
+        hookUpdatedAt: string;
+      }
+    >(),
+    openRetryAfter: timestamp("open_retry_after", { withTimezone: true }),
+    pendingAction: text("pending_action").$type<
+      "review-history" | "closed-reply" | "posting-closed-reply"
+    >(),
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()
       .defaultNow(),
   },
-  (t) => [uniqueIndex("delivery_identity").on(t.webhookId, t.deliveryId)],
+  (t) => [
+    uniqueIndex("delivery_identity").on(t.webhookId, t.deliveryId),
+    index("delivery_session_boundary")
+      .on(t.webhookId, t.boundaryNumber, t.boundaryAt)
+      .where(sql`${t.boundaryNumber} is not null`),
+    index("delivery_due_open")
+      .on(t.openRetryAfter)
+      .where(sql`${t.openRetryAfter} is not null`),
+    uniqueIndex("delivery_closed_command")
+      .on(t.webhookId, t.closedCommandId)
+      .where(sql`${t.closedCommandId} is not null`),
+  ],
 );

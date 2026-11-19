@@ -8,6 +8,8 @@ import { parse } from "smol-toml";
 
 import {
   publicIdSchema,
+  reviewTriggerModeSchema,
+  type ReviewTriggerMode,
   githubInstallationSchema,
   type GithubInstallation,
 } from "@razbor/contracts";
@@ -45,6 +47,7 @@ import {
   type SecretReference,
 } from "@database/src/schema.js";
 import { publicId } from "@database/src/ids.js";
+import { resetRepositoryReviewTriggers } from "@database/src/review-triggers.js";
 import { readStoredSecret } from "@database/src/secrets.js";
 import { reviewCommandText } from "@database/src/presentation.js";
 import {
@@ -83,6 +86,7 @@ export const registrySchema = z
       z
         .object({
           webhook: webhookSettingsSchema.optional(),
+          reviewTriggerMode: reviewTriggerModeSchema.optional(),
           codebaseMemoryEnabled: z.boolean().optional(),
           forge: identifier.optional(),
           selector: z.string().min(1).max(1024).optional(),
@@ -330,6 +334,7 @@ export async function applyRegistry(
         git: r.git,
         indexOwner: r.indexing.owner,
         persistent: r.indexing.persistent,
+        reviewTriggerMode: r.reviewTriggerMode ?? "manual",
         codebaseMemoryEnabled,
       };
       if (!existing)
@@ -345,7 +350,11 @@ export async function applyRegistry(
         const indexingChanged =
           existing.codebaseMemoryEnabled !== codebaseMemoryEnabled ||
           existing.persistent !== r.indexing.persistent;
-        if (!sourceChanged && !indexingChanged) continue;
+        const triggersChanged =
+          existing.reviewTriggerMode !== values.reviewTriggerMode;
+        if (!sourceChanged && !indexingChanged && !triggersChanged) continue;
+        if (triggersChanged)
+          await resetRepositoryReviewTriggers(tx, existing.id);
         await tx
           .update(repositories)
           .set({
@@ -373,6 +382,7 @@ export const repositorySelection = {
   publicId: repositories.publicId,
   configKey: repositories.configKey,
   managedBy: repositories.managedBy,
+  reviewTriggerMode: repositories.reviewTriggerMode,
   codebaseMemoryEnabled: repositories.codebaseMemoryEnabled,
   forgePublicId: forgeInstances.publicId,
   forgeType: forgeInstances.type,
@@ -405,6 +415,7 @@ function repositoryView(row: {
   configKey: string;
   managedBy: string;
   codebaseMemoryEnabled: boolean;
+  reviewTriggerMode: ReviewTriggerMode;
   forgePublicId: string | null;
   forgeType: "github" | "gitlab" | "forgejo" | null;
   agentId: string | null;
@@ -424,6 +435,8 @@ function repositoryView(row: {
     id: row.publicId,
     configKey: row.configKey,
     codebaseMemoryEditable: isUiManagedRepository(row),
+    reviewTriggerModeEditable: isUiManagedRepository(row),
+    reviewTriggerMode: row.reviewTriggerMode,
     codebaseMemoryEnabled: row.codebaseMemoryEnabled,
     forgeId: row.forgePublicId,
     forgeType: row.forgeType,
@@ -811,6 +824,7 @@ const verifyRepositorySchema = z
   .strict();
 
 const createRepositorySchema = verifyRepositorySchema.extend({
+  reviewTriggerMode: reviewTriggerModeSchema.default("manual"),
   codebaseMemoryEnabled: z.boolean().default(true),
   agentId: publicIdSchema("agent").nullable().optional(),
   callbackBase: webhookSettingsSchema.shape.callback_base.optional(),
@@ -1233,6 +1247,7 @@ export async function createRepositoryFromUi(
           : { stored: tokenId },
         indexOwner,
         persistent: true,
+        reviewTriggerMode: request.reviewTriggerMode,
         codebaseMemoryEnabled: request.codebaseMemoryEnabled,
         setupState: request.codebaseMemoryEnabled ? "pending" : "ready",
       })

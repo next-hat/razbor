@@ -24,7 +24,7 @@ These suites need no Docker, database, model credentials, or live forge.
 | `pnpm run test:review`           | Autonomous loop, compaction, budgets, relay retry policy, cumulative progress, offline scoring | Temporary Git repositories and child processes |
 | `pnpm run test:diff`             | Diff pagination, pinned source reads, cancellation, usage reporting                            | Temporary Git repositories and child processes |
 | `pnpm run test:verification`     | Commands, timeouts, output limits, environment isolation, URLs, tool dispatch                  | Child processes and stdio pipes                |
-| `pnpm run test:persistence:unit` | Public IDs and GitHub, GitLab, and Forgejo HTTP adapters                                       | Local sockets                                  |
+| `pnpm run test:persistence:unit` | Public IDs, trigger policy parsing, provider lifecycle events and bot-owned comment operations | Local sockets                                  |
 | `pnpm run test:presentation`     | Review contracts, forge formatting, server-rendered components                                 | The script selects its TSX configuration       |
 | `pnpm run test:release`          | Explicit image publication tags and local-load defaults                                        | Bash; temporary fake Docker/Git, no daemon     |
 | `pnpm run test:coverage`         | The default suite with a coverage report                                                       | No additional requirements                     |
@@ -44,6 +44,42 @@ and mocks.
 Presentation checks cover text, Markdown safety, source links, rendered HTML, and disabled repository indexes with stale preparation errors.
 Check layout, clipboard actions, disclosures, keyboard navigation, and both themes
 in a browser.
+
+Review trigger and comment checks use local HTTP provider fixtures and isolated PostgreSQL
+databases. They exercise source-only and indexed policy decisions with simulated
+attempts and controlled results. The GitLab fork fixture opens an MR before its
+diff refs exist. It checks that the dispatcher recovers the first review after
+a restart, retries source and readiness changes, and ends old opt-ins while a diff
+is pending. A temporary GitLab outage preserves the deferred delivery. A response
+pointing to a different project retires it and stops further provider reads.
+Webhook settings edits revoke deferred work and retain the timestamp
+that prevents a pre-reopen command from activating a new continuous session.
+The fixture also holds a closed-command lookup open while an untracked MR
+reopens, then checks that a post-reopen command enables review of the next push.
+The delayed-delivery check inspects the queued head before sending another update.
+The public PR check uses different authors in the signed event and the forge response.
+Publication checks cover webhook disablement and opt-in revocation before submission,
+recovery after a lost response, unconfirmed GitLab verdicts, and reuse of a saved
+result after draft cleanup. The GitLab fixture also checks that unconfirmed
+follow-ups show unanchored findings, that later reviews suppress verified inline
+duplicates, and that the management CLI can abandon an ambiguous bulk without
+resubmitting it or deleting another user's draft.
+For checkpoints that record the bot ID, recovery requires matching credentials
+and succeeds without an operator-supplied ID.
+It also drops a ready event after the MR's diff refs change, refreshes with the
+webhook disabled, and verifies that refresh after re-enablement recovers and
+publishes the matching result exactly once.
+The Forgejo fixture refreshes an unreviewed PR before its signed title edit and
+checks that the edit starts exactly one review. It also overlaps detail reads
+with a webhook and checks which readiness information survives a missing detail
+field or a changed revision. A failed detail request defers updates to another
+tracked PR and a newly listed PR until the fixture's next successful refresh.
+The status-comment fixture covers masked 404s, deletion during an active review,
+and recovery after a bot rotation through restored credentials or manual removal.
+The Forgejo provider fixture accepts web and API pull-request URLs from their
+configured origins and rejects mismatched repositories, PRs, and origins.
+The GitLab provider fixture checks status-comment cleanup on a 1,000-note MR.
+These checks do not need model credentials.
 
 ## Autonomous review harness
 
@@ -124,10 +160,10 @@ pnpm run test:comments
 pnpm run test:broker
 ```
 
-| Command                     | Coverage                                                                                                                 |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion          |
-| `pnpm run test:comments`    | Commands, webhook HMAC, deduplication, hook setup, acknowledgement fallback, Forgejo publication against a local fixture |
+| Command                     | Coverage                                                                                                                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `pnpm run test:persistence` | Migrations, IDs, access boundaries, registry, tokens, database/queue recovery, stale attempts, saved completion                   |
+| `pnpm run test:comments`    | Signed events, PR opt-in and reset, revision coalescing, same-revision re-review, status-comment recovery and Forgejo publication |
 
 The broker suite uses pg-boss and enrolled runner sessions, with a controlled
 loopback source service. It checks indexed and source-only assignments across a

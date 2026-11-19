@@ -218,6 +218,11 @@ Keep registry and repository keys stable to preserve identities and history.
 Imports retain missing entries and only run explicitly. Remove registrations
 from the file when no longer needed; importing later can recreate a deleted one.
 
+Set `reviewTriggerMode` under `[repositories.<key>]` to `manual`,
+`opt_in_continuous` or `automatic`. Omitting it selects manual on import.
+Reapplying a different mode clears per-PR opt-ins and supersedes queued automatic
+work. Review history stays available. See [review triggering](comment-reviews.md#review-trigger-modes).
+
 An explicit `codebaseMemoryEnabled` in a repository table takes precedence.
 When it is omitted, a registry reapply keeps the existing repository's setting.
 For a new repository, `manage config apply` can read `RAZBOR_INDEX_CONFIG`
@@ -281,9 +286,10 @@ preparation makes saved indexes queryable again. For lost runner credentials or 
 database reset, see [runner recovery](runner.md#after-deliberately-resetting-the-database).
 
 Delete repositories through **Settings → Delete repository**. Razbor blocks new
-work, then removes the webhook, indexes, credentials, and local history. Retry an
-interrupted cleanup; repair credentials if webhook removal fails. The upstream
-repository and published comments remain.
+work and retires temporary status comments before removing the webhook, indexes,
+credentials, and local history. If comment or webhook removal stalls, restore
+provider connectivity or repair the bot's credentials. The upstream repository
+and published review results remain.
 
 ## Import a legacy indexer
 

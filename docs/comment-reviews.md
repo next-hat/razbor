@@ -1,7 +1,7 @@
 # Review a pull request
 
-Request a review with `/agentic_review` on a Forgejo or GitHub pull request, or a
-GitLab merge request.
+Razbor can review Forgejo and GitHub pull requests and GitLab merge requests on
+command or in response to authenticated pull request events.
 
 You need a running [installation](getting-started.md), an assigned
 [runner](runner.md), a reviewer configured in **Agents**, and an HTTPS webhook
@@ -19,7 +19,7 @@ address reachable by your Git provider.
    overrides. If a self-hosted provider runs under a path, set its **Instance
    URL**, for example `https://git.example.com/gitlab`. Keep GitLab groups and
    subgroups in the repository URL.
-3. Choose an AI reviewer or use **Add agent**. Enter allowed command senders as
+3. Select a **Review trigger mode** and choose an AI reviewer or use **Add agent**. Enter allowed command senders as
    comma-separated provider usernames, such as `alice, bob`. Adding an agent
    saves it immediately, even if you cancel repository setup. Enter your public
    HTTPS origin as the webhook callback base; `RAZBOR_WEBHOOK_CALLBACK_BASE`
@@ -118,12 +118,59 @@ and **Issues: write**. Older registrations with automatic hooks also need
 **GitLab:** use a bot personal or project token with `api` scope and Maintainer
 access for automatic hook setup. razbor uses the webhook's **Secret token**.
 The instance must support Draft Notes publication with a summary and
-`reviewer_state`, plus the merge request reviewer state API. Older instances that
-ignore these fields fail publication verification.
+`reviewer_state`. GitLab accepts no expected revision on bulk submission and can
+downgrade a request for changes to a comment. Razbor checks the revision and
+required readiness immediately before and after submission. For a request for
+changes, it also checks the bot's approval permission before sending and the
+returned reviewer state immediately afterward. GitLab cannot rule out a change
+and reversal between these observations. If the response is lost or Razbor
+cannot verify the outcome, the console and reconciled summary show the verdict
+as **unconfirmed**. An unconfirmed follow-up keeps the full result in its own
+summary, including findings without inline anchors. Later reviews recognize
+verified inline notes and avoid posting them again. Recovery never resends the
+bulk request. [GitLab Draft Notes API](https://docs.gitlab.com/api/draft_notes/#publish-all-pending-draft-notes)
+
+If a worker stopped at the bulk POST and reconciliation cannot find the summary,
+inspect the MR and its drafts using the original bot account. To stop retrying
+that review, substitute its review ID in the command below.
+
+```sh
+docker compose run --rm manage review abandon-gitlab-publication rev_ABCDEFGHIJKLMNOP
+```
+
+Older submissions may lack a saved bot ID. If GitLab has no visible summary,
+verify which bot submitted the original review and restore that bot's credential.
+Select **Reconcile webhook** in the repository's webhook settings to refresh the
+saved bot ID. Then append `--original-bot-id <numeric-user-id>` to the command.
+The authenticated GitLab account must match both the supplied ID and the bot ID
+saved on the webhook.
+
+An `abandoned` outcome removes identifiable unpublished drafts owned by that
+review and records the verdict as unconfirmed. A visible marked summary yields
+`submitted` and the dispatcher continues normal reconciliation. An `ineligible`
+result means the command found no ambiguous GitLab bulk to abandon or could
+not confirm its owning identity. A `busy` result means another interaction is
+running for that repository. The command checks up to 1,000 MR notes. If it
+cannot confirm it reached the end of the list, it leaves the review under
+reconciliation. The command never posts a verdict. GitLab may
+still complete an earlier request after the operator stops reconciliation.
+
+Before submitting, Razbor lists the bot's drafts again and checks their IDs,
+text and positions against the reviewed findings. GitLab publishes all the bot's
+drafts on the MR and accepts no expected draft list. Give Razbor its own bot
+identity when other tools would otherwise write drafts under that account.
+
+If a review becomes stale after a GitLab draft creation was interrupted, Razbor
+checks the bot's complete draft list. For a create without a returned ID, it
+requires two empty observations for that draft at least 30 seconds apart before
+releasing it. A draft that appears between checks is verified and deleted by ID.
+GitLab provides no creation receipt for a draft POST whose response was lost.
+A draft that GitLab exposes only after both observations can remain on the MR.
 
 Forgejo and GitLab hooks are created automatically. **Webhook → Remote hook
-setup** shows their callbacks and events. Forgejo needs pull request, pull request
-comment, and push events; GitLab needs merge request, note, and push events. After
+setup** shows their callbacks and events. Forgejo needs `pull_request`,
+`pull_request_sync`, `pull_request_comment`, and `push`. GitLab needs merge
+request, note, and push events. After
 fixing permissions, retry setup without deleting the registration.
 
 ## Public webhook proxy
@@ -188,18 +235,107 @@ Health should succeed; both proxy requests should return `404`. Check the blocke
 paths through the public HTTPS address too. razbor verifies deliveries with the
 provider's configured secret.
 
-## Request your first review
+## Review trigger modes
 
-1. Open a pull request or merge request in the connected repository.
-2. From an allowed account, post a new comment with `/agentic_review` on its first
-   line.
-3. Look for a thumbs-up reaction or queued acknowledgement.
-4. Follow queue, execution, and publication status in the razbor console.
-5. Read the summary and inline findings on the pull request.
+Choose a mode in the connection wizard or **Repository → Settings → General**.
+For a file-managed repository, set `reviewTriggerMode` under
+`[repositories.<key>]` and apply the registry.
 
-Opening a pull request posts a greeting without starting a review. For repositories with Codebase Memory enabled, a supported push webhook to the
-indexed branch refreshes the index without requesting a review. Reviews and replies
-use your model and may incur provider charges.
+| Mode                                       | When Razbor queues a review                                                                                                                                                                         |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Manual (`manual`, default)                 | A permitted user posts a new comment with `/agentic_review` on its first line. Repeat the command for another review.                                                                               |
+| On-demand continuous (`opt_in_continuous`) | The first permitted command queues a review and opts that PR into reviews of subsequent source changes. The opt-in survives restarts. Closing or merging ends it. Reopening requires a new command. |
+| Fully automatic (`automatic`)              | Opening or reopening a ready PR, marking a draft ready, or pushing a new revision can queue a review. On public repositories, the PR author must be named in the permitted senders list.            |
+
+Explicit commands can request another review of the same revision in every
+mode, including on open drafts. Inline replies continue their existing finding
+discussion. If the forge timestamps a command in exactly the same instant as a
+session reset, Razbor queues the explicit review. A later command can activate
+continuous review unambiguously. The PR detail page shows an active opt-in.
+Changing modes ends previous opt-ins. A policy change applies to
+subsequent events and preserves review history. All three modes work with
+source-only and indexed checkouts. Each review can consume inference tokens and
+incur charges from the configured model provider.
+
+For fully automatic reviews, Razbor reads the target repository’s current
+visibility and the PR author from the forge. On a public repository it compares
+the author's login to explicit entries in `permitted_senders` case-insensitively.
+The `*` entry cannot authorize a public PR author. A permitted user can still
+request a review of a contributor’s PR with `/agentic_review`. When the forge
+reports private or internal visibility, fully automatic mode covers ready PRs
+from any author, including contributors outside the sender list.
+
+GitHub sends `pull_request` actions, including `synchronize` and
+`ready_for_review`. Retargeting a PR to another base branch also triggers a
+revision check. Title and description edits alone do not queue a review.
+GitLab sends merge request events, including updates with a
+previous source revision or draft transition. If GitLab is still preparing the diff
+when an MR opens, is updated, or becomes ready, Razbor retries the delivery and
+checks the current revision and policy before queueing work. A verified close or
+reopen ends the previous opt-in even while the diff is being prepared.
+Forgejo sends pull request
+lifecycle events and a separate synchronization subscription for source updates.
+For that subscription, Forgejo sends `pull_request` in `X-Forgejo-Event` and
+`pull_request_sync` in `X-Forgejo-Event-Type`.
+Forgejo reports title edits with the resulting draft flag. Renaming an already-ready
+PR at the same recorded revision leaves its review history alone. When Razbor first
+observes a PR through such an edit, a verified ready revision can trigger its first review.
+Razbor verifies the repository and reads the current PR before queueing an
+automatic review. Providers must report draft status for automatic admission.
+A multi-commit push reviews the resulting head against its merge base. Forks are
+fetched from the configured target remote using `refs/pull/<number>/head` on
+GitHub and Forgejo, and `refs/merge-requests/<iid>/head` on GitLab.
+Default-branch push events still refresh enabled indexes.
+
+The delivery ID, trigger, and queue entry are recorded in PostgreSQL. Another
+delivery for a revision already queued, running or completed for that PR does
+not start a second automatic review. Later pushes replace the head and base of
+an unstarted automatic review. If an attempt is running, its revision stays
+pinned and the latest pending revision waits. Manual commands can request an
+additional review. When a review is waiting for a runner, assigning an eligible
+runner and reviewer lets the same review proceed. Before publishing findings,
+Razbor checks the current source and target revisions and any newer published
+decision. If a previously reviewed revision becomes current again, a saved
+result that was safely withheld as stale can be published without another model
+call. If a delivery fails, redeliver it from the forge. Razbor records a close
+or reopen before reading review history. Redelivery resumes that work. If a
+closed-PR command was already declined, redelivery reconciles the explanation
+even if the PR has since reopened.
+
+Provider references cover
+[GitHub pull request events](https://docs.github.com/en/webhooks/webhook-events-and-payloads#pull_request),
+[GitLab merge request events](https://docs.gitlab.com/user/project/integrations/webhook_events/#merge-request-events),
+and [Forgejo v15 webhook types](https://codeberg.org/forgejo/forgejo/src/tag/v15.0.0/modules/webhook/type.go).
+
+Follow a queued review in the console. A temporary top-level comment identifies
+the commit while Razbor waits for an eligible runner and reviewer. Once the
+attempt starts, Razbor edits the same comment. The bot needs permission to read,
+create, edit and delete its own issue comments (GitHub and Forgejo) or merge
+request notes (GitLab). Set `RAZBOR_PUBLIC_URL` to the HTTPS console origin
+to include a review-page link. If final publication takes time, the existing
+comment shows that publication is pending. Razbor removes the comment once the
+outbox confirms the result, failure message or stale outcome. The final result, failure messages and discussions remain.
+If the provider is unavailable or a write response is lost, the durable outbox
+retains the state needed to reconcile the bot-owned marker. A lost create
+response can delay status updates until the comment appears. During cleanup,
+Razbor checks the full comment list again after 30 seconds if the bot's marker
+is missing. Two complete reads without the marker finish cleanup. A fast review
+may finish before the status worker posts a comment.
+
+If a temporary comment disappears while the review is queued or running,
+Razbor detects it on the next status update. Once a complete PR comment listing
+confirms its absence, Razbor can post a replacement for the still-active review.
+
+After a bot account change, each existing comment retains its original owner.
+New reviews use the newly configured bot. For an existing review, restore the
+original credentials and reconcile the webhook, or have the owner remove the
+temporary comment on the forge. While the old comment is visible, Razbor checks
+the PR hourly and leaves the comment in place. Once the old comment is gone,
+an active review can post a replacement under the new account.
+
+Repository deletion waits for temporary comment cleanup before discarding
+credentials. If the forge is unavailable or rejects a delete, restore
+connectivity or the bot's permissions. Razbor retries with the saved identity.
 
 ## Read the result
 
@@ -253,7 +389,8 @@ review and available discussion. Sender restrictions still apply. Top-level
 comments do not start these conversations.
 
 Replies leave the review and summary unchanged. After fixing an issue or
-discussing a possible false positive, post a new review command. The next review
+discussing a possible false positive, a new review command explicitly requests
+a re-review in any mode. The next review
 checks earlier findings alongside the current changes:
 
 - **Open** and **uncertain** findings stay in the summary.
@@ -273,7 +410,20 @@ the thread. Forgejo leaves it open because its API adapter lacks resolution.
 Summary-only findings are reassessed but have no thread to update.
 
 If base or head commits change before publication, razbor reports a stale review.
-Post the command again for the current revisions.
+A manual command requests a fresh review. Active continuous policies also
+respond to source revision events.
+
+If the forge's ready event was missed, refresh the pull request list. Razbor
+checks the PR's readiness and exact diff, then looks up the newest review of
+that revision. If the newest review was automatic and completed, Razbor can
+reopen its stale publication when repository policy permits. A newer failed
+manual review of the same revision blocks recovery of an older automatic
+result. An already published result stays published.
+
+Refresh saves each repository's PR list in one transaction. If a required
+detail request times out or the forge returns an unexpected error, Razbor
+reports that repository as incomplete and defers all its listed PR updates
+until the next refresh.
 
 ## Troubleshooting
 

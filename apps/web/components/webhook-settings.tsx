@@ -150,7 +150,7 @@ export function WebhookSettings({
             <>
               <dl className="grid gap-4 text-sm sm:grid-cols-2">
                 <div className="flex flex-col gap-1">
-                  <dt className="text-muted-foreground">Review commands</dt>
+                  <dt className="text-muted-foreground">Webhook events</dt>
                   <dd>{hook.data?.enabled ? "Enabled" : "Disabled"}</dd>
                 </div>
                 <div className="flex flex-col gap-1">
@@ -217,9 +217,7 @@ export function WebhookSettings({
                   </Field>
                 )}
                 <Field>
-                  <FieldLabel htmlFor="senders">
-                    Permitted command senders
-                  </FieldLabel>
+                  <FieldLabel htmlFor="senders">Permitted senders</FieldLabel>
                   <Input
                     id="senders"
                     placeholder="alice, bob"
@@ -229,8 +227,9 @@ export function WebhookSettings({
                     required
                   />
                   <FieldDescription>
-                    Forge usernames, separated by commas. Use * to allow any
-                    commenter only while the repository is private.
+                    Enter forge usernames separated by commas. They can request
+                    reviews and qualify as authors for fully automatic public PR
+                    reviews. Use * for any commenter on a private repository.
                   </FieldDescription>
                 </Field>
                 {!appManaged && (
@@ -266,7 +265,7 @@ export function WebhookSettings({
                     disabled={busy}
                   />
                   <FieldLabel htmlFor="enabled">
-                    Accept review commands
+                    Accept repository webhook events
                   </FieldLabel>
                 </Field>
                 <div className="flex flex-wrap gap-2">

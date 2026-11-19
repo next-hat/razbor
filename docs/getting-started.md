@@ -155,7 +155,7 @@ For `unknown runtime kata`, finish step 1. For a missing resolver file, see the
    You can reuse an App already saved in this instance. Alternatively, choose
    manual webhook setup and check access using a repository URL and token.
    Forgejo and GitLab keep their token-based setup. Choose an agent, enter the
-   callback address and allowed command senders, then confirm. Razbor starts
+   review trigger mode, callback address and allowed command senders, then confirm. Razbor starts
    indexing when **Codebase Memory** is enabled. See the [provider setup guide](comment-reviews.md) for details.
 4. For manual GitHub setup, copy the URL, events, and one-time secret from the
    finish screen into GitHub's repository webhook settings, then send or redeliver
@@ -174,15 +174,18 @@ files. To run reviews on a second machine, follow [runner enrollment](runner.md)
 
 ### 5. Request your first review
 
-Open a pull request or merge request in the connected repository. As one of the
-allowed senders, post a new comment with `/agentic_review` on its first line.
+Open a pull request or merge request in the connected repository. In manual or
+on-demand continuous mode, an allowed sender posts a new comment with
+`/agentic_review` on its first line. In fully automatic mode, opening a ready
+pull request queues the review.
 
-The bot acknowledges the request, and the console shows its progress. When it
+The bot acknowledges manual commands. A temporary comment and the console show review progress. When it
 finishes, the summary and findings appear on the pull request or merge request.
 This step calls your configured model and may incur charges from that provider.
 
-Reply in a finding's thread to discuss it. After pushing a fix, post the same
-review command again to check the new changes and reassess earlier findings.
+Reply in a finding's thread to discuss it. After pushing a fix in manual mode, post the same command to review the new
+changes. In an active continuous or fully automatic review, pushing the fix
+queues the next review.
 See [reviews and replies](comment-reviews.md) if the command is ignored or
 the result does not appear.
 

@@ -3,7 +3,7 @@
 import Link from "next/link.js";
 import { GitPullRequest, ArrowRight } from "lucide-react";
 
-import type { ReviewJobView } from "@razbor/contracts";
+import type { ReviewJobView, ReviewTriggerMode } from "@razbor/contracts";
 import { reviewDisplayName } from "@razbor/contracts/presentation";
 
 import { usePoll } from "@web/lib/use-poll.js";
@@ -35,11 +35,13 @@ export function RepositoryReviews({
   initialData,
   isAdmin = false,
   reviewCommand = null,
+  reviewTriggerMode,
 }: Readonly<{
   id: string;
   initialData?: ReviewJobView[];
   isAdmin?: boolean;
   reviewCommand?: string | null;
+  reviewTriggerMode?: ReviewTriggerMode;
 }>) {
   const { data, error } = usePoll(
     `/api/repositories/${id}/reviews`,
@@ -152,10 +154,14 @@ export function RepositoryReviews({
               />
               <EmptyTitle>No reviews yet</EmptyTitle>
               <EmptyDescription>
-                {isAdmin && reviewCommand ? (
+                {reviewTriggerMode === "automatic" ? (
+                  "Open a pull request that is ready for review. On public repositories, Razbor queues automatic reviews only for authors named in the permitted senders list."
+                ) : isAdmin && reviewCommand ? (
                   <>
                     Comment <code>{reviewCommand}</code> on a pull request to
-                    request a review.
+                    {reviewTriggerMode === "opt_in_continuous"
+                      ? " start continuous review."
+                      : " request a review."}
                   </>
                 ) : (
                   "Reviews for this repository will appear here."

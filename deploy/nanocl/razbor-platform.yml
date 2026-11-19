@@ -139,6 +139,7 @@ Cargoes:
           - RAZBOR_INDEX_OWNER=production-indexer
           - RAZBOR_INDEX_ENDPOINT=http://razbor-indexer:8790
           - RAZBOR_WEBHOOK_CALLBACK_BASE=https://razbor.next-hat.com
+          - RAZBOR_PUBLIC_URL=https://razbor.next-hat.com
           - REVIEW_QUEUE=reviews
         Healthcheck:
           Test:

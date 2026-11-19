@@ -190,6 +190,48 @@
       "when": 1790000000026,
       "tag": "0026_optional_codebase_memory",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790000000027,
+      "tag": "0027_repository_review_trigger_mode",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1790000000028,
+      "tag": "0028_review_trigger_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790000000029,
+      "tag": "0029_review_status_comment",
+      "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790000000030,
+      "tag": "0030_webhook_delivery_actions",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790000000031,
+      "tag": "0031_deferred_open_deliveries",
+      "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790000000032,
+      "tag": "0032_gitlab_session_boundaries",
+      "breakpoints": true
     }
   ]
 }

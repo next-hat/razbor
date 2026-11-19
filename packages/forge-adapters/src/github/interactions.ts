@@ -11,10 +11,14 @@ import {
 import {
   ForgeOperationError,
   ForgeWebhookError,
+  removeIfPresent,
+  reviewRevision,
+  verifyStatusComment,
   type Forge,
   type ForgeChange,
   type ForgePullRequest,
   type ForgeReviewComment,
+  type ForgeReviewPublication,
   type ForgeWebhook,
   type InlineComment,
 } from "@forge-adapters/src/interactions.js";
@@ -128,23 +132,62 @@ export function parseGithubComment(raw: Uint8Array, event: string | undefined) {
   };
 }
 
-/** Extract repository and author identity for newly opened pull requests. */
+/** Translate GitHub lifecycle actions and base-branch retargets into review triggers. */
+function githubLifecycle(action: string, baseChanged: boolean) {
+  switch (action) {
+    case "opened":
+    case "reopened":
+    case "closed":
+      return action;
+    case "synchronize":
+      return "updated";
+    case "edited":
+      return baseChanged ? "updated" : undefined;
+    case "ready_for_review":
+      return "ready";
+    case "converted_to_draft":
+      return "draft";
+  }
+}
+
+/** Normalize PR lifecycle events; their revisions and open/draft state are re-read from REST. */
 export function parseGithubPullRequest(raw: Uint8Array) {
   const value = parse(Buffer.from(raw).toString("utf8"));
-  if (z.object({ action: z.string() }).parse(value).action !== "opened")
-    return undefined;
+  const { action, changes } = z
+    .object({
+      action: z.string(),
+      changes: z
+        .object({
+          base: z
+            .object({ ref: z.object({ from: z.string().min(1) }) })
+            .optional(),
+        })
+        .optional(),
+    })
+    .parse(value);
+  const kind = githubLifecycle(action, changes?.base !== undefined);
+  if (!kind) return undefined;
   const payload = z
     .object({
       repository: z.object({ id }),
-      pull_request: z.object({ number, user: user.nullable() }),
+      pull_request: z.object({
+        number,
+        user: user.nullable(),
+        updated_at: z.string().datetime({ offset: true }).optional(),
+        closed_at: z.string().datetime({ offset: true }).nullish(),
+      }),
     })
     .parse(value);
-  if (!payload.pull_request.user) return undefined;
-  return {
+  const pull = payload.pull_request;
+  const change = {
     repositoryId: payload.repository.id,
-    number: payload.pull_request.number,
-    author: payload.pull_request.user.login,
+    number: pull.number,
+    occurredAt:
+      kind === "closed" ? (pull.closed_at ?? pull.updated_at) : pull.updated_at,
   };
+  return kind === "opened"
+    ? ({ ...change, kind, author: pull.user?.login ?? "" } as const)
+    : ({ ...change, kind } as const);
 }
 
 /** Extract pushed refs while ignoring branch deletions and zero revisions. */
@@ -257,7 +300,7 @@ export class GithubForge implements Forge {
       }
       if (event === "pull_request") {
         const value = parseGithubPullRequest(raw);
-        return value ? { ...value, kind: "opened", deliveryId } : undefined;
+        return value ? { ...value, deliveryId } : undefined;
       }
       if (event === "push") {
         const value = parseGithubPush(raw);
@@ -325,6 +368,7 @@ export class GithubForge implements Forge {
           z.object({
             number,
             state: z.literal("open"),
+            draft: z.boolean().optional(),
             title: z.string(),
             html_url: z.string().url(),
             user: user.nullable(),
@@ -352,6 +396,7 @@ export class GithubForge implements Forge {
         seen.add(pull.number);
         result.push({
           number: pull.number,
+          draft: pull.draft,
           title: pull.title,
           url: pull.html_url,
           author: pull.user?.login,
@@ -370,32 +415,38 @@ export class GithubForge implements Forge {
   /** Validate pull request identity, reject closed or merged requests, and compare exact open revisions. */
   async change(n: number): Promise<ForgeChange> {
     number.parse(n);
-    const pull = z
+    const response = await this.transport.request(`${this.route}/pulls/${n}`);
+    const identity = z
       .object({
         number,
         state: z.enum(["open", "closed"]),
         merged: z.boolean(),
-        title: z.string(),
         html_url: z.string().url(),
-        user: user.nullable(),
-        base: z.object({ sha, ref: z.string().min(1).max(1024).optional() }),
-        head: z.object({ sha, ref: z.string().min(1).max(1024).optional() }),
       })
-      .parse(await this.transport.request(`${this.route}/pulls/${n}`));
+      .parse(response);
     const expected = approvedUrl(
       this.connection.webUrl,
       this.connection.allowHttp,
     );
-    const url = approvedUrl(pull.html_url, this.connection.allowHttp);
+    const url = approvedUrl(identity.html_url, this.connection.allowHttp);
     if (
-      pull.number !== n ||
+      identity.number !== n ||
       url.origin !== expected.origin ||
       url.pathname !==
         `${expected.pathname.replace(/\/$/, "")}/${repositoryPath(`${this.owner}/${this.repository}`)}/pull/${n}`
     )
       throw new ForgeOperationError("invalid-response");
-    if (pull.state === "closed" || pull.merged)
+    if (identity.state === "closed" || identity.merged)
       throw new ForgeOperationError("change-closed");
+    const pull = z
+      .object({
+        draft: z.boolean().optional(),
+        title: z.string(),
+        user: user.nullable(),
+        base: z.object({ sha, ref: z.string().min(1).max(1024).optional() }),
+        head: z.object({ sha, ref: z.string().min(1).max(1024).optional() }),
+      })
+      .parse(response);
     const compared = z
       .object({ merge_base_commit: z.object({ sha }) })
       .parse(
@@ -405,13 +456,14 @@ export class GithubForge implements Forge {
       );
     return {
       number: n,
+      draft: pull.draft,
       baseSha: pull.base.sha,
       headSha: pull.head.sha,
       mergeBase: compared.merge_base_commit.sha,
       headBranch: pull.head.ref,
       baseBranch: pull.base.ref,
       title: pull.title,
-      url: pull.html_url,
+      url: identity.html_url,
       author: pull.user?.login,
     };
   }
@@ -425,6 +477,7 @@ export class GithubForge implements Forge {
         id,
         body: z.string(),
         user: user.nullable(),
+        created_at: z.string().datetime({ offset: true }).optional(),
         issue_url: z.string().default(""),
         pull_request_url: z.string().default(""),
       })
@@ -460,14 +513,25 @@ export class GithubForge implements Forge {
         value.pull_request_url = `${web.href.replace(/\/$/, "")}/${repositoryPath(`${this.owner}/${this.repository}`)}/pull/${n}`;
       }
     }
-    return { ...value, id: commentId, user: value.user };
+    return {
+      ...value,
+      id: commentId,
+      user: value.user,
+      createdAt: value.created_at,
+    };
   }
 
   /** Read every top-level comment for publication marker reconciliation. */
-  async comments(n: number) {
+  async comments(n: number, options?: { complete: boolean }) {
     return z
       .array(z.object({ id, body: z.string(), user: historicalUser }))
-      .parse(await this.transport.list(`${this.route}/issues/${n}/comments`));
+      .parse(
+        await this.transport.list(
+          `${this.route}/issues/${n}/comments`,
+          "per_page",
+          options?.complete,
+        ),
+      );
   }
 
   /** Read all native review states, including pending and dismissed reviews. */
@@ -648,6 +712,57 @@ export class GithubForge implements Forge {
     return this.create(`${this.route}/issues/${n}/comments`, { body });
   }
 
+  /** Resolve the repository-wide REST ID only after verifying its exact issue URL and ownership. */
+  private async statusRoute(
+    n: number,
+    commentId: string,
+    botId: string,
+    marker: string,
+  ) {
+    id.parse(commentId);
+    verifyStatusComment(
+      await this.comment(commentId, n),
+      commentId,
+      botId,
+      marker,
+    );
+    return `${this.route}/issues/comments/${commentId}`;
+  }
+
+  /** Replace the verified status through the issue-comments endpoint. */
+  async editStatusComment(
+    n: number,
+    commentId: string,
+    botId: string,
+    marker: string,
+    body: string,
+  ) {
+    await this.transport.request(
+      await this.statusRoute(n, commentId, botId, marker),
+      "PATCH",
+      { body },
+    );
+  }
+
+  /** Remove the verified issue comment, including retries after a lost response. */
+  async deleteStatusComment(
+    n: number,
+    commentId: string,
+    botId: string,
+    marker: string,
+  ) {
+    await removeIfPresent(
+      commentId,
+      async () => {
+        await this.transport.request(
+          await this.statusRoute(n, commentId, botId, marker),
+          "DELETE",
+        );
+      },
+      () => this.comments(n, { complete: true }),
+    );
+  }
+
   /** Reply only to a root comment belonging to the requested review and thread. */
   async replyToReview(n: number, reviewId: string, comment: InlineComment) {
     const rows = await this.reviewComments(n, reviewId);
@@ -669,22 +784,29 @@ export class GithubForge implements Forge {
     body: string,
     comments: InlineComment[],
     event: "COMMENT" | "REQUEST_CHANGES",
+    publication?: ForgeReviewPublication,
   ) {
     sha.parse(head);
-    const result = await this.create(`${this.route}/pulls/${n}/reviews`, {
-      event,
-      commit_id: head,
-      body,
-      comments: comments.map((comment) => ({
-        path: comment.path,
-        line: comment.lineEnd,
-        side: "RIGHT",
-        ...(comment.lineStart < comment.lineEnd
-          ? { start_line: comment.lineStart, start_side: "RIGHT" }
-          : {}),
-        body: comment.body,
-      })),
-    });
+    if (publication) await reviewRevision(this, n, head, publication);
+    /** Send the review after the provider revision and repository policy checks pass. */
+    const write = () =>
+      this.create(`${this.route}/pulls/${n}/reviews`, {
+        event,
+        commit_id: head,
+        body,
+        comments: comments.map((comment) => ({
+          path: comment.path,
+          line: comment.lineEnd,
+          side: "RIGHT",
+          ...(comment.lineStart < comment.lineEnd
+            ? { start_line: comment.lineStart, start_side: "RIGHT" }
+            : {}),
+          body: comment.body,
+        })),
+      });
+    const result = publication?.submit
+      ? await publication.submit(write)
+      : await write();
     this.commentsCache.delete(n);
     this.threadsCache.delete(n);
     return result;

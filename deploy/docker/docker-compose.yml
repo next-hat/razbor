@@ -119,6 +119,7 @@ services:
       RAZBOR_INDEX_ENDPOINT: http://indexer:8790
       RAZBOR_INDEX_MANAGEMENT_TOKEN: ${RAZBOR_INDEX_MANAGEMENT_TOKEN:?Set the index management token}
       RAZBOR_WEBHOOK_CALLBACK_BASE: ${RAZBOR_PUBLIC_URL:?Set the public HTTPS origin}
+      RAZBOR_PUBLIC_URL: ${RAZBOR_PUBLIC_URL}
       REVIEW_QUEUE: reviews
     healthcheck:
       test:
