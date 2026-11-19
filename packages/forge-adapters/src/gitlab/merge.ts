@@ -25,6 +25,7 @@ const mrSchema = z.object({
   sha: commitSha,
   target_branch: z.string(),
   draft: z.boolean(),
+  user: z.object({ can_merge: z.boolean().nullish() }).nullish(),
   squash_on_merge: z.boolean().optional(),
   squash_commit_sha: commitSha.nullish(),
   merge_when_pipeline_succeeds: z.boolean(),
@@ -36,10 +37,12 @@ const mrSchema = z.object({
 });
 
 const access = z.object({
-  access_level: z.preprocess(
-    (v) => String(v),
-    z.enum(["0", "30", "40", "50", "60"]).transform(Number),
-  ),
+  access_level: z
+    .preprocess(
+      (v) => String(v),
+      z.enum(["0", "30", "40", "50", "60"]).transform(Number),
+    )
+    .nullable(),
   member_role_id: mergeId.nullish(),
   user_id: mergeId.nullish(),
   group_id: mergeId.nullish(),
@@ -75,7 +78,8 @@ function onlyDestination(
             !entry.deploy_key_id &&
             (entry.user_id
               ? entry.user_id !== botId
-              : entry.access_level === 0 || entry.access_level >= 40),
+              : entry.access_level !== null &&
+                (entry.access_level === 0 || entry.access_level >= 40)),
         )),
   );
 }
@@ -246,6 +250,10 @@ export async function inspectGitlabMerge(
       ? { ...mergeState("scheduled", reason), guardState }
       : mergeState(guardState, reason);
   }
+  // Protected-branch rules establish exclusivity. GitLab evaluates the
+  // authenticated bot's effective permission on this particular MR target.
+  if (mr.user?.can_merge !== true)
+    return unmetGuard("blocked", "exclusive_destination_required");
   if (mr.has_conflicts || !mr.blocking_discussions_resolved)
     return unmetGuard("blocked", "merge_restrictions");
   if (

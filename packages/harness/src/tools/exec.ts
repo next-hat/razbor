@@ -36,6 +36,11 @@ const execOptionsSchema = z
 
 export type ExecOptions = z.input<typeof execOptionsSchema>;
 
+/** Identify Git invocations by executable name, including a caller-supplied path. */
+export function isGitCommand(executable: unknown) {
+  return typeof executable === "string" && path.basename(executable) === "git";
+}
+
 /**
  * Runs argv without a shell from a repository-confined directory using only
  * caller-approved environment variables. Caps time and combined output, kills child
@@ -72,7 +77,7 @@ export async function executeCommand(
   );
   // Explicit Git exploration uses the same no-hooks/no-protocol policy as source reads.
   // Arbitrary test/build programs remain confined by the job container, not argv filtering.
-  const isGit = path.basename(args.argv[0]) === "git";
+  const isGit = isGitCommand(args.argv[0]);
   const argv = isGit
     ? [args.argv[0], ...safeGitOptions, ...args.argv.slice(1)]
     : args.argv;

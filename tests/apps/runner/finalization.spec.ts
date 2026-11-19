@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { renameSync } from "node:fs";
 import { access, mkdir, rename } from "node:fs/promises";
 import path from "node:path";
@@ -553,6 +554,14 @@ for (const inspection of [
   test("lazy merge assessment after inspecting " + inspection, async (t) => {
     const complete = inspection.startsWith("both");
     const steps: ((payload: Payload) => Reply)[] = [];
+    // Use the installed Git on this host for the absolute-path coverage case.
+    let gitExecutable = "git";
+    if (inspection === "both pinned exec patches") {
+      gitExecutable = execFileSync("sh", ["-c", "command -v git"], {
+        encoding: "utf8",
+      }).trim();
+      assert.ok(path.isAbsolute(gitExecutable));
+    }
     if (inspection.includes("read_diff"))
       steps.push(() => ({
         call: {
@@ -585,7 +594,7 @@ for (const inspection of [
           call: {
             id: "inspect",
             argv: [
-              "git",
+              gitExecutable,
               "diff",
               f.files.base,
               f.files.head,

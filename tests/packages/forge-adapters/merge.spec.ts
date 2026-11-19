@@ -336,6 +336,16 @@ test("GitHub surfaces confirmed rate limits on legacy cancellation and preserves
 
 /** Return authoritative pipeline, protection, schedule owner and revision state from an offline MR. */
 function gitlabFixture(t: TestContext) {
+  type Access = { access_level: number | null; group_id?: number };
+
+  const branches = ["*", "main"].map((name) => ({
+    name,
+    allow_force_push: false,
+    push_access_levels: [{ access_level: 0 }] as Access[],
+    merge_access_levels: [
+      { access_level: name === "main" ? 30 : 40 },
+    ] as Access[],
+  }));
   const mr = {
     iid: 7,
     project_id: 10,
@@ -343,6 +353,8 @@ function gitlabFixture(t: TestContext) {
     sha: headSha,
     target_branch: "main",
     draft: false,
+    user: { can_merge: true } as
+      { can_merge?: boolean | null } | null | undefined,
     squash_on_merge: false as boolean | undefined,
     squash_commit_sha: null as string | null | undefined,
     merge_when_pipeline_succeeds: false,
@@ -379,14 +391,7 @@ function gitlabFixture(t: TestContext) {
     if (path === "/api/v4/user") return { id: 2, bot: true };
     if (path === "/api/v4/version") return { version: flags.version };
     if (path.startsWith(route + "/protected_branches?"))
-      return path.endsWith("page=1")
-        ? ["*", "main"].map((name) => ({
-            name,
-            allow_force_push: false,
-            push_access_levels: [{ access_level: 0 }],
-            merge_access_levels: [{ access_level: name === "main" ? 30 : 40 }],
-          }))
-        : [];
+      return path.endsWith("page=1") ? branches : [];
     if (path === route + "/repository/branches/main")
       return { name: "main", protected: true, commit: { id: flags.base } };
     if (path === route + "/repository/commits/" + headSha)
@@ -406,7 +411,7 @@ function gitlabFixture(t: TestContext) {
     }
     assert.fail(`unexpected ${method} ${path}`);
   });
-  return { api: forge("gitlab"), mr, project, flags, mutations };
+  return { api: forge("gitlab"), mr, project, flags, mutations, branches };
 }
 
 test("GitLab verifies a same-SHA successful pipeline and native restrictions before scheduling by numeric project ID and SHA", async (t) => {
@@ -453,13 +458,56 @@ test("GitLab verifies a same-SHA successful pipeline and native restrictions bef
   assert.equal((await f.api.inspectMerge(request)).state, "stale");
   f.flags.base = baseSha;
   assert.equal((await f.api.inspectMerge(request)).state, "ready");
+  const [wildcard, target] = f.branches;
+  target.merge_access_levels = [{ access_level: 40 }];
+  for (const user of [
+    { can_merge: false },
+    { can_merge: null },
+    {},
+    null,
+    undefined,
+  ]) {
+    f.mr.user = user;
+    assert.deepEqual(await f.api.inspectMerge(request), {
+      state: "blocked",
+      reason: "exclusive_destination_required",
+    });
+    await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
+  }
+  // A target-specific push-and-merge grant to a group may authorize the bot.
+  f.mr.user = { can_merge: true };
+  target.push_access_levels = [{ access_level: null, group_id: 81 }];
+  assert.equal((await f.api.inspectMerge(request)).state, "ready");
+  // The same group grant on other branches destroys the exclusivity proof.
+  wildcard.merge_access_levels.push({ access_level: null, group_id: 81 });
+  assert.equal(
+    (await f.api.inspectMerge(request)).reason,
+    "exclusive_destination_required",
+  );
+  wildcard.merge_access_levels.pop();
   assert.deepEqual(f.mutations, []);
-  assert.equal(await f.api.scheduleMerge(request), "scheduled");
+  assert.deepEqual(
+    await f.api.scheduleMerge(request, false, async (stage) => {
+      if (stage === "acknowledged") f.mr.user = { can_merge: false };
+    }),
+    {
+      state: "scheduled",
+      guardState: "blocked",
+      reason: "exclusive_destination_required",
+    },
+  );
+  f.mr.user = { can_merge: true };
   assert.deepEqual(f.mutations, [
     { sha: headSha, auto_merge: true, squash: true },
   ]);
   const healthy = { ...f.mr };
   for (const [change, guardState, reason] of [
+    [
+      { user: { can_merge: false } },
+      "blocked",
+      "exclusive_destination_required",
+    ],
+    [{ user: undefined }, "blocked", "exclusive_destination_required"],
     [
       { head_pipeline: { sha: headSha, status: "running" } },
       "awaiting_checks",

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 
 import { git, MAX_GIT_OUTPUT_BYTES } from "@harness/src/git.js";
+import { isGitCommand } from "@harness/src/tools/exec.js";
 
 const MAX_INPUT_BYTES = 1_000_000;
 
@@ -275,7 +276,7 @@ export class PreparedDiff {
   observeExec(argv: unknown, stdout: string) {
     if (
       !Array.isArray(argv) ||
-      argv[0] !== "git" ||
+      !isGitCommand(argv[0]) ||
       argv[1] !== "diff" ||
       argv[2] !== this.baselineSha ||
       argv[3] !== this.headSha ||
