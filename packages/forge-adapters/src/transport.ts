@@ -137,22 +137,21 @@ export class HttpForgeTransport {
         body: body === undefined ? undefined : JSON.stringify(body),
       });
       if (!response.ok) {
-        if (
+        const rateLimited =
           (response.status === 429 &&
             ["github", "gitlab"].includes(this.connection.type)) ||
           (response.status === 403 &&
             this.connection.type === "github" &&
-            (await githubRateLimitedResponse(response)))
-        ) {
-          if (response.status === 429) await response.body?.cancel();
+            (await githubRateLimitedResponse(response)));
+        // Cleanup cannot change the refusal or delay reporting its retry deadline.
+        if (!response.bodyUsed) void response.body?.cancel().catch(() => {});
+        if (rateLimited)
           throw new ForgeOperationError(
             "unavailable",
             false,
             response.status,
             rateLimitRetry(response),
           );
-        }
-        if (!response.bodyUsed) await response.body?.cancel();
         const reason =
           response.status === 401 || response.status === 403
             ? "permission"

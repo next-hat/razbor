@@ -82,6 +82,7 @@ test(
     let observed = barrier();
     let release = barrier();
     let listDraft = true;
+    let untrackedTitle = "Review lifecycle";
     let pauseRead = false;
     const concurrentDetail = barrier();
     const releaseRefresh = barrier();
@@ -127,7 +128,7 @@ test(
             (number === 25 && detail && omitDetailDraft)
               ? undefined
               : draft,
-          title: "Review lifecycle",
+          title: number === 26 ? untrackedTitle : "Review lifecycle",
           user: prAuthor,
           html_url: origin + "/team/project/pulls/" + number,
           base: {
@@ -523,21 +524,22 @@ test(
       // ready event must still start exactly one review in fully automatic mode.
       draft = true;
       await lifecycle("opened", 23);
-      /** Read the draft evidence and admission generation of the tracked PR. */
-      const draftFence = async () =>
+      /** Read the draft evidence and admission generation of a saved PR. */
+      const draftFence = async (number: number) =>
         (
           await database.pool.query(
-            "select draft, trigger_generation from pull_requests where number=23",
+            "select draft, trigger_generation from pull_requests where number=$1",
+            [number],
           )
         ).rows[0];
-      const beforeReady = await draftFence();
+      const beforeReady = await draftFence(23);
       assert.equal(beforeReady.draft, true);
       draft = false;
       assert.deepEqual(
         (await syncPullRequests(database, [repo.id])).failures,
         [],
       );
-      assert.deepEqual(await draftFence(), beforeReady);
+      assert.deepEqual(await draftFence(23), beforeReady);
       await lifecycle("edited", 23);
       assert.equal((await history()).length, priorCount + 2);
       /** Read both fences, branch names, and SHAs for this provider PR. */
@@ -904,6 +906,25 @@ test(
           (item) => item.number === 26,
         ),
       );
+      // PR 26 was discovered only through the listing. A missing draft flag
+      // can reuse its saved readiness only while its revision and title match.
+      const listedReady = await draftFence(26);
+      assert.equal(listedReady.draft, false);
+      listDraft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.deepEqual(await draftFence(26), listedReady);
+      untrackedTitle = "WIP: Review lifecycle";
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      assert.deepEqual(await draftFence(26), {
+        draft: null,
+        trigger_generation: listedReady.trigger_generation + 1,
+      });
     } finally {
       release.resolve();
       delete process.env.RAZBOR_TEST_TRIGGER_SECRET;

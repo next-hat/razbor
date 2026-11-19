@@ -571,10 +571,8 @@ test(
     let denyNextSubmission = false;
     const inspections: number[] = [];
     const voteWrites: number[] = [];
-    const voteFailures = [
-      new ForgeOperationError("not-sent"),
-      new ForgeOperationError("unavailable", false, 200, Date.now() + 300_000),
-    ];
+    let voteFailure: "not-sent" | "rate-limited" | undefined;
+    let providerVoteDeadline: number | undefined;
     const liveApprovalEvents: string[] = [];
     let visibleVote: "absent" | "approved" | "dismissed" = "absent";
     const approve = t.mock.method(
@@ -603,8 +601,17 @@ test(
         if (reconcileOnly) return visibleVote;
         await beforeWrite();
         assert.equal(await voteStatus(request.reviewId), "uncertain");
-        if (request.number === 9 && voteFailures.length)
-          throw voteFailures.shift();
+        if (request.number === 9 && voteFailure) {
+          if (voteFailure === "not-sent")
+            throw new ForgeOperationError("not-sent");
+          providerVoteDeadline = Date.now() + 300_000;
+          throw new ForgeOperationError(
+            "unavailable",
+            false,
+            200,
+            providerVoteDeadline,
+          );
+        }
         voteWrites.push(request.number);
         if (request.number === 12) {
           visibleVote = "approved";
@@ -946,8 +953,12 @@ test(
     assert.equal(nextOrdinaryNote, 201);
     // A development HTTP setting must never send a triage preflight or retain
     // the old eligible preview when the configured origin cannot be trusted.
-    const callsBeforeHttp = providerRequests.mock.callCount();
     for (const forgeType of ["forgejo", "gitlab"]) {
+      assert.deepEqual(await decision(clean), {
+        status: "auto_merge_eligible",
+        action: "dry_run",
+      });
+      const callsBeforeHttp = providerRequests.mock.callCount();
       await db.pool.query(
         "update forge_instances set type=$1, api_url='http://forge.invalid/api', allow_http=true where config_key='test'",
         [forgeType],
@@ -959,13 +970,13 @@ test(
         status: "blocked",
         action: null,
       });
+      await db.pool.query(
+        "update forge_instances set type='forgejo', api_url=$1, allow_http=false where config_key='test'",
+        [config.forges.test.api_url],
+      );
+      await due(second);
+      await processMergeTriage(db);
     }
-    await db.pool.query(
-      "update forge_instances set type='forgejo', api_url=$1, allow_http=false where config_key='test'",
-      [config.forges.test.api_url],
-    );
-    await due(second);
-    await processMergeTriage(db);
     assert.deepEqual(await decision(clean), {
       status: "auto_merge_eligible",
       action: "dry_run",
@@ -1247,15 +1258,19 @@ test(
     assert.match(bodyFor(8), /approval was dismissed/);
     const deniedVotePr = await pull(9);
     const deniedVoteReview = await complete(deniedVotePr, 96);
-    for (const { retryAt } of [...voteFailures]) {
+    for (const failure of ["not-sent", "rate-limited"] as const) {
+      voteFailure = failure;
+      const dispatchStarted = Date.now();
       await processMergeTriage(restart);
       assert.equal(await voteStatus(deniedVoteReview), null);
-      assert.ok(
-        (await deadline(deniedVotePr))!.getTime() >=
-          (retryAt ?? Date.now() + 30_000),
-      );
+      const scheduledRetry = (await deadline(deniedVotePr))!.getTime();
+      if (failure === "rate-limited") {
+        assert.ok(providerVoteDeadline !== undefined);
+        assert.ok(scheduledRetry >= providerVoteDeadline);
+      } else assert.ok(scheduledRetry >= dispatchStarted + 30_000);
       await due(deniedVotePr);
     }
+    voteFailure = undefined;
     await processMergeTriage(db);
     assert.equal(await voteStatus(deniedVoteReview), "unavailable");
     await due(deniedVotePr);

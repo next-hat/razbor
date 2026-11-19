@@ -365,8 +365,7 @@ function gitlabFixture(t: TestContext) {
   };
   const flags = {
     loseResponse: false,
-    refuse: false,
-    rateLimited: false,
+    rejection: undefined as Response | undefined,
     nullMergeUser: false,
     base: baseSha,
     version: "19.4.0-ee",
@@ -396,12 +395,7 @@ function gitlabFixture(t: TestContext) {
       method === "PUT"
     ) {
       mutations.push(body);
-      if (flags.rateLimited)
-        return new Response(null, {
-          status: 429,
-          headers: { "retry-after": "180" },
-        });
-      if (flags.refuse) return new Response(null, { status: 409 });
+      if (flags.rejection) return flags.rejection;
       mr.merge_when_pipeline_succeeds = true;
       mr.merge_user = flags.nullMergeUser ? null : { id: 2 };
       if (flags.loseResponse) throw new Error("response lost");
@@ -504,6 +498,7 @@ test("GitLab requires project-enforced unsquashed merges and checks the terminal
   for (const missing of [null, undefined]) {
     f.mr.squash_commit_sha = missing;
     const result = await f.api.inspectMerge(request);
+    assert.equal(result.state, "blocked");
     assert.equal(result.terminal, true);
     assert.equal(result.reason, "merge_method_unavailable");
   }
@@ -514,21 +509,33 @@ test("GitLab distinguishes a guarded refusal from an unknown outcome and reconci
   const now = Date.now();
   t.mock.method(Date, "now", () => now);
   const stages: ForgeMergeWriteStage[] = [];
-  f.flags.rateLimited = true;
-  await assert.rejects(
-    f.api.scheduleMerge(request, false, async (stage) => {
-      stages.push(stage);
-    }),
-    { status: 429, uncertain: false, retryAt: now + 180000 },
-  );
-  assert.deepEqual(stages, ["submitting", "prepared"]);
-  f.flags.rateLimited = false;
-  f.flags.refuse = true;
+  /** Model a failed body stream after the provider returned refusal headers. */
+  function brokenBody() {
+    return new ReadableStream({
+      start: (controller) =>
+        controller.error(new Error("response body failed")),
+    });
+  }
+  for (const body of [null, brokenBody()]) {
+    f.flags.rejection = new Response(body, {
+      status: 429,
+      headers: { "retry-after": "180" },
+    });
+    stages.length = 0;
+    await assert.rejects(
+      f.api.scheduleMerge(request, false, async (stage) => {
+        stages.push(stage);
+      }),
+      { status: 429, uncertain: false, retryAt: now + 180000 },
+    );
+    assert.deepEqual(stages, ["submitting", "prepared"]);
+  }
+  f.flags.rejection = new Response(brokenBody(), { status: 409 });
   await assert.rejects(
     f.api.scheduleMerge(request),
     (e) => e instanceof ForgeOperationError && !e.uncertain && e.status === 409,
   );
-  f.flags.refuse = false;
+  f.flags.rejection = undefined;
   f.flags.loseResponse = true;
   await assert.rejects(
     f.api.scheduleMerge(request),
@@ -538,7 +545,7 @@ test("GitLab distinguishes a guarded refusal from an unknown outcome and reconci
     (await forge("gitlab").inspectMerge(request)).state,
     "scheduled",
   );
-  assert.equal(f.mutations.length, 3);
+  assert.equal(f.mutations.length, 4);
 });
 
 test("GitLab binds an unattributed schedule to a positive PUT receipt and preserves uncertainty after transport loss", async (t) => {

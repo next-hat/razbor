@@ -74,6 +74,8 @@ checks that the edit starts exactly one review. It also overlaps detail reads
 with a webhook and checks which readiness information survives a missing detail
 field or a changed revision. A failed detail request defers updates to another
 tracked PR and a newly listed PR until the fixture's next successful refresh.
+When an untracked PR listing omits the draft flag, the fixture checks that an
+unchanged title preserves readiness and a rename clears it and advances the generation.
 The status-comment fixture covers masked 404s, deletion during an active review,
 and recovery after a bot rotation through restored credentials or manual removal.
 The Forgejo provider fixture accepts web and API pull-request URLs from their

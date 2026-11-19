@@ -737,10 +737,11 @@ export async function syncPullRequests(
                   values.draft = before.draft;
               }
               // Use the same guarded readiness for persistence and change detection.
-              // Only an unchanged partial listing may retain a previously observed draft flag.
+              // A partial listing may reuse readiness only for the same revision and title.
               const draft = before?.tracked
                 ? sql`${values.draft}::boolean`
-                : sql`case when excluded.draft is null and not (${revised}) then ${pullRequests.draft} else excluded.draft end`;
+                : sql`case when excluded.draft is null and not (${revised}) and ${pullRequests.title} = excluded.title
+                      then ${pullRequests.draft} else excluded.draft end`;
               const changed = sql`(${revised} or row(${pullRequests.draft}, ${pullRequests.mergeBase}, ${pullRequests.startSha})
                 is distinct from row(${draft}, excluded.merge_base, excluded.start_sha))`;
               const [updated] = await tx

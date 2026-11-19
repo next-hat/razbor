@@ -14,6 +14,7 @@ import {
   previousFindingsSchema,
   type PreviousFinding,
   type ReviewConversation,
+  type ReviewFinding,
 } from "@razbor/contracts";
 import type {
   ForgeChange,
@@ -78,15 +79,23 @@ export async function previousConsoleFindings(
   number: number,
   excludeReviewId?: string,
 ) {
+  const resolvedIds = sql`jsonb_path_query_array(${reviews.result},
+    '$.findingChecks[*] ? (@.status == "resolved" && @.id starts with "console:").id')`;
   const history = await db
     .select({
       id: reviews.publicId,
       head: reviews.headSha,
-      source: reviews.source,
-      result: reviews.result,
-      trigger: reviewTriggers.id,
-      current: sql<boolean>`${reviews.source}->>'mergeRevision' = ${pullRequests.mergeRevision}::text
-          and ${reviews.headSha} = ${pullRequests.headSha} and ${reviews.baseSha} = ${pullRequests.baseSha}`,
+      findings: sql<
+        ReviewFinding[] | null
+      >`case when ${reviewTriggers.id} is null then ${reviews.result}->'findings' end`,
+      // A console assessment must be repeated when the destination or revision changes.
+      resolved: sql<
+        PreviousFinding[] | null
+      >`case when ${reviewTriggers.id} is not null or (
+        ${reviews.source}->>'mergeRevision' = ${pullRequests.mergeRevision}::text
+        and ${reviews.headSha} = ${pullRequests.headSha} and ${reviews.baseSha} = ${pullRequests.baseSha}
+      ) then jsonb_path_query_array(${reviews.source}, '$.previousFindings[*] ? (@.id == $ids[*])',
+        jsonb_build_object('ids', ${resolvedIds})) end`,
     })
     .from(reviews)
     .innerJoin(pullRequests, eq(pullRequests.id, reviews.mergePullRequestId))
@@ -98,6 +107,7 @@ export async function previousConsoleFindings(
         eq(pullRequests.repositoryId, repositoryId),
         eq(pullRequests.number, number),
         eq(reviews.status, "completed"),
+        sql`${reviews.source}->>'conversation' is null`,
         excludeReviewId ? ne(reviews.publicId, excludeReviewId) : undefined,
         or(
           and(
@@ -105,8 +115,7 @@ export async function previousConsoleFindings(
             sql`jsonb_array_length(${reviews.result}->'findings') > 0`,
           ),
           and(
-            sql`exists (select 1 from jsonb_array_elements(${reviews.result}->'findingChecks') as assessment
-                        where assessment->>'id' like 'console:%' and assessment->>'status' = 'resolved')`,
+            sql`jsonb_array_length(${resolvedIds}) > 0`,
             or(
               isNull(reviewTriggers.id),
               sql`${dispatchOutbox.publication}->>'state' = 'published'
@@ -120,30 +129,18 @@ export async function previousConsoleFindings(
     .orderBy(reviews.createdAt, reviews.publicId);
   const open = new Map<string, PreviousFinding>();
   for (const row of history) {
-    if (row.source.conversation) continue;
-    // A console run has no confirmed publication. Its assessments must be
-    // repeated when the destination or revision changes.
-    for (const check of (row.trigger || row.current
-      ? row.result?.findingChecks
-      : undefined) ?? []) {
-      const old = open.get(check.id);
+    for (const saved of row.resolved ?? []) {
+      const old = open.get(saved.id);
       if (
-        check.status === "resolved" &&
         old &&
-        row.source.previousFindings?.some(
-          (saved) =>
-            saved.id === old.id &&
-            saved.reviewId === old.reviewId &&
-            findingKey(saved.finding) === findingKey(old.finding),
-        )
+        saved.reviewId === old.reviewId &&
+        findingKey(saved.finding) === findingKey(old.finding)
       )
-        open.delete(check.id);
+        open.delete(saved.id);
     }
-    if (!row.trigger) {
-      for (const [index, finding] of (row.result?.findings ?? []).entries()) {
-        const id = `console:${row.id}:${index}`;
-        open.set(id, { id, reviewId: row.id, originalHead: row.head, finding });
-      }
+    for (const [index, finding] of (row.findings ?? []).entries()) {
+      const id = `console:${row.id}:${index}`;
+      open.set(id, { id, reviewId: row.id, originalHead: row.head, finding });
     }
   }
   return [...open.values()];
