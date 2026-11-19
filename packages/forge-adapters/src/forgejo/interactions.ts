@@ -444,8 +444,8 @@ export class ForgejoInteractions implements Forge {
     };
   }
   /**
-   * Read a comment's author, text and issue or pull request location for
-   * independent webhook verification.
+   * Read a comment's author and text. When a PR is supplied, verify its web or
+   * API location and return the canonical web URL for webhook verification.
    */
   async comment(commentId: string, n?: number) {
     const value = z
@@ -465,13 +465,23 @@ export class ForgejoInteractions implements Forge {
     if (value.id !== commentId)
       throw new ForgeOperationError("invalid-response");
     if (n !== undefined) {
+      number.parse(n);
       const web = approvedUrl(
         this.connection.webUrl,
         this.connection.allowHttp,
       );
-      const expected = `${web.href.replace(/\/$/, "")}/${this.route.slice("repos/".length)}/pulls/${number.parse(n)}`;
-      if (value.pull_request_url !== expected)
+      const api = approvedUrl(
+        this.connection.apiUrl,
+        this.connection.allowHttp,
+      );
+      const webUrl = `${web.href.replace(/\/$/, "")}/${this.route.slice("repos/".length)}/pulls/${n}`;
+      const apiUrl = `${api.href.replace(/\/$/, "")}/${this.route}/pulls/${n}`;
+      if (
+        value.pull_request_url !== webUrl &&
+        value.pull_request_url !== apiUrl
+      )
         throw new ForgeOperationError("invalid-response");
+      value.pull_request_url = webUrl;
     }
     return { ...value, createdAt: value.created_at };
   }

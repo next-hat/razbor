@@ -62,12 +62,16 @@ result after draft cleanup. The GitLab fixture also checks that unconfirmed
 follow-ups show unanchored findings, that later reviews suppress verified inline
 duplicates, and that the management CLI can abandon an ambiguous bulk without
 resubmitting it or deleting another user's draft.
+For checkpoints that record the bot ID, recovery requires matching credentials
+and succeeds without an operator-supplied ID.
 It also drops a ready event after the MR's diff refs change, then verifies that
 refresh recovers the matching completed result and publishes it exactly once.
 The Forgejo fixture refreshes an unreviewed PR before its signed title edit and
 checks that the edit starts exactly one review.
 The status-comment fixture covers masked 404s, deletion during an active review,
 and recovery after a bot rotation through restored credentials or manual removal.
+The Forgejo provider fixture accepts web and API pull-request URLs from their
+configured origins and rejects mismatched repositories, PRs, and origins.
 The GitLab provider fixture checks status-comment cleanup on a 1,000-note MR.
 These checks do not need model credentials.
 

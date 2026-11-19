@@ -15,12 +15,16 @@ import {
 } from "@razbor/forge-adapters";
 
 /** Bind an adapter to a loopback API or a non-routable URL for parser-only checks. */
-function fixtureForge(type: ForgeType, origin = "https://fixture.invalid") {
+function fixtureForge(
+  type: ForgeType,
+  origin = "https://fixture.invalid",
+  webUrl = origin,
+) {
   return createForge(
     {
       type,
       apiUrl: `${origin}/api/${{ github: "v3", gitlab: "v4", forgejo: "v1" }[type]}`,
-      webUrl: origin,
+      webUrl,
       allowHttp: true,
       token: "local-test",
     },
@@ -391,7 +395,7 @@ test("current change reads use the target repository, immutable fork revisions a
                 : undefined,
             /** Record whether the adapter classified this as a possible remote submission. */
             async save(progress) {
-              bulkWriting = !!progress.bulk?.writing;
+              bulkWriting ||= !!progress.bulk?.writing;
             },
           },
         ),
@@ -408,6 +412,7 @@ test("current change reads use the target repository, immutable fork revisions a
     assert.equal(draft, true);
     if (type === "gitlab") {
       let preflight: ForgePublicationProgress = {};
+      let savedBulkWriting = false;
       const interrupted = new Error("worker stopped before native submission");
       /** Retry the same frozen review with the durable state from its previous preflight. */
       const submitWith = (interrupt = false) =>
@@ -427,12 +432,14 @@ test("current change reads use the target repository, immutable fork revisions a
                 }
               : undefined,
             async save(checkpoint) {
+              savedBulkWriting ||= !!checkpoint.bulk?.writing;
               preflight = structuredClone(checkpoint);
             },
           },
         );
       draft = false;
       await assert.rejects(submitWith(true), interrupted);
+      assert.equal(savedBulkWriting, false);
       assert.equal(structuredClone(preflight).bulk, undefined);
       introduceDraftOnApprovalRead = true;
       await assert.rejects(
@@ -443,6 +450,7 @@ test("current change reads use the target repository, immutable fork revisions a
           !error.uncertain,
       );
       assert.equal(bulkPosts, 0);
+      assert.equal(savedBulkWriting, false);
       assert.equal(structuredClone(preflight).bulk, undefined);
       assert.equal(cleanupDraft?.id, 22);
       cleanupDraft = undefined;
@@ -666,6 +674,7 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
   const running = `Running\n\n${marker}`;
   const writes: string[] = [];
   let provider: ForgeType = "github";
+  let forgejoPullBase = "";
   let body = queued;
   let owner = "5";
   let commentId = "91";
@@ -723,7 +732,7 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
           body,
           system: false,
           issue_url: `${origin}/api/v3/repos/team/project/issues/${number}`,
-          pull_request_url: `${origin}/team/project/pulls/${number}`,
+          pull_request_url: `${forgejoPullBase}/${number}`,
           created_at: "2026-02-04T03:02:01Z",
           noteable_type: "MergeRequest",
           noteable_iid: number,
@@ -748,12 +757,24 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
   const address = server.address();
   assert.ok(address && typeof address !== "string");
   const origin = `http://127.0.0.1:${address.port}`;
+  const forgejoWebUrl = "https://web.fixture.invalid/forge";
   try {
-    for (provider of ["github", "forgejo", "gitlab"] as const) {
+    for (const [type, pullBase] of [
+      ["github", ""],
+      ["forgejo", `${origin}/api/v1/repos/team/project/pulls`],
+      ["forgejo", `${forgejoWebUrl}/team/project/pulls`],
+      ["gitlab", ""],
+    ] as const) {
+      provider = type;
+      forgejoPullBase = pullBase;
       writes.length = 0;
       body = queued;
       absent = false;
-      const forge = fixtureForge(provider, origin);
+      const forge = fixtureForge(
+        provider,
+        origin,
+        provider === "forgejo" ? forgejoWebUrl : origin,
+      );
       /** Exercise an untrusted response without touching any provider comment. */
       const rejectWrite = async () => {
         await assert.rejects(
@@ -781,6 +802,23 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
       hideSingleComment = true;
       await rejectWrite();
       hideSingleComment = false;
+      if (provider === "forgejo") {
+        for (const wrongBase of [
+          `${origin}/api/v1/repos/team/other/pulls`,
+          `${forgejoWebUrl}/team/other/pulls`,
+          `${origin}/team/project/pulls`,
+          `${forgejoWebUrl}/api/v1/repos/team/project/pulls`,
+          "https://other.fixture.invalid/forge/team/project/pulls",
+        ]) {
+          forgejoPullBase = wrongBase;
+          await rejectWrite();
+        }
+        forgejoPullBase = pullBase;
+        assert.equal(
+          (await forge.comment("91", 12)).pull_request_url,
+          `${forgejoWebUrl}/team/project/pulls/12`,
+        );
+      }
       if (provider === "gitlab") {
         discussion = true;
         await rejectWrite();

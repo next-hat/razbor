@@ -135,7 +135,7 @@ test(
       }
       const list = /\/issues\/(\d+)\/comments$/.exec(path);
       if (list) {
-        const url = origin + "/team/project/pulls/" + list[1];
+        const url = origin + "/api/v1/repos/team/project/pulls/" + list[1];
         if (method === "GET")
           return send(
             [...comments.values()].filter((c) => c.pull_request_url === url),
@@ -164,7 +164,8 @@ test(
           body: "/agentic_review",
           user: author,
           created_at: commandTime.toISOString(),
-          pull_request_url: origin + "/team/project/pulls/" + commentNumber,
+          pull_request_url:
+            origin + "/api/v1/repos/team/project/pulls/" + commentNumber,
           issue_url: "",
         });
       }
@@ -1093,22 +1094,27 @@ test(
         await abandonGitlabPublication(database, followup.id),
         "ineligible",
       );
-      await database.pool.query(
-        "update dispatch_outbox set publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
-        [
-          JSON.stringify({
-            state: "uncertain",
-            mode: "review",
-            writing: true,
-            reviewPayload: { ...frozen, comments: [inline] },
-            providerProgress: {
-              "draft-0": { id: "41" },
-              bulk: { writing: true },
-            },
-          }),
-          followup.id,
-        ],
-      );
+      /** Restore the interrupted submission with the owner recorded by that worker, if any. */
+      const restoreCheckpoint = async (botId?: string) => {
+        await database.pool.query(
+          "update dispatch_outbox set publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
+          [
+            JSON.stringify({
+              state: "uncertain",
+              mode: "review",
+              writing: true,
+              reviewPayload: { ...frozen, comments: [inline] },
+              providerProgress: {
+                "draft-0": { id: "41" },
+                bulk: { writing: true, botId },
+              },
+            }),
+            followup.id,
+          ],
+        );
+      };
+
+      await restoreCheckpoint();
       draftNote = {
         id: 41,
         author_id: 8,
@@ -1156,6 +1162,20 @@ test(
         outcome: "abandoned",
       });
       assert.equal(draftNote, undefined);
+      assert.equal(
+        await abandonGitlabPublication(database, followup.id),
+        "abandoned",
+      );
+      await restoreCheckpoint("8");
+      assert.equal(
+        await abandonGitlabPublication(database, followup.id),
+        "ineligible",
+      );
+      assert.equal(
+        (await publicationView(database, followup.id))?.publication?.state,
+        "uncertain",
+      );
+      await restoreCheckpoint("9");
       assert.equal(
         await abandonGitlabPublication(database, followup.id),
         "abandoned",
