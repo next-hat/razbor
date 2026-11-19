@@ -9,6 +9,7 @@ import type { PullRequestView } from "@razbor/database";
 import { TriageQueue } from "@razbor/web/triage-queue";
 import { RepositoryMergePolicy } from "@razbor/web/repository-merge-policy";
 import { triageQueue, initialQueueFilters } from "@razbor/web/merge-triage";
+import { visiblePullRequest } from "@razbor/web/pull-requests";
 import { IndexPanel, type IndexData } from "@razbor/web/index-panel";
 import { ReviewMarkdown } from "@razbor/web/review-markdown";
 import { ReviewResult } from "@razbor/web/review-result";
@@ -288,6 +289,38 @@ function triagePr(
     },
   };
 }
+
+test("only repository managers see configured reviewer candidates on PRs and their reviews", () => {
+  const pr = triagePr(1, "human_review_required");
+  const decision = {
+    status: "human_review_required" as const,
+    reviewers: ["unverified-candidate"],
+    reasons: [],
+  };
+  const review = {
+    id: "review_1",
+    repositoryId: pr.repositoryId,
+    status: "completed" as const,
+    submittedAt: pr.createdAt,
+    mergeDecision: decision,
+  };
+  const detail = {
+    ...pr,
+    merge: { decision },
+    latestReview: review,
+    reviews: [review],
+  };
+  const member = visiblePullRequest(detail, false);
+  const manager = visiblePullRequest(detail, true);
+  for (const [view, expected] of [
+    [member, []],
+    [manager, ["unverified-candidate"]],
+  ] as const) {
+    assert.deepEqual(view.merge.decision.reviewers, expected);
+    assert.deepEqual(view.latestReview.mergeDecision.reviewers, expected);
+    assert.deepEqual(view.reviews[0].mergeDecision.reviewers, expected);
+  }
+});
 
 test("both queue surfaces put human escalation before intervention, verification, running reviews and eligibility", () => {
   const rows = [

@@ -515,11 +515,12 @@ function publicReasons(
   return reasons;
 }
 
-/** Publish only service-owned reason codes and explanations, including for historical decisions. */
+/** Expose status and service-owned reasons to members while keeping configured reviewer candidates private. */
 export function publicMergeDecision(decision: MergeDecision): MergeDecision {
   return {
-    ...decision,
+    status: decision.status,
     reasons: publicReasons(decision, publicReasonMessages),
+    reviewers: [],
   };
 }
 
