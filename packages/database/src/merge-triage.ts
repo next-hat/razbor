@@ -1,4 +1,4 @@
-import { and, eq, inArray, lte, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, lte, ne, notExists, sql } from "drizzle-orm";
 
 import {
   evaluateMergeDecision,
@@ -49,6 +49,17 @@ type Repo = typeof repositories.$inferSelect;
 type ProviderClient = Awaited<ReturnType<typeof triageForge>>;
 
 const retryMs = 30000;
+
+/** Honor an explicit provider deadline or slow down persistent permission failures. */
+function providerBackoff(error: unknown) {
+  if (
+    !(error instanceof ForgeOperationError) ||
+    (error.retryAt === undefined && error.reason !== "permission")
+  )
+    return;
+  const now = Date.now();
+  return new Date(Math.max(now + retryMs, error.retryAt ?? now + 3_600_000));
+}
 
 /** Describe a server or provider condition without storing raw provider errors. */
 function reason(
@@ -312,6 +323,37 @@ async function triagePullRequest(database: Database, prId: string) {
     return;
   }
   const { review, publication, trigger } = entry;
+  const active = ["scheduled", "uncertain", "writing"] as const;
+
+  /** Apply provider backoff only while no native write on this PR needs reconciliation. */
+  async function deferProviderFailure(error: unknown) {
+    const deadline = providerBackoff(error);
+    if (!deadline) return;
+    await withCurrentMergeReview(database, repo, pr, review, async (tx) => {
+      await tx
+        .update(pullRequests)
+        .set({
+          mergeAfter: sql`greatest(${pullRequests.mergeAfter}, ${deadline.toISOString()}::timestamptz)`,
+        })
+        .where(
+          and(
+            eq(pullRequests.id, pr.id),
+            notExists(
+              tx
+                .select({ id: reviews.id })
+                .from(reviews)
+                .where(
+                  and(
+                    eq(reviews.mergePullRequestId, pr.id),
+                    inArray(reviews.mergeAction, [...active]),
+                  ),
+                ),
+            ),
+          ),
+        );
+    });
+  }
+
   if (review.mergeAction === "merged") {
     if (pr.escalationComment && review.source.mergePolicy) {
       try {
@@ -328,7 +370,7 @@ async function triagePullRequest(database: Database, prId: string) {
           await triageForge(database, repo.id),
         );
       } catch (error) {
-        // The claim deadline retries this PR while other repositories can continue.
+        await deferProviderFailure(error);
         logger.warn(
           {
             reviewId: review.publicId,
@@ -384,11 +426,11 @@ async function triagePullRequest(database: Database, prId: string) {
   let state: ForgeMergeState | undefined;
   let approval: Awaited<ReturnType<typeof syncReviewApproval>>;
   let nativeRetryAt: Date | undefined;
+  let providerRetryAt: Date | undefined;
   /** Resolve the trusted forge identity lazily, including console-triggered reviews without a webhook. */
   async function provider() {
     return (client ??= await triageForge(database, repo.id));
   }
-  const active = ["scheduled", "uncertain", "writing"] as const;
   const fenced = active.some((v) => v === action);
   const older = await database.db
     .select()
@@ -574,15 +616,22 @@ async function triagePullRequest(database: Database, prId: string) {
           // A native merge capability read is independent from an exact-revision
           // vote and the confidence comment. It cannot grant merge authority.
           if (
-            !(error instanceof ForgeOperationError) ||
-            (error.reason !== "permission" && error.reason !== "unsupported") ||
-            error.retryAt
-          )
-            nativeRetryAt = new Date(
-              error instanceof ForgeOperationError && error.retryAt
-                ? error.retryAt
-                : Date.now() + 300_000,
-            );
+            error instanceof ForgeOperationError &&
+            error.retryAt !== undefined
+          ) {
+            providerRetryAt = providerBackoff(error);
+            nativeRetryAt = providerRetryAt;
+          } else if (
+            error instanceof ForgeOperationError &&
+            error.reason === "permission"
+          ) {
+            if (!snapshot.policy.dryRun) nativeRetryAt = providerBackoff(error);
+          } else if (!(
+            error instanceof ForgeOperationError &&
+            error.reason === "unsupported"
+          )) {
+            nativeRetryAt = new Date(Date.now() + 300_000);
+          }
           state = { state: "blocked", reason: "guard_unavailable" };
         }
         const pendingReview = state.pendingCheckReviewId;
@@ -734,7 +783,11 @@ async function triagePullRequest(database: Database, prId: string) {
       action = "dry_run";
       retry = false;
     }
-    if (!fenced && snapshot?.policy.dryRun && state?.state === "blocked")
+    if (
+      !fenced &&
+      state?.state === "blocked" &&
+      (snapshot?.policy.dryRun || nativeRetryAt)
+    )
       retry = false;
     if (!fenced && state?.reason === "github_schedule_owner_unbound")
       retry = false;
@@ -780,6 +833,7 @@ async function triagePullRequest(database: Database, prId: string) {
       review.status === "completed" &&
       !["stale", "merged"].includes(decision.status),
     );
+    let deferComment = false;
     if (human || reportDryRun) {
       try {
         const fresh = await (await provider()).api.change(pr.number);
@@ -804,6 +858,12 @@ async function triagePullRequest(database: Database, prId: string) {
           error instanceof ForgeOperationError &&
           error.reason === "change-closed";
         retry = !closed;
+        const deadline = !fenced && providerBackoff(error);
+        if (deadline) {
+          deferComment = true;
+          if (!providerRetryAt || deadline > providerRetryAt)
+            providerRetryAt = deadline;
+        }
         decision = closed
           ? reason(
               "stale",
@@ -819,6 +879,7 @@ async function triagePullRequest(database: Database, prId: string) {
       if (decision.status === "stale") {
         retry = false;
         nativeRetryAt = undefined;
+        providerRetryAt = undefined;
         approval = undefined;
       }
     }
@@ -862,19 +923,21 @@ async function triagePullRequest(database: Database, prId: string) {
           .set({
             ...(human ? { humanEscalated: true } : {}),
             mergeAfter:
-              retry ||
+              providerRetryAt ??
+              (retry ||
               human ||
               reportDryRun ||
               pr.escalationComment ||
-              approvalRetryAt
+              approvalRetryAt ||
+              nativeRetryAt
                 ? new Date(Date.now() + retryMs)
-                : null,
+                : null),
           })
           .where(eq(pullRequests.id, pr.id));
         return true;
       },
     );
-    if (!saved) return;
+    if (!saved || deferComment) return;
     if (send && request && client)
       await writeGuardedMerge(
         database,
@@ -915,30 +978,14 @@ async function triagePullRequest(database: Database, prId: string) {
         await tx
           .update(pullRequests)
           .set({
-            mergeAfter: sql`least(${next}, ${approvalRetryAt?.toISOString() ?? null}::timestamptz, ${nativeRetryAt?.toISOString() ?? null}::timestamptz)`,
+            mergeAfter: sql`greatest(${providerRetryAt?.toISOString() ?? null}::timestamptz,
+              least(${next}, ${approvalRetryAt?.toISOString() ?? null}::timestamptz, ${nativeRetryAt?.toISOString() ?? null}::timestamptz))`,
           })
           .where(eq(pullRequests.id, pr.id));
       });
     }
   } catch (error) {
-    if (
-      !fenced &&
-      snapshot?.policy.dryRun &&
-      error instanceof ForgeOperationError &&
-      (error.retryAt !== undefined || error.reason === "permission")
-    ) {
-      // A locked comment or denied credential needs a slower recheck. Keep the
-      // durable vote and comment intents intact and honor provider rate limits.
-      const retryAt = new Date(
-        Math.max(Date.now() + retryMs, error.retryAt ?? Date.now() + 3_600_000),
-      );
-      await withCurrentMergeReview(database, repo, pr, review, async (tx) => {
-        await tx
-          .update(pullRequests)
-          .set({ mergeAfter: retryAt })
-          .where(eq(pullRequests.id, pr.id));
-      });
-    }
+    if (!fenced) await deferProviderFailure(error);
     if (
       !fenced &&
       (decision.reasons[0]?.code === "guard_unavailable" ||

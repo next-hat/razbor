@@ -412,7 +412,9 @@ test(
     let nextPatchOutcome: "delayed" | "lost acknowledgment" | undefined;
     let rejectedMention = false;
     let policyVoteHead = headSha;
-    t.mock.method(
+    let denyFreshRevision = false;
+    let denyMergedComments = false;
+    const providerRequests = t.mock.method(
       globalThis,
       "fetch",
       async (input: URL, init?: RequestInit) => {
@@ -450,6 +452,8 @@ test(
             active: true,
           });
         const pullRoute = /^repos\/team\/repo\/pulls\/(\d+)$/.exec(route);
+        if (denyFreshRevision && pullRoute?.[1] === "18")
+          return new Response(null, { status: 403 });
         if (pullRoute)
           return Response.json({
             number: Number(pullRoute[1]),
@@ -470,6 +474,8 @@ test(
           route,
         );
         const number = Number(collection?.[1]);
+        if (denyMergedComments && number === 12)
+          return new Response(null, { status: 403 });
         const stored = noteStores.get(number) ?? new Map<string, string>();
         if (collection) noteStores.set(number, stored);
         if (collection && init?.method === "POST") {
@@ -1286,9 +1292,28 @@ test(
     assert.deepEqual(voteWrites, [8, 9, 10, 13, 14]);
     const readyForBoth = await pull(12);
     const liveApprovedReview = await complete(readyForBoth, 99);
+    const nativeRetryAfter = Date.now() + 240_000;
+    pauseInspection = async (request) => {
+      if (request.reviewId === liveApprovedReview)
+        throw new ForgeOperationError(
+          "unavailable",
+          false,
+          429,
+          nativeRetryAfter,
+        );
+    };
+    await processMergeTriage(db);
+    assert.deepEqual(liveApprovalEvents, ["cast approval"]);
+    assert.equal(await voteStatus(liveApprovedReview), "approved");
+    assert.equal((await deadline(readyForBoth))!.getTime(), nativeRetryAfter);
+    await processMergeTriage(restart);
+    assert.equal(inspections.filter((number) => number === 12).length, 1);
+    pauseInspection = undefined;
+    await due(readyForBoth);
     await processMergeTriage(db);
     assert.deepEqual(liveApprovalEvents, [
       "cast approval",
+      "read approved vote",
       "read approved vote",
       "submit native merge",
       "read approved vote",
@@ -1301,6 +1326,22 @@ test(
     });
     assert.deepEqual(voteWrites, [8, 9, 10, 13, 14, 12]);
     assert.equal(writes, 1);
+    // A completed merge can still owe an update to its review comment.
+    denyMergedComments = true;
+    await db.pool.query(
+      "update pull_requests set merge_after=now(), escalation_comment=$2 where public_id=$1",
+      [readyForBoth, { botId: "1" }],
+    );
+    const commentDeniedAt = Date.now();
+    await processMergeTriage(restart);
+    assert.ok(
+      (await deadline(readyForBoth))!.getTime() >= commentDeniedAt + 3_600_000,
+    );
+    assert.equal((await decision(liveApprovedReview)).action, "merged");
+    denyMergedComments = false;
+    await due(readyForBoth);
+    await processMergeTriage(db);
+    assert.equal(await deadline(readyForBoth), null);
 
     config.repositories.project.mergePolicy = {
       ...policy,
@@ -1355,6 +1396,72 @@ test(
     assert.equal(await deadline(githubNew), null);
     assert.equal(schedule.mock.callCount(), beforeGithub);
     cancelOldSchedule.mock.restore();
+    // A live capability read can fail before a native intent exists. Persist
+    // the provider deadline so another dispatcher leaves this review asleep.
+    const retryPr = await pull(17);
+    const retryReview = await complete(retryPr, 95);
+    let inspectionFailure = new ForgeOperationError("permission", false, 403);
+    pauseInspection = async (request) => {
+      if (request.reviewId === retryReview) throw inspectionFailure;
+    };
+    const deniedAt = Date.now();
+    await processMergeTriage(db);
+    assert.ok((await deadline(retryPr))!.getTime() >= deniedAt + 3_600_000);
+    assert.deepEqual(await decision(retryReview), {
+      status: "blocked",
+      action: null,
+    });
+    await processMergeTriage(restart);
+    assert.equal(inspections.filter((number) => number === 17).length, 1);
+    const allowedAgainAt = Date.now() + 125_000;
+    inspectionFailure = new ForgeOperationError(
+      "unavailable",
+      false,
+      429,
+      allowedAgainAt,
+    );
+    await due(retryPr);
+    await processMergeTriage(restart);
+    assert.equal((await deadline(retryPr))!.getTime(), allowedAgainAt);
+    await processMergeTriage(db);
+    assert.equal(inspections.filter((number) => number === 17).length, 2);
+    assert.equal(schedule.mock.callCount(), beforeGithub);
+    pauseInspection = undefined;
+    // A rotated bot cannot edit the durable escalation owned by its predecessor.
+    const rotatedPr = await pull(18);
+    const rotatedReview = await complete(rotatedPr, 70);
+    await db.pool.query(
+      "update pull_requests set escalation_comment=$2 where public_id=$1",
+      [rotatedPr, { botId: "42", remoteId: "700" }],
+    );
+    // A denied fresh revision read blocks the decision before any note is touched.
+    denyFreshRevision = true;
+    const beforeRevision = Date.now();
+    await processMergeTriage(db);
+    assert.deepEqual(await decision(rotatedReview), {
+      status: "blocked",
+      action: null,
+    });
+    assert.ok(
+      (await deadline(rotatedPr))!.getTime() >= beforeRevision + 3_600_000,
+    );
+    assert.equal(noteStores.has(18), false);
+    denyFreshRevision = false;
+    await due(rotatedPr);
+    const beforeEscalation = Date.now();
+    await processMergeTriage(restart);
+    assert.ok(
+      (await deadline(rotatedPr))!.getTime() >= beforeEscalation + 3_600_000,
+    );
+    /** Count provider revision reads for the PR whose escalation has the previous bot ID. */
+    const rotatedReads = () =>
+      providerRequests.mock.calls.filter((call) =>
+        String(call.arguments[0]).endsWith("/pulls/18"),
+      ).length;
+    assert.equal(rotatedReads(), 2);
+    await processMergeTriage(db);
+    assert.equal(rotatedReads(), 2);
+    assert.equal(noteStores.has(18), false);
     checks = { state: "ready", reason: "provider_ready" };
     const live = await complete(second, 95);
     // Restart after the durable intent, before any provider mutation was attempted.
