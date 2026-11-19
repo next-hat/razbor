@@ -156,6 +156,9 @@ function githubFixture(t: TestContext) {
     loseCreateResponse: false,
     loseRetireResponse: false,
     delayRelease: false,
+    checkSuiteCount: 1,
+    secondCheckPage: undefined as
+      { total_count: number; check_runs: typeof runs } | undefined,
   };
   fakeFetch(t, (path, method, body) => {
     if (path === "/api/graphql" && String(body.query).startsWith("query ")) {
@@ -228,16 +231,27 @@ function githubFixture(t: TestContext) {
         enforcement: "active",
         current_user_can_bypass: flags.rulesetBypass,
       };
+    if (path === `${route}/commits/${headSha}/check-suites?per_page=1`)
+      return {
+        total_count: flags.checkSuiteCount,
+        check_suites: [{ head_sha: headSha }],
+      };
     if (path.startsWith(`${route}/commits/${headSha}/check-runs?`)) {
       const params = new URLSearchParams(path.split("?")[1]);
+      const page = Number(params.get("page") ?? 1);
+      assert.equal(params.get("per_page"), "100");
+      if (page === 2 && flags.secondCheckPage) return flags.secondCheckPage;
+      let found = runs;
       if (params.get("filter") === "all") {
         assert.equal(params.get("app_id"), "1");
-        const found = runs.filter(
+        found = runs.filter(
           (row) => row.app.id === 1 && row.name === params.get("check_name"),
         );
-        return { total_count: found.length, check_runs: found.slice(0, 100) };
       }
-      return { total_count: runs.length, check_runs: runs.slice(0, 100) };
+      return {
+        total_count: found.length,
+        check_runs: found.slice((page - 1) * 100, page * 100),
+      };
     }
     if (method === "POST" && path === `${route}/check-runs`) {
       mutations.push("create_pending");
@@ -310,6 +324,67 @@ test("GitHub checks the pinned App, all verified checks, protection and targets 
   f.pr.autoMergeRequest = null;
   assert.equal(await f.api.cancelMerge(request), "cancelled");
   assert.equal((await f.api.inspectMerge(request)).state, "blocked");
+});
+
+test("GitHub pages through required and historical checks and rejects inconsistent pages before a write", async (t) => {
+  const f = githubFixture(t);
+  const ci = f.runs[0];
+  const background = Array.from({ length: 100 }, (_, i) => ({
+    ...ci,
+    id: 300 + i,
+    name: `background-${i}`,
+    app: { id: 1 },
+    external_id: `background-${i}`,
+  }));
+  f.runs.unshift(...background);
+  ci.conclusion = "failure";
+  assert.equal(
+    (await f.api.inspectMerge(request)).reason,
+    "required_check_failed",
+  );
+  ci.conclusion = "success";
+  for (const invalid of [
+    { total_count: 101, check_runs: [background[0]] },
+    { total_count: 101, check_runs: [{ ...ci, head_sha: baseSha }] },
+    { total_count: 101, check_runs: [] },
+    { total_count: 102, check_runs: [ci, { ...ci, id: 999 }] },
+  ]) {
+    f.flags.secondCheckPage = invalid;
+    await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
+  }
+  f.flags.secondCheckPage = undefined;
+  f.flags.checkSuiteCount = 1001;
+  await assert.rejects(f.api.scheduleMerge(request), ForgeOperationError);
+  assert.deepEqual(f.mutations, []);
+  f.flags.checkSuiteCount = 1000;
+  f.runs.push(
+    ...Array.from({ length: 1900 }, (_, i) => ({
+      ...ci,
+      id: 1000 + i,
+      name: `extra-${i}`,
+    })),
+  );
+  await assert.rejects(f.api.inspectMerge(request), ForgeOperationError);
+  f.runs.pop();
+  assert.equal((await f.api.inspectMerge(request)).state, "ready");
+  f.runs.splice(101);
+  assert.equal(await f.api.scheduleMerge(request), "scheduled");
+
+  f.pr.autoMergeRequest = null;
+  for (const other of background) other.name = checkName;
+  f.flags.secondCheckPage = { total_count: 101, check_runs: [ci] };
+  await assert.rejects(f.api.cancelMerge(request), ForgeOperationError);
+  assert.equal(f.runs.at(-1)?.conclusion, "success");
+  f.flags.secondCheckPage = undefined;
+  assert.equal(await f.api.cancelMerge(request), "cancelled");
+  assert.equal(f.runs.at(-1)?.conclusion, "cancelled");
+  assert.ok(background.every((row) => row.conclusion === "success"));
+  assert.deepEqual(f.mutations, [
+    "create_pending",
+    "arm",
+    "success",
+    "cancelled",
+  ]);
 });
 
 test("GitHub retires only a verified pre-submission check and permits a replacement review on the same head", async (t) => {

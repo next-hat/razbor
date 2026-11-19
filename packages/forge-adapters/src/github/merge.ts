@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { providerId } from "@forge-adapters/src/http.js";
 import {
   ForgeOperationError,
   type ForgeMergeRequest,
@@ -162,6 +163,19 @@ const check = z.object({
   conclusion: z.string().nullable(),
 });
 
+const checkPageSize = 100;
+
+const maxCheckPages = 20;
+
+const checkCount = providerId
+  .pipe(z.string().regex(/^\d+$/))
+  .pipe(z.coerce.number<string>().int().nonnegative());
+
+const checkPage = z.object({
+  total_count: checkCount,
+  check_runs: z.array(check).max(checkPageSize),
+});
+
 type GithubApi = {
   route: string;
   owner: string;
@@ -198,7 +212,7 @@ function externalId(request: ForgeMergeRequest) {
   return `razbor/${request.externalRepositoryId}/${request.number}/${request.baseSha}/${request.reviewId}`;
 }
 
-/** Read bounded check results. Retirement includes historical runs that a newer run could hide. */
+/** Read every reported run for this head, including historical runs when retiring a check. */
 async function checks(
   api: GithubApi,
   request: ForgeMergeRequest,
@@ -207,22 +221,52 @@ async function checks(
   const filter = eligibilityName
     ? `filter=all&check_name=${encodeURIComponent(eligibilityName)}&app_id=${api.app?.appId}`
     : "filter=latest";
-  const response = z
-    .object({
-      total_count: z.coerce.number().int().nonnegative(),
-      check_runs: z.array(check),
-    })
-    .parse(
+  const commitRoute = `${api.route}/commits/${request.headSha}`;
+  const runs = new Map<string, z.infer<typeof check>>();
+  let total: number | undefined;
+  for (let page = 1; page <= maxCheckPages; page++) {
+    const response = checkPage.parse(
       await api.transport.request(
-        `${api.route}/commits/${request.headSha}/check-runs?${filter}&per_page=100`,
+        `${commitRoute}/check-runs?${filter}&per_page=${checkPageSize}&page=${page}`,
       ),
     );
+    total ??= response.total_count;
+    if (
+      total > maxCheckPages * checkPageSize ||
+      response.total_count !== total ||
+      response.check_runs.length !== Math.min(checkPageSize, total - runs.size)
+    )
+      throw new ForgeOperationError("invalid-response");
+    for (const row of response.check_runs) {
+      if (
+        row.head_sha !== request.headSha ||
+        runs.has(row.id) ||
+        (eligibilityName &&
+          (row.name !== eligibilityName || row.app.id !== api.app?.appId))
+      )
+        throw new ForgeOperationError("invalid-response");
+      runs.set(row.id, row);
+    }
+    if (runs.size === total) break;
+  }
+  // GitHub silently omits older suites from its commit-level check-runs endpoint
+  // above 1,000 suites, even when its check-run total and pages agree.
+  const suites = z
+    .object({
+      total_count: checkCount,
+      check_suites: z.array(z.object({ head_sha: commitSha })).max(1),
+    })
+    .parse(
+      await api.transport.request(`${commitRoute}/check-suites?per_page=1`),
+    );
   if (
-    response.total_count !== response.check_runs.length ||
-    response.check_runs.some((row) => row.head_sha !== request.headSha)
+    suites.total_count > 1000 ||
+    suites.check_suites.length !== Math.min(1, suites.total_count) ||
+    suites.check_suites.some((suite) => suite.head_sha !== request.headSha) ||
+    (suites.total_count === 0 && runs.size > 0)
   )
     throw new ForgeOperationError("invalid-response");
-  return response.check_runs;
+  return [...runs.values()];
 }
 
 /** Verify that this repository’s installation is subject to the specific active branch ruleset. */

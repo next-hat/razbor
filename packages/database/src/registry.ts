@@ -228,10 +228,10 @@ async function validateImportCredentialContext(
 }
 
 /**
- * Apply declared forge and repository settings under the registry lock,
- * preserving ownership and identity; changed source policies invalidate
- * verification without deleting absent entries. An omitted indexing preference keeps
- * the saved value or defaults a new repository according to its source-service owner.
+ * Apply declared settings under the registry lock, preserving ownership,
+ * identity and absent entries. Settle prior merge authority before a source
+ * edit invalidates verification and review revisions. An omitted indexing
+ * preference keeps its saved value or defaults by source-service owner.
  */
 export async function applyRegistry(
   database: Database,
@@ -375,7 +375,7 @@ export async function applyRegistry(
           !policyChanged
         )
           continue;
-        if (policyChanged) {
+        if (policyChanged || sourceChanged) {
           try {
             await settleMergeAuthority(database, tx, existing);
           } catch (error) {
@@ -388,11 +388,11 @@ export async function applyRegistry(
               throw new RepositoryManagementError(
                 409,
                 error.message +
-                  " Apply the new forge credential with an empty [repositories] table first, then retry the policy import.",
+                  " Apply the new forge credential with an empty [repositories] table first, then retry the repository import.",
               );
             throw error;
           }
-          await wakeRepositoryTriage(tx, existing.id);
+          await wakeRepositoryTriage(tx, existing.id, sourceChanged);
         }
         if (triggersChanged)
           await resetRepositoryReviewTriggers(tx, existing.id);

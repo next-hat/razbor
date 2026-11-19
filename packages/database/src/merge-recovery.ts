@@ -170,9 +170,10 @@ export async function retireOrphanedCheck(
 }
 
 /**
- * Settle all existing native merge authorities before replacing policy or admitting
- * a newer code review. Repository-wide callers hold the owning repository FOR UPDATE;
- * a PR-scoped caller holds its repository FOR SHARE and the current PR FOR UPDATE.
+ * Settle outstanding native merge requests before changing the policy or source
+ * binding or admitting a newer code review. Repository-wide callers hold the owning
+ * repository FOR UPDATE. A PR-scoped caller holds its repository FOR SHARE and the
+ * current PR FOR UPDATE.
  * Those locks conflict with both scheduling transactions. Remote acknowledgements are
  * independent writes so rollback cannot erase a confirmed cancellation on another PR.
  */

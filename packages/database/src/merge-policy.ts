@@ -9,14 +9,20 @@ import {
   reviewTriggers,
 } from "@database/src/schema.js";
 
-/** Revisit saved decisions and any outstanding native operation after a policy edit. */
+/** Revisit decisions after policy or source edits. A changed source requires fresh reviews even for unchanged commits. */
 export async function wakeRepositoryTriage(
   tx: Transaction,
   repositoryId: string,
+  sourceChanged = false,
 ) {
   await tx
     .update(pullRequests)
-    .set({ mergeAfter: new Date() })
+    .set({
+      mergeAfter: new Date(),
+      ...(sourceChanged
+        ? { mergeRevision: sql`${pullRequests.mergeRevision} + 1` }
+        : {}),
+    })
     .where(eq(pullRequests.repositoryId, repositoryId));
 }
 

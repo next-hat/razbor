@@ -18,7 +18,11 @@ import {
   updateRepositoryMergePolicy,
 } from "@razbor/database";
 import { migrate } from "@razbor/database/migrate";
-import { applyRegistry, registrySchema } from "@razbor/database/registry";
+import {
+  applyRegistry,
+  refreshRepository,
+  registrySchema,
+} from "@razbor/database/registry";
 import {
   ForgejoInteractions,
   ForgeOperationError,
@@ -1087,6 +1091,11 @@ test(
       },
     );
     const changed = { ...original, minimumConfidence: 100 };
+    const differentSelector = structuredClone(config);
+    differentSelector.repositories.repo.selector = "team/renamed";
+    const verified = await getRepository(db, repo.id);
+    await assert.rejects(applyRegistry(db, differentSelector), { status: 409 });
+    assert.deepEqual(await getRepository(db, repo.id), verified);
     config.repositories.repo.mergePolicy = changed;
     await assert.rejects(applyRegistry(db, config), { status: 409 });
     config.forges.forge.credential = {
@@ -1166,6 +1175,63 @@ test(
         )
       ).rows[0].merge_action,
       "refused",
+    );
+
+    // A Git-only edit must settle the original binding and invalidate its review,
+    // even when re-verification returns the same provider identity and commit IDs.
+    const beforeSourceEdit = await submitReview(
+      db,
+      { repositoryId: repo.id, headSha, baseSha },
+      undefined,
+      undefined,
+      pr,
+    );
+    await db.pool.query(
+      "update reviews set merge_action='scheduled' where public_id=$1",
+      [beforeSourceEdit.id],
+    );
+    await db.pool.query(
+      "update pull_requests set merge_after=null where public_id=$1",
+      [pr],
+    );
+    cancel.mock.mockImplementationOnce(async () => "cancelled");
+    config.repositories.repo.git.branch = "release";
+    config.repositories.repo.git.upstream = "refs/remotes/origin/release";
+    await applyRegistry(db, config);
+    assert.equal(cancel.mock.callCount(), 3);
+    const unverified = await getRepository(db, repo.id);
+    assert.equal(unverified?.branch, "release");
+    assert.equal(unverified?.verifiedAt, null);
+    assert.equal(unverified?.mergePolicyVersion, 2);
+    const sourceEdit = (
+      await db.pool.query(
+        `select p.merge_revision = (r.source->>'mergeRevision')::int + 1 as stale,
+          p.merge_after <= now() as due, r.merge_action
+         from reviews r join pull_requests p on p.id=r.merge_pull_request_id
+         where r.public_id=$1`,
+        [beforeSourceEdit.id],
+      )
+    ).rows[0];
+    assert.deepEqual(sourceEdit, {
+      stale: true,
+      due: true,
+      merge_action: "refused",
+    });
+    const reverified = await refreshRepository(db, repo.id);
+    assert.equal(
+      reverified?.externalRepositoryId,
+      verified?.externalRepositoryId,
+    );
+    assert.ok(reverified?.verifiedAt);
+    await processMergeTriage(db);
+    assert.equal(
+      (
+        await db.pool.query(
+          "select merge_decision->>'status' as status from reviews where public_id=$1",
+          [beforeSourceEdit.id],
+        )
+      ).rows[0].status,
+      "stale",
     );
 
     await db.pool.query(
