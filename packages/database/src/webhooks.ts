@@ -22,11 +22,13 @@ import {
   type Forge,
   type ForgeChange,
   type ForgeWebhook,
+  type RepositoryMetadata,
   ForgeOperationError,
 } from "@razbor/forge-adapters";
 
 import {
   acceptReviewTrigger,
+  lockReviewTriggerChanges,
   reviewSubmissionLock,
   reviewTriggerSession,
   triggerDelivery,
@@ -129,7 +131,7 @@ async function context(database: Database, repositoryId: string) {
  * Create a budgeted provider client using the repository's credential override
  * or shared forge reference and its verified selector.
  */
-async function adapter(
+async function openAdapter(
   database: Database,
   row: Awaited<ReturnType<typeof context>>,
   budgetMs = 20000,
@@ -160,16 +162,29 @@ async function adapter(
         ...(app ? { githubAppBot: app.bot } : {}),
       };
   const selector = row.repo.observed?.fullPath ?? row.repo.selector!;
-  if (verifyBinding) {
-    const metadata = await verifyRepository(
-      connection,
-      selector,
-      AbortSignal.timeout(budgetMs),
-    );
-    if (metadata.externalRepositoryId !== row.repo.externalRepositoryId)
-      throw new ForgeOperationError("permission");
-  }
-  return createForge(connection, selector, budgetMs);
+  const metadata = verifyBinding
+    ? await verifyRepository(
+        connection,
+        selector,
+        AbortSignal.timeout(budgetMs),
+      )
+    : undefined;
+  if (
+    metadata &&
+    metadata.externalRepositoryId !== row.repo.externalRepositoryId
+  )
+    throw new ForgeOperationError("permission");
+  return { api: createForge(connection, selector, budgetMs), metadata };
+}
+
+/** Open a provider client for an interaction that does not need the repository metadata. */
+async function adapter(
+  database: Database,
+  row: Awaited<ReturnType<typeof context>>,
+  budgetMs = 20000,
+  verifyBinding = false,
+) {
+  return (await openAdapter(database, row, budgetMs, verifyBinding)).api;
 }
 
 /**
@@ -198,7 +213,7 @@ async function publishedReview(
     (remote) =>
       remote.user.id === bot &&
       remote.commit_id === head &&
-      remote.state !== "PENDING",
+      !["PENDING", "UNCONFIRMED"].includes(remote.state),
   );
   const marked = candidates.filter(
     (remote) =>
@@ -315,7 +330,7 @@ async function previousFindings(
         (remote) =>
           remote.id === publication.remoteId &&
           remote.user.id === bot &&
-          remote.state !== "PENDING",
+          !["PENDING", "UNCONFIRMED"].includes(remote.state),
       )
     ) {
       resolveRecapFindings(review);
@@ -516,6 +531,7 @@ export async function configureWebhook(
       throw new Error(
         "Webhook settings are owned by another configuration source",
       );
+    await lockReviewTriggerChanges(tx, repo.id);
     if (
       old?.mode === "github-app" &&
       (settings.callback_base.replace(/\/$/, "") !== old.callbackBase ||
@@ -631,6 +647,7 @@ export async function saveWebhookFromUi(
       .for("update");
     if (old && old.managedBy !== "ui")
       throw new Error("File-managed settings are read-only");
+    await lockReviewTriggerChanges(tx, repo.id);
     if (
       old?.mode === "github-app" &&
       (data.signing_secret ||
@@ -803,7 +820,11 @@ export async function removeRepositoryWebhook(
           `status:${repositoryId}`,
           async () => {
             const [pending] = await database.db
-              .select({ id: dispatchOutbox.id })
+              .select({
+                error: sql<
+                  string | null
+                >`${dispatchOutbox.statusComment}->>'error'`,
+              })
               .from(dispatchOutbox)
               .innerJoin(reviews, eq(reviews.id, dispatchOutbox.reviewId))
               .where(
@@ -812,7 +833,25 @@ export async function removeRepositoryWebhook(
                   sql`${dispatchOutbox.statusComment} is not null`,
                 ),
               )
+              .orderBy(
+                sql`case when ${dispatchOutbox.statusComment}->>'error' = 'status-comment-owner-changed' then 0 else 1 end`,
+              )
               .limit(1);
+            if (pending?.error === "status-comment-owner-changed") {
+              const message =
+                "Remove the previous bot's temporary review comment on the forge or restore its credentials so cleanup can finish.";
+              if (repository.setupError !== message) {
+                await database.db
+                  .update(repositories)
+                  .set({ setupError: message })
+                  .where(
+                    and(
+                      eq(repositories.id, repository.id),
+                      eq(repositories.status, "deleting"),
+                    ),
+                  );
+              }
+            }
             return !pending;
           },
         );
@@ -877,6 +916,22 @@ function webhookErrorReason(error: unknown) {
   return "unavailable";
 }
 
+/** Public fully automatic reviews require an explicit case-insensitive match for the forge's PR author. */
+function allowsAutomaticAuthor(
+  visibility: RepositoryMetadata["visibility"] | undefined,
+  author: string | null | undefined,
+  senders: string[],
+) {
+  if (visibility !== "public")
+    return visibility === "private" || visibility === "internal";
+  const login = author?.toLowerCase();
+  return (
+    !!login &&
+    login !== "*" &&
+    senders.some((sender) => sender.toLowerCase() === login)
+  );
+}
+
 /** Queue policy-authorized work for the current revision and greet a newly opened PR once. */
 async function handlePullRequest(
   database: Database,
@@ -892,7 +947,7 @@ async function handlePullRequest(
     row.repo.id,
     event.number,
   );
-  const api = await adapter(database, row, 30000, true);
+  const { api, metadata } = await openAdapter(database, row, 30000, true);
   setStage?.("read-pull-request");
   let change: ForgeChange | undefined;
   try {
@@ -901,12 +956,11 @@ async function handlePullRequest(
       return [403, "pull-request-identity-mismatch"];
   } catch (error) {
     if (
-      event.kind === "opened" &&
       row.forge.type === "gitlab" &&
       error instanceof ForgeOperationError &&
       error.reason === "diff-pending"
     ) {
-      setStage?.("persist-deferred-open");
+      setStage?.("persist-deferred-merge-request");
       const saved = await acceptReviewTrigger(
         database,
         row.repo,
@@ -927,11 +981,16 @@ async function handlePullRequest(
     )
       throw error;
   }
+  const automaticAuthorPermitted = allowsAutomaticAuthor(
+    metadata?.visibility,
+    change?.author,
+    h.senders,
+  );
   const eligible =
     change?.draft === false &&
     event.kind !== "closed" &&
     event.kind !== "reopened" &&
-    (row.repo.reviewTriggerMode === "automatic" ||
+    ((row.repo.reviewTriggerMode === "automatic" && automaticAuthorPermitted) ||
       (row.repo.reviewTriggerMode === "opt_in_continuous" &&
         session?.continuousReviewSince));
   /** Read prior published findings only after the event is eligible to queue work. */
@@ -950,6 +1009,7 @@ async function handlePullRequest(
     {
       event,
       change,
+      automaticAuthorPermitted,
       generation: session?.triggerGeneration ?? 0,
       previous,
     },
@@ -965,6 +1025,7 @@ async function handlePullRequest(
       {
         event,
         change,
+        automaticAuthorPermitted,
         previous: history.findings,
         generation: accepted.historyGeneration,
       },
@@ -995,8 +1056,9 @@ async function handlePullRequest(
           const instructions = {
             manual: `Request a review by commenting \`${reviewCommandText()}\`.`,
             opt_in_continuous: `Comment \`${reviewCommandText()}\` to start continuous review for this pull request. I'll review subsequent revisions automatically.`,
-            automatic:
-              "I'll review this pull request automatically when it is ready and when its source revision changes.",
+            automatic: automaticAuthorPermitted
+              ? "I'll review this pull request automatically when it is ready and when its source revision changes."
+              : `A permitted user can request a review by commenting \`${reviewCommandText()}\`.`,
           };
           await api.postComment(
             event.number,
@@ -1453,6 +1515,15 @@ export async function acceptWebhook(
   }
 }
 
+// A disabled hook may still own a native verdict whose response or final checkpoint was lost.
+const nativeRecoveryPending = sql<boolean>`coalesce(${dispatchOutbox.publication}->>'mode' = 'review' and (
+  ${dispatchOutbox.publication} ? 'remoteId'
+  or (${dispatchOutbox.publication}->>'writing' = 'true' and not (${dispatchOutbox.publication} ? 'providerProgress'))
+  or ${dispatchOutbox.publication} #>> '{providerProgress,bulk,writing}' = 'true'
+  or ${dispatchOutbox.publication} #>> '{providerProgress,bulk,submitted}' = 'true'
+  or ${dispatchOutbox.publication} #>> '{providerProgress,bulk,id}' is not null
+), false)`;
+
 /**
  * Serialize one review's acknowledgement or final publication, reconciling
  * remote markers before writes and preserving uncertain outcomes for later
@@ -1478,6 +1549,7 @@ export async function processInteraction(database: Database, reviewId: string) {
         review: reviews,
         trigger: reviewTriggers,
         outbox: dispatchOutbox,
+        recoverNative: nativeRecoveryPending,
         repositoryId: repositories.publicId,
         generation: pullRequests.triggerGeneration,
       })
@@ -1499,19 +1571,34 @@ export async function processInteraction(database: Database, reviewId: string) {
       outbox.acknowledgedAt &&
       (review.status === "queued" ||
         review.status === "running" ||
-        ["published", "stale"].includes(outbox.publication?.state ?? ""))
+        ["published", "stale", "unconfirmed"].includes(
+          outbox.publication?.state ?? "",
+        ))
     )
       return;
     const row = await context(database, entry.repositoryId);
-    if (row.repo.status !== "active" || !row.hook.enabled) return;
+    if (
+      row.repo.status !== "active" ||
+      (!row.hook.enabled && !entry.recoverNative)
+    )
+      return;
     if (!row.hook.botId) return;
     const bot = row.hook.botId;
+    let metadata: RepositoryMetadata | undefined;
     /** Read the PR session and owning policy together for the saved review. */
     function sessionQuery(db: Pick<Database["db"], "select">) {
       return db
-        .select({ pr: pullRequests, mode: repositories.reviewTriggerMode })
+        .select({
+          pr: pullRequests,
+          mode: repositories.reviewTriggerMode,
+          senders: repositoryWebhooks.senders,
+        })
         .from(pullRequests)
         .innerJoin(repositories, eq(repositories.id, pullRequests.repositoryId))
+        .innerJoin(
+          repositoryWebhooks,
+          eq(repositoryWebhooks.repositoryId, repositories.id),
+        )
         .where(
           and(
             eq(pullRequests.repositoryId, review.repositoryId),
@@ -1535,7 +1622,12 @@ export async function processInteraction(database: Database, reviewId: string) {
           session.pr.mergeBase === review.baseSha) &&
         (session.pr.startSha === null ||
           session.pr.startSha === trigger.change.startSha) &&
-        (session.mode === "automatic" ||
+        ((session.mode === "automatic" &&
+          allowsAutomaticAuthor(
+            metadata?.visibility,
+            session.pr.author,
+            session.senders,
+          )) ||
           (session.mode === "opt_in_continuous" &&
             !!session.pr.continuousReviewSince))
       );
@@ -1587,12 +1679,12 @@ export async function processInteraction(database: Database, reviewId: string) {
     };
     let api: Forge;
     try {
-      api = await adapter(
+      ({ api, metadata } = await openAdapter(
         database,
         row,
         outbox.acknowledgedAt ? 30000 : 6000,
         true,
-      );
+      ));
     } catch (error) {
       logger.warn(
         { reviewId, reason: webhookErrorReason(error) },
@@ -1875,6 +1967,23 @@ export async function processInteraction(database: Database, reviewId: string) {
      */
     async function finishReviewPublication() {
       const payload = progress.reviewPayload;
+      if (!row.hook.enabled) {
+        await update({
+          publication: {
+            ...progress,
+            state: "published",
+            writing: false,
+            error: undefined,
+            limitations: [
+              ...new Set([
+                ...(progress.limitations ?? []),
+                "Recovered the submitted review while the webhook was disabled. Additional summary and thread updates were skipped.",
+              ]),
+            ],
+          },
+        });
+        return;
+      }
       if (payload?.recapReviewId) {
         const current = await api.change(trigger.change.number);
         if (
@@ -2027,6 +2136,15 @@ export async function processInteraction(database: Database, reviewId: string) {
       await update({ publication: progress });
     }
 
+    /** A sent or possibly sent GitLab bulk must use its frozen payload exclusively for recovery. */
+    function hasGitlabSubmission() {
+      const bulk = progress.providerProgress?.bulk;
+      return (
+        api.type === "gitlab" &&
+        !!(bulk?.writing || bulk?.submitted || bulk?.id)
+      );
+    }
+
     /**
      * Recover bot-owned marked provider writes and stop duplicate publication
      * while a prior write's outcome remains uncertain.
@@ -2061,6 +2179,22 @@ export async function processInteraction(database: Database, reviewId: string) {
         progress = { ...progress, inlineIds };
         await update({ publication: progress });
         await finishReviewPublication();
+        return true;
+      }
+      if (
+        progress.mode === "review" &&
+        progress.remoteId &&
+        !hasGitlabSubmission()
+      ) {
+        // A rotated bot or a temporarily incomplete listing cannot authorize resubmitting a known native review.
+        await update({
+          publication: {
+            ...progress,
+            state: "uncertain",
+            error:
+              "The saved native review is not visible to this bot. Reconciliation is pending.",
+          },
+        });
         return true;
       }
       const existingComment =
@@ -2110,13 +2244,18 @@ export async function processInteraction(database: Database, reviewId: string) {
      * stale or failed.
      */
     async function publishReview() {
-      const bulk = api.type === "gitlab" && progress.providerProgress?.bulk;
-      if (bulk && (bulk.writing || bulk.submitted || bulk.id)) {
+      if (hasGitlabSubmission()) {
         // A submitted GitLab verdict may already be visible. Recover its frozen
         // notes and summary before a fresh change observation can retire the run.
         if (!progress.reviewPayload)
           throw new ForgeOperationError("unavailable", true);
         await submitNativeReview(progress.reviewPayload);
+        return;
+      }
+      if (!row.hook.enabled) {
+        // GitLab journals the bulk operation before the POST. Without that checkpoint,
+        // a pending GitLab payload can wait safely until the hook is enabled again.
+        await update({ publication: { ...progress, writing: false } });
         return;
       }
       const newer = await hasNewerPublishedReview();
@@ -2336,15 +2475,36 @@ export async function processInteraction(database: Database, reviewId: string) {
       const key = reviewSubmissionLock(trigger.repositoryId);
       let started = false;
       try {
+        if ((await api.identity()).id !== bot)
+          throw new ForgeOperationError("permission");
         const lock = await lockClient.query<{ locked: boolean }>(
           "select pg_try_advisory_lock(748322, hashtext($1)) as locked",
           [key],
         );
         if (!lock.rows[0].locked) throw new ForgeOperationError("unavailable");
         try {
-          const [session] = await sessionQuery(drizzle(lockClient));
-          if (!sessionAllowsReview(session))
-            throw new ForgeOperationError("invalid-response");
+          const db = drizzle(lockClient);
+          const [hook] = await db
+            .select({ enabled: repositoryWebhooks.enabled })
+            .from(repositoryWebhooks)
+            .innerJoin(
+              repositories,
+              eq(repositories.id, repositoryWebhooks.repositoryId),
+            )
+            .where(
+              and(
+                eq(repositoryWebhooks.id, trigger.webhookId),
+                eq(repositoryWebhooks.botId, bot),
+                eq(repositories.id, trigger.repositoryId),
+                eq(repositories.status, "active"),
+              ),
+            );
+          if (!hook?.enabled) throw new ForgeOperationError("permission");
+          if (trigger.origin === "automatic" || progress.rearmed) {
+            const [session] = await sessionQuery(db);
+            if (!sessionAllowsReview(session))
+              throw new ForgeOperationError("invalid-response");
+          }
           started = true;
           return await write();
         } finally {
@@ -2384,10 +2544,7 @@ export async function processInteraction(database: Database, reviewId: string) {
           progress: progress.providerProgress ?? {},
           revision: trigger.change,
           requireReady: trigger.origin === "automatic" || !!progress.rearmed,
-          submit:
-            trigger.origin === "automatic" || progress.rearmed
-              ? submitUnderPolicy
-              : undefined,
+          submit: submitUnderPolicy,
           save: saveProviderProgress,
         },
       );
@@ -2398,6 +2555,22 @@ export async function processInteraction(database: Database, reviewId: string) {
       )
         .filter((c) => c.body.includes(marker))
         .map((c) => c.id);
+      const confirmation = progress.providerProgress?.bulk?.confirmation;
+      if (
+        api.type === "gitlab" &&
+        confirmation &&
+        confirmation !== "confirmed"
+      ) {
+        await update({
+          publication: {
+            ...progress,
+            state: "unconfirmed",
+            error:
+              "GitLab published the review notes, but the verdict on the reviewed revision could not be confirmed.",
+          },
+        });
+        return;
+      }
       await finishReviewPublication();
     }
 
@@ -2415,9 +2588,7 @@ export async function processInteraction(database: Database, reviewId: string) {
         error.reason === "change-closed" &&
         !progress.writing
       ) {
-        const bulk = progress.providerProgress?.bulk;
-        const bulkStarted = bulk?.writing || bulk?.submitted || bulk?.id;
-        if (api.type === "gitlab" && bulkStarted && !progress.remoteId) {
+        if (hasGitlabSubmission() && !progress.remoteId) {
           await update({
             publication: {
               ...progress,
@@ -2433,7 +2604,7 @@ export async function processInteraction(database: Database, reviewId: string) {
           !progress.remoteId &&
           !progress.inlineIds &&
           !progress.providerProgress?.summary &&
-          !bulkStarted;
+          !hasGitlabSubmission();
         if (
           beforeGitlabSubmission &&
           progress.providerProgress &&
@@ -2475,11 +2646,14 @@ export async function processInteraction(database: Database, reviewId: string) {
         return;
       }
       const uncertain =
-        (progress.writing ||
+        (entry.recoverNative &&
+          api.type !== "gitlab" &&
+          progress.mode === "review") ||
+        ((progress.writing ||
           Object.entries(progress.providerProgress ?? {}).some(
             ([key, operation]) => key.startsWith("fixed:") && operation.writing,
           )) &&
-        (!(error instanceof ForgeOperationError) || error.uncertain);
+          (!(error instanceof ForgeOperationError) || error.uncertain));
       await update({
         publication: {
           ...progress,
@@ -2495,7 +2669,7 @@ export async function processInteraction(database: Database, reviewId: string) {
   });
 }
 
-/** Resume one authenticated GitLab opening once its exact diff version becomes available. */
+/** Resume one authenticated GitLab delivery after its open MR's diff becomes available. */
 export async function processDeferredOpen(database: Database) {
   const due = sql`${webhookDeliveries.openRetryAfter} <= now()`;
   const [row] = await database.db
@@ -2579,9 +2753,9 @@ export async function processInteractions(database: Database) {
     .where(
       and(
         eq(repositories.status, "active"),
-        eq(repositoryWebhooks.enabled, true),
+        sql`(${repositoryWebhooks.enabled} or (${dispatchOutbox.acknowledgedAt} is not null and ${nativeRecoveryPending}))`,
         sql`${repositoryWebhooks.botId} is not null`,
-        sql`${dispatchOutbox.interactionAfter} <= now() and (${dispatchOutbox.acknowledgedAt} is null or (${reviews.status} in ('completed','failed') and coalesce(${dispatchOutbox.publication}->>'state','pending') not in ('published','stale')))`,
+        sql`${dispatchOutbox.interactionAfter} <= now() and (${dispatchOutbox.acknowledgedAt} is null or (${reviews.status} in ('completed','failed') and coalesce(${dispatchOutbox.publication}->>'state','pending') not in ('published','stale','unconfirmed')))`,
       ),
     )
     .orderBy(dispatchOutbox.interactionAfter)

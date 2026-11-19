@@ -15,16 +15,22 @@ import {
 
 /** Honor the retry deadline for both normal status changes and forced cleanup. */
 export function statusCommentDue(retire = false) {
+  const saved = dispatchOutbox.statusComment;
+  const checked = sql`${saved} ? 'checkedHookBotId'`;
+  const bindingChanged = sql`${saved}->>'checkedHookBotId' is distinct from ${repositoryWebhooks.botId}`;
+  const previousOwner = sql`${saved} is not null and ${saved}->>'botId' is distinct from ${repositoryWebhooks.botId}`;
   return and(
-    sql`(${dispatchOutbox.statusAfter} is null or ${dispatchOutbox.statusAfter} <= now())`,
+    sql`(${dispatchOutbox.statusAfter} is null or ${dispatchOutbox.statusAfter} <= now()
+      or (${checked} and ${bindingChanged})
+      or (not (${checked}) and ${previousOwner}))`,
     retire
       ? isNotNull(dispatchOutbox.statusComment)
       : sql`${reviews.source}->'conversation' is null
-    and ((${reviews.status} in ('queued', 'running')
+    and ((${previousOwner}) or (${checked}) or (${reviews.status} in ('queued', 'running')
       and (${dispatchOutbox.statusComment}->>'shown' is distinct from ${reviews.status}
         or ${dispatchOutbox.statusComment}->>'headSha' is distinct from ${reviews.headSha}))
       or (${reviews.status} in ('completed', 'failed')
-        and (${dispatchOutbox.publication}->>'state' in ('published', 'stale')
+        and (${dispatchOutbox.publication}->>'state' in ('published', 'stale', 'unconfirmed')
           or ${dispatchOutbox.statusComment}->>'shown' is distinct from ${reviews.status})
         and ${dispatchOutbox.statusComment} is not null))`,
   );
@@ -79,41 +85,75 @@ export async function syncStatusComment(
     .from(dispatchOutbox)
     .innerJoin(reviews, eq(reviews.id, dispatchOutbox.reviewId))
     .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
+    .innerJoin(
+      repositoryWebhooks,
+      eq(repositoryWebhooks.id, reviewTriggers.webhookId),
+    )
     .where(and(eq(reviews.publicId, reviewId), statusCommentDue(retire)));
   if (!entry) return;
   const { phase, head, change } = entry;
   const terminal = phase === "completed" || phase === "failed";
-  const remove =
-    retire ||
-    (terminal &&
-      ["published", "stale"].includes(entry.publication?.state ?? ""));
   const marker = `<!-- razbor:${reviewId}:status -->`;
   const botId = entry.saved?.botId ?? currentBotId;
   if (!botId) return;
+  const previousOwner = currentBotId !== null && currentBotId !== botId;
+  const remove =
+    retire ||
+    previousOwner ||
+    (terminal &&
+      ["published", "stale", "unconfirmed"].includes(
+        entry.publication?.state ?? "",
+      ));
   let state: ReviewStatusComment = entry.saved ?? { botId };
+  if (previousOwner || Object.hasOwn(state, "checkedHookBotId"))
+    state = { ...state, checkedHookBotId: currentBotId };
 
   /** Persist the write fence independently from acknowledgement and publication retry deadlines. */
-  async function save(value: ReviewStatusComment | null, retry = false) {
+  async function save(value: ReviewStatusComment | null, retryMs = 0) {
     await database.db
       .update(dispatchOutbox)
       .set({
         statusComment: value,
-        statusAfter: retry ? new Date(Date.now() + 30000) : null,
+        statusAfter: retryMs ? new Date(Date.now() + retryMs) : null,
       })
       .where(eq(dispatchOutbox.id, entry.outboxId));
   }
 
   try {
-    if ((retire || terminal) && !state.creatingBody && !state.remoteId) {
+    if ((remove || terminal) && !state.creatingBody && !state.remoteId) {
       await save(null);
       return;
     }
     const api = await adapter();
-    if (
-      (currentBotId && currentBotId !== botId) ||
-      (await api.identity()).id !== botId
-    )
-      throw new ForgeOperationError("permission");
+    if ((await api.identity()).id !== botId) {
+      // A replacement credential may inspect this verified PR but cannot mutate
+      // the previous bot's comment. An owner can remove it manually or restore
+      // credentials; keep the exact ID or creation fence until either is proven.
+      state = { ...state, checkedHookBotId: currentBotId };
+      if (!state.remoteId && !state.creatingBody)
+        throw new ForgeOperationError("permission");
+      const visible = (
+        await api.comments(change.number, { complete: true })
+      ).some(
+        (comment) =>
+          comment.id === state.remoteId ||
+          (comment.user.id === botId && comment.body.endsWith(`\n${marker}`)),
+      );
+      if (!visible) {
+        if (state.remoteId || state.missingOnRetirement) await save(null);
+        else await save({ ...state, missingOnRetirement: true }, 30000);
+        return;
+      }
+      await save(
+        {
+          ...state,
+          error: "status-comment-owner-changed",
+          missingOnRetirement: undefined,
+        },
+        3600000,
+      );
+      return;
+    }
 
     if (state.creatingBody) {
       const matches = (
@@ -127,7 +167,7 @@ export async function syncStatusComment(
       // confirm absence on the next retry before releasing its creation fence.
       if (remove && matches.length === 0) {
         if (state.missingOnRetirement) await save(null);
-        else await save({ ...state, missingOnRetirement: true }, true);
+        else await save({ ...state, missingOnRetirement: true }, 30000);
         return;
       }
       if (matches.length !== 1 || matches[0].body !== state.creatingBody) {
@@ -160,7 +200,7 @@ export async function syncStatusComment(
         eq(repositoryWebhooks.id, reviewTriggers.webhookId),
       )
       .where(
-        sql`${reviews.publicId} = ${reviewId} and ${repositories.status} = 'active' and ${repositoryWebhooks.enabled}`,
+        sql`${reviews.publicId} = ${reviewId} and ${repositories.status} = 'active' and ${repositoryWebhooks.enabled} and ${repositoryWebhooks.botId} = ${botId}`,
       );
     if (latest?.phase !== phase || latest.head !== head) return;
     const body = statusBody(reviewId, phase, head, marker);
@@ -215,7 +255,7 @@ export async function syncStatusComment(
   } catch (error) {
     const reason =
       error instanceof ForgeOperationError ? error.reason : "unavailable";
-    await save({ ...state, error: reason }, true);
+    await save({ ...state, error: reason }, 30000);
     logger.warn(
       { reviewId, reason },
       "review status comment reconciliation deferred",

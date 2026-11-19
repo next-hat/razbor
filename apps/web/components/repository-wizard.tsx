@@ -650,7 +650,7 @@ export function RepositoryWizard({
                 </Field>
                 <Field>
                   <FieldLabel htmlFor="repository-senders">
-                    Who can request reviews?
+                    Permitted senders
                   </FieldLabel>
                   <Input
                     id="repository-senders"
@@ -663,7 +663,8 @@ export function RepositoryWizard({
                   <FieldDescription>
                     {guidance.label} usernames, separated by commas. Use a
                     different account from the bot to request reviews. Use *
-                    only for a private repository.
+                    only for a private repository. On public repositories, fully
+                    automatic reviews require a named PR author from this list.
                   </FieldDescription>
                 </Field>
                 {usesGithubApp ? (
@@ -737,7 +738,7 @@ export function RepositoryWizard({
                       "Review trigger mode",
                       reviewTriggerLabels[reviewTriggerMode],
                     ],
-                    ["Permitted command senders", senders],
+                    ["Permitted senders", senders],
                     ["Webhook callback", selectedCallback],
                   ].map(([label, value]) => (
                     <div key={label} className="flex min-w-0 flex-col gap-1">

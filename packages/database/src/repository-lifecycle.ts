@@ -7,7 +7,10 @@ import { publicIdSchema, reviewTriggerModeSchema } from "@razbor/contracts";
 import { createForge, verifyRegistration } from "@razbor/forge-adapters";
 
 import { requireContextSession } from "@database/src/contexts.js";
-import { resetRepositoryReviewTriggers } from "@database/src/review-triggers.js";
+import {
+  lockReviewTriggerChanges,
+  resetRepositoryReviewTriggers,
+} from "@database/src/review-triggers.js";
 import type { Database, Transaction } from "@database/src/connection.js";
 import {
   getRepository,
@@ -220,6 +223,7 @@ export async function requestRepositoryDeletion(
         400,
         "Type the exact repository name to confirm deletion.",
       );
+    await lockReviewTriggerChanges(tx, repo.id);
     const now = new Date();
     await tx
       .update(repositories)

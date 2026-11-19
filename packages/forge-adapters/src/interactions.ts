@@ -72,7 +72,19 @@ export type ForgeReviewComment = {
 
 export type ForgePublicationProgress = Record<
   string,
-  { id?: string; writing?: boolean; submitted?: boolean }
+  {
+    id?: string;
+    writing?: boolean;
+    submitted?: boolean;
+    /** The first complete draft listing that found an uncertain create absent during cleanup. */
+    missingSince?: number;
+    /** Evidence captured around the original GitLab bulk POST, never reconstructed from later reviewer state. */
+    confirmation?:
+      | "confirmed"
+      | "revision-unconfirmed"
+      | "verdict-unconfirmed"
+      | "response-unconfirmed";
+  }
 >;
 
 export type ForgeReviewPublication = {

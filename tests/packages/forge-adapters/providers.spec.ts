@@ -220,11 +220,19 @@ test("current change reads use the target repository, immutable fork revisions a
   let closed = false;
   let draft = true;
   let outdatedDiff = false;
+  let gitlabHead = head;
   let foreign = false;
-  let bulkOutcome: "accepted" | "lost" = "accepted";
+  let bulkOutcome:
+    | "accepted"
+    | "lost"
+    | "downgraded"
+    | "permission-changed"
+    | "new-head"
+    | "new-draft" = "accepted";
   let bulkPosts = 0;
   let summaryBody = "";
   let interruptSummaryRead = false;
+  let cleanupDraft: { id: number; note: string; author_id: number } | undefined;
   t.mock.method(globalThis, "fetch", async (input: URL, init: RequestInit) => {
     assert.equal(input.origin, origin);
     const url = input.pathname;
@@ -234,6 +242,8 @@ test("current change reads use the target repository, immutable fork revisions a
       summaryBody = payload.note;
       bulkPosts++;
       if (bulkOutcome === "lost") throw new Error("lost response");
+      if (bulkOutcome === "new-head") gitlabHead = "4".repeat(40);
+      if (bulkOutcome === "new-draft") draft = true;
       interruptSummaryRead = true;
       return new Response(null, { status: 204 });
     }
@@ -270,7 +280,19 @@ test("current change reads use the target repository, immutable fork revisions a
     if (url.endsWith("/merge_requests/12/discussions"))
       return Response.json([]);
     if (url.endsWith("/merge_requests/12/draft_notes"))
-      return Response.json([]);
+      return Response.json(cleanupDraft ? [cleanupDraft] : []);
+    if (url.endsWith("/merge_requests/12/approvals"))
+      return Response.json({ user_can_approve: bulkOutcome !== "downgraded" });
+    if (url.endsWith("/merge_requests/12/reviewers"))
+      return Response.json([
+        {
+          user: { id: 5, username: "razbor" },
+          state:
+            bulkOutcome === "permission-changed" || draft
+              ? "reviewed"
+              : "requested_changes",
+        },
+      ]);
     const project = foreign ? "fork/project" : "team/project";
     if (url === `/api/v3/repos/team/project/compare/${base}...${head}`)
       return Response.json({ merge_base_commit: { sha: mergeBase } });
@@ -287,9 +309,9 @@ test("current change reads use the target repository, immutable fork revisions a
         target_branch: "main",
         source_branch: "main",
         source_project_id: 99,
-        sha: head,
+        sha: gitlabHead,
         diff_refs: {
-          head_sha: outdatedDiff ? base : head,
+          head_sha: outdatedDiff ? base : gitlabHead,
           base_sha: mergeBase,
           start_sha: base,
         },
@@ -370,12 +392,21 @@ test("current change reads use the target repository, immutable fork revisions a
     await rejectsPublication(base);
     assert.equal(draft, true);
     if (type === "gitlab") {
-      // Recover both an acknowledged bulk write and a lost response from the original summary.
-      for (const outcome of ["accepted", "lost"] as const) {
+      // Recover the notes for each submission with only the evidence captured around its own POST.
+      for (const outcome of [
+        "accepted",
+        "lost",
+        "downgraded",
+        "permission-changed",
+        "new-head",
+        "new-draft",
+      ] as const) {
         bulkOutcome = outcome;
         bulkPosts = 0;
         summaryBody = "";
         draft = false;
+        outdatedDiff = false;
+        gitlabHead = head;
         let saved: ForgePublicationProgress = {};
         /** Resume exactly the provider checkpoint saved by the previous call. */
         const publish = () =>
@@ -398,12 +429,61 @@ test("current change reads use the target repository, immutable fork revisions a
         await assert.rejects(publish());
         assert.equal(
           saved.bulk.submitted,
-          outcome === "accepted" ? true : undefined,
+          outcome === "lost" ? undefined : true,
         );
         draft = true;
+        outdatedDiff = false;
         assert.equal(await publish(), "17");
-        assert.match(summaryBody, /:complete -->$/);
+        if (outcome === "accepted") {
+          assert.match(summaryBody, /:complete -->$/);
+          assert.equal(saved.bulk.confirmation, "confirmed");
+        } else {
+          assert.match(summaryBody, /GitLab verdict unconfirmed/);
+          assert.match(summaryBody, /:unconfirmed -->$/);
+          assert.equal((await forge.reviews(12))[0]?.state, "UNCONFIRMED");
+          assert.equal(
+            saved.bulk.confirmation,
+            outcome === "lost"
+              ? "response-unconfirmed"
+              : outcome === "new-draft" || outcome === "new-head"
+                ? "revision-unconfirmed"
+                : "verdict-unconfirmed",
+          );
+        }
         assert.equal(bulkPosts, 1);
+      }
+      let clock = Date.now();
+      const time = t.mock.method(Date, "now", () => clock);
+      let cleanup: ForgePublicationProgress = { "draft-0": { writing: true } };
+      /** Reopen the bounded adapter as a later dispatcher retry would. */
+      const retire = () =>
+        fixtureForge("gitlab").discardPendingReview!(
+          12,
+          "rev_abcdefghijklmnop",
+          cleanup,
+          async (checkpoint) => {
+            cleanup = structuredClone(checkpoint);
+          },
+        );
+      try {
+        await assert.rejects(retire(), ForgeOperationError);
+        assert.equal(cleanup["draft-0"].missingSince, clock);
+        clock += 29999;
+        await assert.rejects(retire(), ForgeOperationError);
+        cleanupDraft = {
+          id: 41,
+          author_id: 9,
+          note: `finding\n\n<!-- razbor-gitlab-draft:rev_abcdefghijklmnop:0:${head} -->`,
+        };
+        await assert.rejects(retire(), ForgeOperationError);
+        assert.equal(cleanup["draft-0"].missingSince, undefined);
+        cleanupDraft = undefined;
+        await assert.rejects(retire(), ForgeOperationError);
+        assert.equal(cleanup["draft-0"].missingSince, clock);
+        clock += 30000;
+        await retire();
+      } finally {
+        time.mock.restore();
       }
     }
     closed = true;

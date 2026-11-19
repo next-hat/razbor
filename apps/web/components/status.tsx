@@ -6,7 +6,7 @@ import { Badge } from "@web/components/ui/badge.js";
  */
 function statusVariant(value: string) {
   if (
-    /failed|error|permission|unsupported|uncertain/.test(value) ||
+    /failed|error|permission|unsupported|uncertain|unconfirmed/.test(value) ||
     value === "high"
   )
     return "destructive";

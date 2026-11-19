@@ -49,12 +49,15 @@ Review trigger and comment checks use local HTTP provider fixtures and isolated 
 databases. They exercise source-only and indexed policy decisions with simulated
 attempts and controlled results. The GitLab fork fixture opens an MR before its
 diff refs exist. It checks that the dispatcher recovers the first review after
-a restart and drops a deferred opening when its webhook is disabled and re-enabled.
+a restart, retries source and readiness changes, and ends old opt-ins while a diff
+is pending. Disabling and re-enabling the webhook revokes the deferred delivery.
 The delayed-delivery check inspects the queued head before sending another update.
-Publication checks cover an opt-in revoked before submission, recovery after a
-lost GitLab bulk response, and reuse of a saved result after draft cleanup.
-The status-comment fixture checks that a masked 404 preserves the original ID
-and that deletion during an active review produces one replacement.
+The public PR check uses different authors in the signed event and the forge response.
+Publication checks cover webhook disablement and opt-in revocation before submission,
+recovery after a lost response, unconfirmed GitLab verdicts, and reuse of a saved
+result after draft cleanup.
+The status-comment fixture covers masked 404s, deletion during an active review,
+and recovery after a bot rotation through restored credentials or manual removal.
 These checks do not need model credentials.
 
 ## Autonomous review harness

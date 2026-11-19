@@ -39,6 +39,8 @@ type Observation = {
   previous?: PreviousFinding[];
   conversation?: ReviewConversation;
   commandAt?: string;
+  /** Whether the verified PR author may trigger fully automatic reviews under this hook's settings. */
+  automaticAuthorPermitted?: boolean;
   waitingForDiff?: boolean;
 };
 
@@ -380,7 +382,7 @@ export async function acceptReviewTrigger(
       .where(triggerDelivery(hook.id, event));
     if (
       receipt?.pendingOpen &&
-      (event.kind !== "opened" ||
+      (event.kind !== receipt.pendingOpen.kind ||
         receipt.pendingOpen.number !== event.number ||
         receipt.pendingOpen.repositoryId !== event.repositoryId ||
         receipt.pendingOpen.hookUpdatedAt !== hook.updatedAt.toISOString())
@@ -413,7 +415,48 @@ export async function acceptReviewTrigger(
       .update(repositoryWebhooks)
       .set({ lastDelivery: "accepted", lastDeliveryAt: new Date() })
       .where(eq(repositoryWebhooks.id, hook.id));
-    if (observation.waitingForDiff && event.kind === "opened") {
+    let since = session?.continuousReviewSince ?? null;
+    let reset = session?.reviewSessionResetAt ?? null;
+    const closed = !change && !observation.waitingForDiff;
+    const boundaryEvent = event.kind === "closed" || event.kind === "reopened";
+    if (closed || boundaryEvent) {
+      // A delayed boundary cannot revoke an opt-in posted in a later open session.
+      const boundary =
+        event.kind !== "comment" && event.occurredAt
+          ? new Date(event.occurredAt)
+          : receipt.createdAt;
+      if (!reset || reset < boundary) reset = boundary;
+      if (closed || (since && since <= reset)) since = null;
+    }
+    if (observation.waitingForDiff && event.kind !== "comment") {
+      // GitLab verified the MR is open but has no current diff. Invalidate the
+      // old revision's readiness and apply session boundaries before retrying.
+      if (session) {
+        const changed =
+          session.state !== "open" ||
+          session.draft !== null ||
+          since?.getTime() !== session.continuousReviewSince?.getTime() ||
+          reset?.getTime() !== session.reviewSessionResetAt?.getTime();
+        const now = new Date();
+        await tx
+          .update(pullRequests)
+          .set({
+            state: "open",
+            draft: null,
+            continuousReviewSince: since,
+            reviewSessionResetAt: reset,
+            triggerGeneration: observation.generation + (changed ? 1 : 0),
+            updatedAt: now,
+            syncedAt: now,
+          })
+          .where(scope);
+        if (
+          boundaryEvent &&
+          active.reviewTriggerMode === "opt_in_continuous" &&
+          !since
+        )
+          await supersedeQueuedAutomaticReviews(tx, repo.id, event.number);
+      }
       await tx
         .update(webhookDeliveries)
         .set({
@@ -445,23 +488,38 @@ export async function acceptReviewTrigger(
         );
       if (prior) return { duplicate: true } as const;
     }
-    let since = session?.continuousReviewSince ?? null;
-    let reset = session?.reviewSessionResetAt ?? null;
-    if (!change || event.kind === "closed" || event.kind === "reopened") {
-      // A delayed close/reopen cannot revoke an opt-in posted in a later open session.
-      const boundary =
-        event.kind !== "comment" && event.occurredAt
-          ? new Date(event.occurredAt)
-          : receipt.createdAt;
-      if (!reset || reset < boundary) reset = boundary;
-      if (!change || (since && since <= reset)) since = null;
-    }
-    if (
+    const activating =
       change &&
       event.kind === "comment" &&
       !observation.conversation &&
-      active.reviewTriggerMode === "opt_in_continuous"
-    ) {
+      active.reviewTriggerMode === "opt_in_continuous";
+    if (activating && forge === "gitlab") {
+      // A close/reopen can arrive before the first PR snapshot exists. Its
+      // durable receipt still fences a delayed command that beats the retry.
+      const [pending] = await tx
+        .select({
+          boundary: sql<
+            string | null
+          >`max(coalesce((${webhookDeliveries.pendingOpen}->>'occurredAt')::timestamptz,
+            ${webhookDeliveries.createdAt}))::text`,
+        })
+        .from(webhookDeliveries)
+        .where(
+          and(
+            eq(webhookDeliveries.webhookId, hook.id),
+            sql`${webhookDeliveries.openRetryAfter} is not null`,
+            sql`${webhookDeliveries.pendingOpen}->>'number' = ${String(event.number)}`,
+            sql`${webhookDeliveries.pendingOpen}->>'kind' in ('closed', 'reopened')`,
+            sql`${webhookDeliveries.pendingOpen}->>'hookUpdatedAt' = ${hook.updatedAt.toISOString()}`,
+          ),
+        );
+      if (pending.boundary) {
+        const boundary = new Date(pending.boundary);
+        if (!reset || reset < boundary) reset = boundary;
+        if (since && since <= reset) since = null;
+      }
+    }
+    if (activating) {
       const posted = observation.commandAt
         ? new Date(observation.commandAt)
         : undefined;
@@ -525,7 +583,8 @@ export async function acceptReviewTrigger(
         .where(scope);
     }
     const automaticAllowed =
-      active.reviewTriggerMode === "automatic" ||
+      (active.reviewTriggerMode === "automatic" &&
+        observation.automaticAuthorPermitted === true) ||
       (active.reviewTriggerMode === "opt_in_continuous" && since !== null);
     if (
       !change ||
@@ -553,7 +612,11 @@ export async function acceptReviewTrigger(
       // leaves the delivery resumable at the same boundary on redelivery.
       await tx
         .update(webhookDeliveries)
-        .set({ pendingAction: "review-history" })
+        .set({
+          pendingAction: "review-history",
+          pendingOpen: receipt.pendingOpen,
+          openRetryAfter: receipt.openRetryAfter,
+        })
         .where(eq(webhookDeliveries.id, receipt.id));
       return { historyGeneration: sessionValues.triggerGeneration } as const;
     }

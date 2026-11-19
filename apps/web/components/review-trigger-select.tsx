@@ -29,7 +29,7 @@ const descriptions = {
   opt_in_continuous:
     "A permitted user comments /agentic_review once per pull request. Later commits trigger reviews until the request closes.",
   automatic:
-    "Razbor reviews open pull requests when they are ready and whenever their source revision changes.",
+    "Razbor reviews ready pull requests and new revisions. On public repositories, the PR author must be named in the permitted senders list.",
 } satisfies Record<ReviewTriggerMode, string>;
 
 /** Select the repository policy and explain when the choice will incur model usage. */

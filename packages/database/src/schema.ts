@@ -949,6 +949,8 @@ export const legacyRevocations = pgTable(
 
 export type ReviewStatusComment = {
   botId: string;
+  /** Hook identity observed while the credential could not mutate the saved owner's comment. */
+  checkedHookBotId?: string | null;
   /** Persist the exact bytes before creation, so an uncertain POST is never repeated. */
   creatingBody?: string;
   /** A complete listing during retirement found no matching bot-owned marker. */
@@ -985,7 +987,13 @@ export const dispatchOutbox = pgTable("dispatch_outbox", {
 
 export type Publication = {
   state:
-    "pending" | "publishing" | "published" | "failed" | "uncertain" | "stale";
+    | "pending"
+    | "publishing"
+    | "published"
+    | "failed"
+    | "uncertain"
+    | "unconfirmed"
+    | "stale";
   remoteId?: string;
   inlineIds?: string[];
   providerProgress?: ForgePublicationProgress;
@@ -1088,7 +1096,9 @@ export const webhookDeliveries = pgTable(
     deliveryId: text("delivery_id").notNull(),
     closedCommandId: text("closed_command_id"),
     pendingOpen: jsonb("pending_open").$type<
-      Extract<ForgeWebhook, { kind: "opened" }> & { hookUpdatedAt: string }
+      Exclude<ForgeWebhook, { kind: "ping" | "push" | "comment" }> & {
+        hookUpdatedAt: string;
+      }
     >(),
     openRetryAfter: timestamp("open_retry_after", { withTimezone: true }),
     pendingAction: text("pending_action").$type<

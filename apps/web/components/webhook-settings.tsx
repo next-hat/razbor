@@ -217,9 +217,7 @@ export function WebhookSettings({
                   </Field>
                 )}
                 <Field>
-                  <FieldLabel htmlFor="senders">
-                    Permitted command senders
-                  </FieldLabel>
+                  <FieldLabel htmlFor="senders">Permitted senders</FieldLabel>
                   <Input
                     id="senders"
                     placeholder="alice, bob"
@@ -229,8 +227,9 @@ export function WebhookSettings({
                     required
                   />
                   <FieldDescription>
-                    Forge usernames, separated by commas. Use * to allow any
-                    commenter only while the repository is private.
+                    Enter forge usernames separated by commas. They can request
+                    reviews and qualify as authors for fully automatic public PR
+                    reviews. Use * for any commenter on a private repository.
                   </FieldDescription>
                 </Field>
                 {!appManaged && (

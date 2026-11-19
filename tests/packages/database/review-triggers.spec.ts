@@ -43,6 +43,8 @@ test(
     process.env.RAZBOR_TEST_TRIGGER_SECRET = secret;
     const bot = { id: 9, login: "razbor" };
     const author = { id: 2, login: "alice" };
+    let prAuthor = author;
+    let privateRepo = true;
     const base = "a".repeat(40);
     let head = "b".repeat(40);
     let draft = false;
@@ -84,7 +86,7 @@ test(
           id: 1,
           full_name: "team/project",
           html_url: origin + "/team/project",
-          private: true,
+          private: privateRepo,
           archived: false,
         });
       if (path.endsWith("/hooks"))
@@ -100,7 +102,7 @@ test(
           merged: false,
           draft,
           title: "Review lifecycle",
-          user: author,
+          user: prAuthor,
           html_url: origin + "/team/project/pulls/" + number,
           base: { sha: base, ref: "main" },
           head: { sha: head, ref: "fork-feature" },
@@ -465,6 +467,25 @@ test(
           .filter((row) => row.origin === "manual")
           .every((row) => row.comment_id !== null),
       );
+      const beforeFork = (await history()).length;
+      privateRepo = false;
+      // The signed event still names Alice. Only the live PR author's login can authorize an automatic public review.
+      prAuthor = { id: 8, login: "contributor" };
+      await lifecycle("opened", 23);
+      await lifecycle("synchronized", 23);
+      assert.equal((await history()).length, beforeFork);
+      assert.equal(await command(23, author, 23), 202);
+      assert.equal((await history()).length, beforeFork + 1);
+      prAuthor = { ...author, login: "ALICE" };
+      await lifecycle("opened", 24);
+      assert.equal((await history()).length, beforeFork + 2);
+      config.repositories.project.webhook!.permitted_senders = ["*"];
+      await applyWebhookSettings(database, config);
+      await lifecycle("opened", 25);
+      assert.equal((await history()).length, beforeFork + 2);
+      privateRepo = true;
+      await lifecycle("synchronized", 25);
+      assert.equal((await history()).length, beforeFork + 3);
     } finally {
       release.resolve();
       delete process.env.RAZBOR_TEST_TRIGGER_SECRET;
@@ -486,13 +507,23 @@ test(
       target = "2".repeat(40),
       head = "3".repeat(40);
     let start = target;
+    let iid = 27;
     let diffReady = false;
     let closed = false;
     let draftNote: { id: number; author_id: number; note: string } | undefined;
+    let summaryNote:
+      | {
+          id: number;
+          body: string;
+          author: { id: number; username: string };
+          created_at: string;
+        }
+      | undefined;
+    let bulkRequests = 0;
     let hideDeletion = true;
     let hookUrl: string | undefined;
     let origin = "";
-    const server = createServer((req, res) => {
+    const server = createServer(async (req, res) => {
       const path = decodeURIComponent(
         new URL(req.url!, "http://localhost").pathname,
       );
@@ -516,9 +547,9 @@ test(
               : []
             : { id: 1 },
         );
-      if (path.endsWith("/merge_requests/27"))
+      if (path.endsWith("/merge_requests/" + iid))
         return send({
-          iid: 27,
+          iid,
           project_id: 1,
           source_project_id: 2,
           target_project_id: 1,
@@ -527,7 +558,7 @@ test(
           draft: false,
           title: "Fork MR",
           author: { id: 2, username: "alice" },
-          web_url: origin + "/team/project/-/merge_requests/27",
+          web_url: origin + "/team/project/-/merge_requests/" + iid,
           target_branch: "main",
           source_branch: "fork-branch",
           diff_refs: diffReady
@@ -543,8 +574,29 @@ test(
         res.statusCode = 404;
         return send({});
       }
+      if (path.endsWith("/draft_notes/bulk_publish")) bulkRequests++;
+      if (path.endsWith("/discussions")) return send([]);
+      if (path.endsWith("/notes/52") && req.method === "PUT" && summaryNote) {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) chunks.push(chunk);
+        summaryNote.body = JSON.parse(Buffer.concat(chunks).toString()).body;
+        return send(summaryNote);
+      }
       if (path.endsWith("/notes"))
-        return send(req.method === "GET" ? [] : { id: 51 });
+        return send(
+          req.method === "GET"
+            ? summaryNote
+              ? [summaryNote]
+              : []
+            : { id: 51 },
+        );
+      if (path.endsWith("/notes/92"))
+        return send({
+          id: 92,
+          body: "/agentic_review",
+          author: { id: 2, username: "alice" },
+          created_at: "2025-01-01T00:00:00Z",
+        });
       res.statusCode = 404;
       return send({});
     });
@@ -665,11 +717,32 @@ test(
       const [saved] = await listPullRequests(database, [repo.id]);
       assert.equal(saved.baseSha, target);
       start = "4".repeat(40);
-      await acceptWebhook(database, hook.id, event, {
-        "x-gitlab-token": secret,
-        "x-gitlab-event": "Merge Request Hook",
-        "webhook-id": "mr-new-diff",
-      });
+      diffReady = false;
+      /** Deliver one signed lifecycle observation for this MR and diff version. */
+      function deliver(id: string, action: string, ready = false) {
+        return acceptWebhook(
+          database,
+          hook!.id,
+          Buffer.from(
+            JSON.stringify({
+              ...payload,
+              object_attributes: { ...payload.object_attributes, iid, action },
+              ...(ready && {
+                changes: { draft: { previous: true, current: false } },
+              }),
+            }),
+          ),
+          {
+            "x-gitlab-token": secret,
+            "x-gitlab-event": "Merge Request Hook",
+            "webhook-id": id,
+          },
+        );
+      }
+      assert.equal(await deliver("mr-new-diff", "update"), 202);
+      assert.equal((await listReviews(database)).length, 1);
+      diffReady = true;
+      await processDeferredOpen(database);
       assert.equal((await listReviews(database)).length, 2);
       // Disabling and re-enabling the hook revokes a deferred delivery even if
       // the dispatcher is offline for both transitions.
@@ -765,6 +838,118 @@ test(
         ?.publication;
       assert.equal(restored?.state, "pending");
       assert.equal(restored?.rearmed, true);
+      // A lost native response can establish the submitted notes without proving the original verdict.
+      const summary = `Saved result\n\n<!-- razbor:${review.id}:result -->`;
+      summaryNote = {
+        id: 52,
+        author: { id: 9, username: "razbor" },
+        created_at: "2026-01-01T00:00:00Z",
+        body: `${summary}\n\n<!-- razbor-gitlab:${review.id}:${head}:REQUEST_CHANGES:pending -->`,
+      };
+      await database.pool.query(
+        "update dispatch_outbox set publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
+        [
+          JSON.stringify({
+            state: "uncertain",
+            mode: "review",
+            writing: true,
+            reviewPayload: {
+              body: summary,
+              comments: [],
+              event: "REQUEST_CHANGES",
+            },
+            providerProgress: { bulk: { writing: true } },
+          }),
+          review.id,
+        ],
+      );
+      await processInteraction(database, review.id);
+      const recovered = (await publicationView(database, review.id))
+        ?.publication;
+      assert.equal(recovered?.state, "unconfirmed");
+      assert.equal(recovered.remoteId, "52");
+      assert.equal(
+        recovered.providerProgress?.bulk.confirmation,
+        "response-unconfirmed",
+      );
+      assert.match(summaryNote.body, /GitLab verdict unconfirmed/);
+      await processInteraction(database, review.id);
+      assert.equal(bulkRequests, 0);
+      summaryNote = undefined;
+      // A ready transition with no source change signal also survives GitLab's pending diff.
+      diffReady = false;
+      start = "6".repeat(40);
+      assert.equal(await deliver("mr-ready", "update", true), 202);
+      diffReady = true;
+      await processDeferredOpen(database);
+      const {
+        rows: [ready],
+      } = await database.pool.query(
+        "select start_sha from pull_requests where number = 27",
+      );
+      assert.equal(ready.start_sha, start);
+
+      // A close can be delivered after the MR has already reopened. Clear the
+      // opt-in before a source update can see a usable diff and beat the retry.
+      config.repositories.project.reviewTriggerMode = "opt_in_continuous";
+      await applyRegistry(database, config);
+      for (const action of ["close", "reopen"]) {
+        await database.pool.query(
+          "update pull_requests set continuous_review_since = now() - interval '1 second' where number = 27",
+        );
+        const before = (await listReviews(database)).length;
+        diffReady = false;
+        assert.equal(await deliver("mr-pending-" + action, action), 202);
+        const {
+          rows: [boundary],
+        } = await database.pool.query(
+          "select state, continuous_review_since, review_session_reset_at from pull_requests where number = 27",
+        );
+        assert.equal(boundary.state, "open");
+        assert.equal(boundary.continuous_review_since, null);
+        assert.ok(boundary.review_session_reset_at);
+        diffReady = true;
+        start = (action === "close" ? "7" : "8").repeat(40);
+        assert.equal(await deliver("mr-after-" + action, "update"), 200);
+        await processDeferredOpen(database);
+        assert.equal((await listReviews(database)).length, before);
+      }
+      // An unobserved MR has no PR row to reset. A command posted before
+      // the first known reopen can run once but cannot opt the new session in.
+      iid = 28;
+      diffReady = false;
+      assert.equal(await deliver("mr-first-reopen", "reopen"), 202);
+      diffReady = true;
+      const delayedCommand = Buffer.from(
+        JSON.stringify({
+          object_kind: "note",
+          user: payload.user,
+          project: payload.project,
+          merge_request: { iid },
+          object_attributes: {
+            id: 92,
+            author_id: 2,
+            note: "/agentic_review",
+            action: "create",
+            noteable_type: "MergeRequest",
+          },
+        }),
+      );
+      assert.equal(
+        await acceptWebhook(database, hook.id, delayedCommand, {
+          "x-gitlab-token": secret,
+          "x-gitlab-event": "Note Hook",
+          "webhook-id": "mr-delayed-command",
+        }),
+        202,
+      );
+      const {
+        rows: [first],
+      } = await database.pool.query(
+        "select continuous_review_since, review_session_reset_at from pull_requests where number = 28",
+      );
+      assert.equal(first.continuous_review_since, null);
+      assert.ok(first.review_session_reset_at);
     } finally {
       delete process.env.RAZBOR_TEST_MR_SECRET;
       await new Promise<void>((resolve) => server.close(() => resolve()));

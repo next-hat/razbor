@@ -15,6 +15,7 @@ import {
   finishAttempt,
   connectDatabase,
   processInteraction,
+  processInteractions,
   processStatusComments,
   publicationView,
   removeRepositoryWebhook,
@@ -140,6 +141,8 @@ test(
       user: { id: number; login: string };
     }[] = [];
     let reviewWrites = 0;
+    let loseNativeResponse = false;
+    let failReviewList = false;
     let reactionReads = 0;
     let nextNoteId = 100;
     let loseStatusCreate = true;
@@ -152,7 +155,8 @@ test(
     let privateRepo = true;
     let resetAtSubmission:
       { reviewId: string; reset(): Promise<void> } | undefined;
-    const bot = { id: 9, login: "razbor" };
+    const originalBot = { id: 9, login: "razbor" };
+    let bot = originalBot;
     const server = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
       for await (const c of req) chunks.push(c);
@@ -202,6 +206,8 @@ test(
             res.statusCode = 404;
             return reply({});
           }
+          if (req.method === "PATCH" || req.method === "DELETE")
+            assert.equal(note.user.id, bot.id);
           if (req.method === "PATCH") note.body = input.body;
           if (req.method === "DELETE") {
             deletions.push(note.id);
@@ -286,7 +292,15 @@ test(
             state: input.event,
             user: bot,
           });
+          if (loseNativeResponse) {
+            loseNativeResponse = false;
+            res.statusCode = 503;
+          }
           return reply({ id: native.at(-1)!.id });
+        }
+        if (failReviewList) {
+          res.statusCode = 503;
+          return reply({});
         }
         return reply(native);
       }
@@ -720,29 +734,122 @@ test(
         "stale",
       );
       assert.ok(!native.some((note) => note.body.includes(beforeClose.id)));
+      head = "f".repeat(40);
+      assert.equal(await deliver("disable-before-native-post", 17), 202);
+      const [beforeDisable] = await listReviews(db);
+      const explicit = await beginAttempt(db, beforeDisable.id, "test", 30000);
+      if (explicit.kind !== "started")
+        throw new Error("expected explicit review to start");
+      await finishAttempt(db, beforeDisable.id, explicit.attemptId, "test", {
+        summary: "Explicit review across webhook disablement",
+        findings: [],
+      });
+      resetAtSubmission = {
+        reviewId: beforeDisable.id,
+        /** Disable the hook after its checkpoint but before the first native POST. */
+        async reset() {
+          config.repositories.project.webhook!.enabled = false;
+          await applyWebhookSettings(db, config);
+        },
+      };
+      await processInteraction(db, beforeDisable.id);
+      assert.equal(resetAtSubmission, undefined);
+      assert.equal(reviewWrites, 3);
+      config.repositories.project.webhook!.enabled = true;
+      await applyWebhookSettings(db, config);
+      loseNativeResponse = true;
+      await processInteraction(db, beforeDisable.id);
+      assert.equal(reviewWrites, 4);
+      assert.equal(
+        (await publicationView(db, beforeDisable.id))?.publication?.state,
+        "uncertain",
+      );
+      config.repositories.project.webhook!.enabled = false;
+      await applyWebhookSettings(db, config);
+      failReviewList = true;
+      await processInteraction(db, beforeDisable.id);
+      assert.equal(
+        (await publicationView(db, beforeDisable.id))?.publication?.writing,
+        true,
+      );
+      failReviewList = false;
+      await db.pool.query(
+        "update dispatch_outbox set interaction_after = now() where review_id = (select id from reviews where public_id = $1)",
+        [beforeDisable.id],
+      );
+      await processInteractions(db);
+      assert.equal(
+        (await publicationView(db, beforeDisable.id))?.publication?.state,
+        "published",
+      );
+      assert.equal(reviewWrites, 4);
+      config.repositories.project.webhook!.enabled = true;
+      await applyWebhookSettings(db, config);
       assert.equal(await deliver("retire", 13), 202);
       const retiring = (await listReviews(db))[0];
       await processStatusComments(db);
-      /** Check this PR's current notes for the exact retiring run. */
-      const hasRetiringStatus = () =>
-        posted.some((note) =>
+      /** Find this PR's current status for the exact retiring run. */
+      const retiringStatus = () =>
+        posted.find((note) =>
           note.body.endsWith(`<!-- razbor:${retiring.id}:status -->`),
         );
-      assert.ok(hasRetiringStatus());
+      const oldStatus = retiringStatus();
+      assert.ok(oldStatus);
+      const replacementBot = { id: 19, login: "new-review-bot" };
+      bot = replacementBot;
+      await applyWebhookSettings(db, config);
+      await processStatusComments(db);
+      assert.equal(
+        (await publicationView(db, retiring.id))?.statusCommentError,
+        "status-comment-owner-changed",
+      );
+      assert.equal(retiringStatus(), oldStatus);
+      // Restoring the original bot wakes the row immediately, even with the hourly check pending.
+      bot = originalBot;
+      await applyWebhookSettings(db, config);
+      await processStatusComments(db);
+      assert.equal(
+        (await publicationView(db, retiring.id))?.statusCommentError,
+        undefined,
+      );
+      assert.equal(retiringStatus(), oldStatus);
+      bot = replacementBot;
+      await applyWebhookSettings(db, config);
+      await processStatusComments(db);
+      posted.splice(posted.indexOf(oldStatus), 1);
+      await db.pool.query(
+        "update dispatch_outbox set status_after=null where review_id=(select id from reviews where public_id=$1)",
+        [retiring.id],
+      );
+      await processStatusComments(db);
+      await processStatusComments(db);
+      assert.equal(retiringStatus()?.user.id, replacementBot.id);
       config.repositories.project.webhook!.enabled = false;
       await applyWebhookSettings(db, config);
       await processStatusComments(db);
-      assert.ok(!hasRetiringStatus());
+      assert.ok(!retiringStatus());
       config.repositories.project.webhook!.enabled = true;
       await applyWebhookSettings(db, config);
       await processStatusComments(db);
-      assert.ok(hasRetiringStatus());
+      assert.ok(retiringStatus());
+      bot = originalBot;
+      await applyWebhookSettings(db, config);
+      await processStatusComments(db);
       await requestRepositoryDeletion(db, repo.id, {
         confirmation: "team/project",
       });
       assert.equal(await removeRepositoryWebhook(db, repo.id), false);
+      const {
+        rows: [deleting],
+      } = await db.pool.query(
+        "select setup_error from repositories where public_id=$1",
+        [repo.id],
+      );
+      assert.match(deleting.setup_error, /previous bot/);
+      bot = replacementBot;
+      await db.pool.query("update dispatch_outbox set status_after=null");
       await processStatusComments(db);
-      assert.ok(!hasRetiringStatus());
+      assert.ok(!retiringStatus());
       assert.ok(posted.includes(human));
     } finally {
       delete process.env.RAZBOR_TEST_HOOK_SECRET;
