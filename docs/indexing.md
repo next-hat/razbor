@@ -1,8 +1,32 @@
 # Repository indexing and search
 
-The indexer clones registered repositories and builds searchable code and
-documentation indexes. Reviews use them to find related code, then verify the
-exact source revisions under review.
+Every review gets an attempt-scoped Git checkout pinned to its base and head.
+The private Git source service runs under the existing `indexer` service name.
+With **Codebase Memory** enabled it also maintains a searchable branch index.
+Turn the setting on or off when connecting a repository or under **Repository
+Settings → General**. A file-managed repository reads `codebaseMemoryEnabled`
+from its registry table when you reapply the registry. For new UI registrations
+the wizard checks the source service's graph capability. Existing registrations
+keep their saved choice. See [file-managed registration](persistence.md#optional-file-managed-registration)
+for the defaults used by the management CLI.
+
+Disabling the setting stops new index work and hides index tools for subsequent
+attempts. An active indexed attempt keeps its access grant for the recorded
+index revision. If a refresh advances the shared index, its graph tools become
+unavailable. The review can still inspect Git at its original base and head.
+Stored indexes can be reused when indexing is enabled again. The separate
+`indexing.persistent` flag still controls advance provisioning versus on-demand
+indexing for enabled file-managed repositories. See [source-only deployment](deployment.md#deploy-without-codebase-memory)
+for the service configuration.
+
+The web service sends the index management bearer token when it checks deployment
+capabilities, provisions indexes, and reads preparation status. The supplied
+Compose and NanoCL configurations use HTTP on the private service network.
+Anyone who can observe traffic on that hop can read and reuse the token. Keep
+the indexer and its network accessible only to trusted workloads. For traffic
+that crosses hosts or an untrusted network, configure `RAZBOR_INDEX_ENDPOINT`
+to use an HTTPS endpoint with a certificate trusted by the web service and
+protect the connection from TLS termination to the indexer as well.
 
 An index follows the configured branch, usually the default branch. It does not
 include local uncommitted changes or create a graph for each pull request.
@@ -21,7 +45,7 @@ bash scripts/provision-cbm.sh "$RAZBOR_CBM_BUNDLE"
 ```
 
 Use the same path in `.env`. The script verifies the download, and the service
-checks the executable and version at startup. Updates are explicit.
+checks the executable and version when opening an index. Updates are explicit.
 
 Keep `RAZBOR_INDEX_DATA` outside the checkout. It holds private Git checkouts and
 graph files; do not use it as a developer worktree or share it between independent
@@ -92,6 +116,15 @@ alone, has no Git index, and matches the configured branch, upstream, and remote
 policy. Working-tree entries, top-level Git metadata locks, or unfinished Git
 operations block this recovery. The indexer's checkout is a remote cache, so keep
 unpublished work elsewhere.
+
+After an unclean shutdown, the service can remove an empty daemon runtime
+directory without the graph bundle. If the log reports **Retained daemon
+state**, the source service keeps the checkout and leaves deletion pending.
+Stop the previous index service and verify in its process namespace that the
+workspace's daemon has exited. Only then remove the exact runtime directory
+named in the diagnostic. The service retries pending deletions. If ownership
+or daemon exit is uncertain, leave the files in place; unrelated source
+reviews can continue.
 
 Index large repositories before requesting reviews. Reviews reuse a ready branch
 index but keep source pinned to the PR commit. If refresh advances the shared
@@ -171,7 +204,7 @@ The example uses `memory.mode = "full"`; `fast` and `moderate` are also availabl
 
 | Setting or limit             | Default or maximum                                  |
 | ---------------------------- | --------------------------------------------------- |
-| `service.sync_ms`            | Git synchronization: 60000 ms.                      |
+| `service.sync_ms`            | Git synchronization and pack transfer, 60000 ms.    |
 | `memory.index_ms`            | Graph preparation: 90000 ms.                        |
 | `memory.query_ms`            | Graph queries: 15000 ms.                            |
 | `embeddings.request_ms`      | Embedding requests: 60000 ms.                       |
@@ -181,6 +214,12 @@ The example uses `memory.mode = "full"`; `fast` and `moderate` are also availabl
 | Document-search input        | 480 UTF-8 bytes before model prefix and 512 tokens. |
 | Source file                  | 1000000 bytes.                                      |
 | Source reads per preparation | 100000000 bytes, including rereads.                 |
+
+Both source-only and indexed reviews transfer the Git objects reachable from
+the pinned base and head. If a large pack times out during generation or
+transfer, increase `service.sync_ms` on the source service, up to 300000 ms.
+Each pack is limited to 512 MiB, and the review attempt deadline also bounds
+the handoff.
 
 The Nanocl template allows five minutes for graph preparation and one hour for
 embeddings, with four embedding CPU threads. Total preparation, including source

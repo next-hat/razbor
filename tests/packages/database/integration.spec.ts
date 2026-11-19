@@ -6,7 +6,11 @@ import path from "node:path";
 import os from "node:os";
 import { createServer } from "node:http";
 
-import { publicIdSchema, type ReviewAttemptMetrics } from "@razbor/contracts";
+import {
+  codebaseMemoryUnavailableMessage,
+  publicIdSchema,
+  type ReviewAttemptMetrics,
+} from "@razbor/contracts";
 import {
   connectDatabase,
   listRepositories,
@@ -25,6 +29,15 @@ import {
   tokenHash,
   listTokens,
   pendingDispatches,
+  updateRepositoryCodebaseMemory,
+  createRepositoryFromUi,
+  createReviewWorkspace,
+  createIndexToken,
+  listIndexProjects,
+  pendingRepositoryIndexes,
+  repositoryIndexSetup,
+  reconcileIndexCapability,
+  workspaceState,
 } from "@razbor/database";
 import {
   registrySchema,
@@ -35,6 +48,421 @@ import { importLegacy } from "@razbor/database/legacy";
 import { createQueue, dispatchPending } from "@razbor/queue";
 
 import { databaseFixture } from "@tests/packages/database/fixture.js";
+
+test("registry uses owner-scoped deployment defaults only when creating an undeclared preference", async (t) => {
+  const fixture = await databaseFixture();
+  t.after(() => fixture.close());
+  const git = {
+    branch: "main",
+    upstream: "refs/remotes/origin/main",
+    remotes: { origin: "https://example.invalid/repo.git" },
+  };
+  const local = { git, indexing: { owner: "source" } };
+  const config = registrySchema.parse({
+    registry: { key: "file" },
+    repositories: {
+      omitted: local,
+      explicit: { ...local, codebaseMemoryEnabled: true },
+      other: { git, indexing: { owner: "other" } },
+    },
+  });
+  /** Read the persisted choices by stable registry key after each isolated import. */
+  async function choices() {
+    return Object.fromEntries(
+      (await listRepositories(fixture.database)).map((repo) => [
+        repo.configKey,
+        repo.codebaseMemoryEnabled,
+      ]),
+    );
+  }
+  await applyRegistry(fixture.database, config, "source");
+  assert.deepEqual(await choices(), {
+    omitted: false,
+    explicit: true,
+    other: true,
+  });
+  delete config.repositories.explicit.codebaseMemoryEnabled;
+  await applyRegistry(fixture.database, config, "other");
+  assert.deepEqual(await choices(), {
+    omitted: false,
+    explicit: true,
+    other: true,
+  });
+  config.repositories.omitted.codebaseMemoryEnabled = true;
+  config.repositories.explicit.codebaseMemoryEnabled = false;
+  config.repositories.legacy = config.repositories.other;
+  await applyRegistry(fixture.database, config);
+  assert.deepEqual(await choices(), {
+    omitted: true,
+    explicit: false,
+    other: true,
+    legacy: true,
+  });
+});
+
+test("bundle recovery retries only affected persistent setup and preserves unrelated repository states", async (t) => {
+  const fixture = await databaseFixture();
+  t.after(() => fixture.close());
+  const db = fixture.database;
+  const owner = "indexer";
+  const git = {
+    branch: "main",
+    upstream: "refs/remotes/origin/main",
+    remotes: { origin: "https://example.invalid/repo.git" },
+  };
+  const project = { git, indexing: { owner } };
+  await applyRegistry(
+    db,
+    registrySchema.parse({
+      registry: { key: "outage" },
+      repositories: {
+        persistent: project,
+        onDemand: { git, indexing: { owner, persistent: false } },
+        published: project,
+        running: project,
+        unrelated: project,
+        disabled: { ...project, codebaseMemoryEnabled: false },
+        foreign: { git, indexing: { owner: "other" } },
+      },
+    }),
+  );
+  const { administrator } = fixture;
+  await administrator.query(
+    "UPDATE repositories SET setup_state='pending' WHERE config_key IN ('persistent','onDemand','disabled','foreign')",
+  );
+  await administrator.query(
+    "UPDATE repositories SET setup_state='indexing' WHERE config_key='running'",
+  );
+  await administrator.query(
+    "UPDATE repositories SET setup_state='error', setup_error='Verify repository access.' WHERE config_key='unrelated'",
+  );
+  /** Snapshot setup values and timestamps so repeated polling must leave matching rows untouched. */
+  const snapshot = async () =>
+    (
+      await administrator.query(
+        "SELECT config_key, setup_state, setup_error, updated_at::text FROM repositories ORDER BY config_key",
+      )
+    ).rows;
+  const before = await snapshot();
+  const keys = before.map((row) => row.config_key);
+  await reconcileIndexCapability(db, owner, false);
+  const unavailable = await snapshot();
+  assert.deepEqual(
+    unavailable.map((row) => row.config_key),
+    keys,
+  );
+  for (const [index, row] of unavailable.entries()) {
+    if (["persistent", "onDemand"].includes(row.config_key))
+      assert.deepEqual(
+        [row.setup_state, row.setup_error],
+        ["error", codebaseMemoryUnavailableMessage],
+      );
+    else assert.deepEqual(row, before[index]);
+  }
+  await reconcileIndexCapability(db, owner, false);
+  assert.deepEqual(await snapshot(), unavailable);
+  await reconcileIndexCapability(db, owner, true);
+  const recovered = await snapshot();
+  assert.deepEqual(
+    recovered.map((row) => row.config_key),
+    keys,
+  );
+  for (const [index, row] of recovered.entries()) {
+    if (row.config_key === "persistent" || row.config_key === "onDemand")
+      assert.deepEqual(
+        [row.setup_state, row.setup_error],
+        [row.config_key === "persistent" ? "pending" : "ready", null],
+      );
+    else assert.deepEqual(row, before[index]);
+  }
+  await reconcileIndexCapability(db, owner, true);
+  assert.deepEqual(await snapshot(), recovered);
+
+  const repos = await listRepositories(db);
+  const persistent = repos.find((repo) => repo.configKey === "persistent");
+  const onDemand = repos.find((repo) => repo.configKey === "onDemand");
+  assert.ok(persistent && onDemand);
+  for (const repo of [persistent, onDemand]) {
+    await repositoryIndexSetup(db, owner, repo.id, "indexing");
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "interrupted"),
+      true,
+    );
+    assert.equal(
+      (await getRepository(db, repo.id))?.setupState,
+      repo.persistent ? "pending" : "ready",
+    );
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "interrupted"),
+      false,
+    );
+  }
+  assert.deepEqual(await pendingRepositoryIndexes(db, owner), [
+    { id: persistent.id },
+  ]);
+});
+
+test("repository settings fence index grants while preserving an active attempt's source and index policy", async (t) => {
+  const fixture = await databaseFixture();
+  const db = fixture.database;
+  const owner = "fixture";
+  const revision = { baseSha: "a".repeat(40), headSha: "b".repeat(40) };
+  const root = "/fixture/data";
+  try {
+    const config = registrySchema.parse({
+      registry: { key: "ui" },
+      repositories: {
+        project: {
+          git: {
+            branch: "main",
+            upstream: "refs/remotes/origin/main",
+            remotes: { origin: "https://example.invalid/repo.git" },
+          },
+          indexing: { owner },
+        },
+      },
+    });
+    await applyRegistry(db, config);
+    const [repo] = await listRepositories(db);
+    assert.equal(repo.codebaseMemoryEnabled, true);
+    assert.equal(repo.codebaseMemoryEditable, false);
+    await assert.rejects(
+      updateRepositoryCodebaseMemory(db, repo.id, {
+        codebaseMemoryEnabled: false,
+      }),
+      /registry file/,
+    );
+    await ensureDevelopmentWorkspaces(db, owner, root);
+    const [workspace] = await ownedWorkspaces(db, owner);
+    const grant = await createIndexToken(db, workspace.id, true);
+    const request = { repositoryId: repo.id, ...revision };
+    const indexedReview = await submitReview(db, request);
+    const indexed = await beginAttempt(db, indexedReview.id, owner, 60000);
+    assert.ok(indexed.kind === "started" && indexed.codebaseMemoryEnabled);
+    const queued = await submitReview(db, request);
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "indexing"),
+      true,
+    );
+    config.repositories.project.codebaseMemoryEnabled = false;
+    await applyRegistry(db, config);
+    const [project] = await listIndexProjects(db, repo.id);
+    assert.deepEqual(
+      [
+        project.state,
+        project.indexedAt,
+        project.headSha,
+        project.canCreateToken,
+      ],
+      ["disabled", null, null, false],
+    );
+    assert.deepEqual(await pendingRepositoryIndexes(db, owner), []);
+    await assert.rejects(authorizeHash(db, tokenHash(grant.token), owner));
+    await assert.rejects(createIndexToken(db, workspace.id, false));
+    await assert.rejects(ensureDevelopmentWorkspaces(db, owner, root, repo.id));
+    const lease = {
+      ...request,
+      reviewId: indexedReview.id,
+      attemptId: indexed.attemptId,
+      ttlMs: 60000,
+    };
+    const pinned = await createReviewWorkspace(db, owner, root, lease);
+    assert.equal(pinned.codebaseMemoryEnabled, true);
+    // The shared graph tracks its own branch, which can be behind the PR head.
+    await workspaceState(
+      db,
+      owner,
+      pinned.id,
+      "ready",
+      revision.headSha,
+      undefined,
+      revision.baseSha,
+    );
+    assert.equal(
+      await repositoryIndexSetup(db, owner, repo.id, "indexing"),
+      false,
+    );
+    await ensureDevelopmentWorkspaces(
+      db,
+      owner,
+      root,
+      repo.id,
+      indexed.attemptId,
+    );
+    assert.equal(
+      await repositoryIndexSetup(
+        db,
+        owner,
+        repo.id,
+        "indexing",
+        undefined,
+        pinned.git,
+        indexed.attemptId,
+      ),
+      true,
+    );
+    assert.equal((await getRepository(db, repo.id))!.setupState, "ready");
+    const source = await beginAttempt(db, queued.id, owner, 60000);
+    assert.ok(source.kind === "started" && !source.codebaseMemoryEnabled);
+    await assert.rejects(
+      ensureDevelopmentWorkspaces(db, owner, root, repo.id, source.attemptId),
+    );
+    // Re-enable while the pinned attempt owns preparation, before it publishes readiness.
+    config.repositories.project.codebaseMemoryEnabled = true;
+    await applyRegistry(db, config);
+    await workspaceState(db, owner, workspace.id, "ready", revision.baseSha);
+    /** Publish the result of the still-running preparation at its recorded graph revision. */
+    const finishSharedSetup = (headSha: string) =>
+      repositoryIndexSetup(
+        db,
+        owner,
+        repo.id,
+        "ready",
+        undefined,
+        pinned.git,
+        indexed.attemptId,
+        {
+          project: workspace.id,
+          headSha,
+        },
+      );
+    assert.equal(await finishSharedSetup(revision.headSha), false);
+    assert.equal((await getRepository(db, repo.id))?.setupState, "pending");
+    assert.equal(await finishSharedSetup(revision.baseSha), true);
+    assert.equal((await getRepository(db, repo.id))?.setupState, "ready");
+    config.repositories.project.codebaseMemoryEnabled = false;
+    await applyRegistry(db, config);
+    await finishAttempt(db, indexedReview.id, indexed.attemptId, owner, {
+      summary: "Fixture complete",
+      findings: [],
+    });
+    await assert.rejects(
+      ensureDevelopmentWorkspaces(db, owner, root, repo.id, indexed.attemptId),
+    );
+    config.repositories.project.codebaseMemoryEnabled = true;
+    await applyRegistry(db, config);
+    assert.deepEqual(await pendingRepositoryIndexes(db, owner), [
+      { id: repo.id },
+    ]);
+    const checkout = await createReviewWorkspace(db, owner, root, {
+      ...lease,
+      reviewId: queued.id,
+      attemptId: source.attemptId,
+    });
+    assert.equal(checkout.codebaseMemoryEnabled, false);
+    await workspaceState(
+      db,
+      owner,
+      checkout.id,
+      "ready",
+      revision.headSha,
+      undefined,
+      null,
+    );
+    await assert.rejects(
+      workspaceState(
+        db,
+        owner,
+        workspace.id,
+        "ready",
+        revision.headSha,
+        undefined,
+        null,
+      ),
+    );
+    await assert.rejects(
+      workspaceState(
+        db,
+        owner,
+        workspace.id,
+        "ready",
+        revision.headSha,
+        undefined,
+        revision.baseSha,
+      ),
+    );
+    // An existing index with stale Git policy stays fenced when unrelated
+    // workspaces are provisioned at source-service startup.
+    config.repositories.project.git.remotes.origin =
+      "https://example.invalid/moved.git";
+    config.repositories.another = structuredClone(config.repositories.project);
+    await applyRegistry(db, config);
+    await ensureDevelopmentWorkspaces(db, owner, root);
+    assert.equal(
+      (await ownedWorkspaces(db, owner)).filter((item) => !item.temporary)
+        .length,
+      2,
+    );
+    await assert.rejects(
+      ensureDevelopmentWorkspaces(db, owner, root, repo.id),
+      /policy changed/,
+    );
+    const repositoryUrl = "https://forge.invalid/team/ui";
+    const providerResponses = new Map<string, unknown>([
+      ["/api/v3/user", { id: 1, login: "fixture" }],
+      [
+        "/api/v3/repos/team/ui",
+        {
+          id: 2,
+          full_name: "team/ui",
+          html_url: repositoryUrl,
+          default_branch: "main",
+          private: true,
+          archived: false,
+          clone_url: `${repositoryUrl}.git`,
+        },
+      ],
+      [
+        "/api/v3/repos/team/ui/branches/main",
+        { name: "main", commit: { sha: revision.headSha } },
+      ],
+    ]);
+    t.mock.method(globalThis, "fetch", async (url: URL) => {
+      assert.equal(url.origin, "https://forge.invalid");
+      assert.ok(providerResponses.has(url.pathname));
+      return Response.json(providerResponses.get(url.pathname));
+    });
+    const created = await createRepositoryFromUi(db, {
+      forgeType: "github",
+      webhookMode: "manual",
+      repositoryUrl,
+      accessToken: "local-test-credential",
+      permittedSenders: ["fixture"],
+      callbackBase: "https://razbor.invalid",
+      codebaseMemoryEnabled: false,
+    });
+    assert.equal(created.codebaseMemoryEnabled, false);
+    assert.equal(created.setupState, "ready");
+    await assert.rejects(
+      updateRepositoryCodebaseMemory(
+        db,
+        created.id,
+        { codebaseMemoryEnabled: true },
+        "ctx_ABCDEFGHIJKLMNOP",
+      ),
+    );
+    await assert.rejects(
+      updateRepositoryCodebaseMemory(db, created.id, {
+        codebaseMemoryEnabled: "false",
+      }),
+    );
+    const saved = await updateRepositoryCodebaseMemory(db, created.id, {
+      codebaseMemoryEnabled: true,
+    });
+    assert.ok(saved?.codebaseMemoryEditable && saved.codebaseMemoryEnabled);
+    assert.equal(saved.setupState, "pending");
+    assert.equal(
+      (
+        await updateRepositoryCodebaseMemory(db, created.id, {
+          codebaseMemoryEnabled: false,
+        })
+      )?.setupState,
+      "ready",
+    );
+  } finally {
+    await fixture.close();
+  }
+});
 
 test(
   "durable identities, migration, scope, recovery and no UUID leakage with PostgreSQL/pg-boss",

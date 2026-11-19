@@ -48,7 +48,8 @@ To apply pending migrations manually:
 docker compose run --rm migrate
 ```
 
-This applies base SQL, pg-boss schema setup, and embedding migrations. The
+This applies base SQL and pg-boss schema setup. The indexed Compose deployment
+also applies embedding migrations. The
 migration role manages schemas; the runtime role only accesses data. Use the
 checked-in migrations rather than a schema push or reset. Back up before
 upgrades and stop old workers before changing their dependencies or protocol.
@@ -216,6 +217,15 @@ mounts or environment configuration.
 Keep registry and repository keys stable to preserve identities and history.
 Imports retain missing entries and only run explicitly. Remove registrations
 from the file when no longer needed; importing later can recreate a deleted one.
+
+An explicit `codebaseMemoryEnabled` in a repository table takes precedence.
+When it is omitted, a registry reapply keeps the existing repository's setting.
+For a new repository, `manage config apply` can read `RAZBOR_INDEX_CONFIG`
+from its own environment. Point it to the source-service TOML mounted inside
+the management container. A matching owner configured without `[memory]`
+defaults to source-only. Other owners and installations without this file
+retain the historical indexed default. The development source-only overlay
+supplies the file for both registry and management commands.
 
 ### Change an existing checkout to HTTPS
 

@@ -9,6 +9,8 @@ import type { RequestInit as UndiciRequestInit } from "undici";
 import { z } from "zod";
 
 import {
+  codebaseMemoryUnavailableCode,
+  codebaseMemoryUnavailableMessage,
   commitSchema,
   memoryOperationSchema,
   publicIdSchema,
@@ -69,7 +71,7 @@ function mcpHeaderValue(value: string) {
   return value;
 }
 
-const bindingSchema = z
+const sourceBindingSchema = z
   .object({
     attemptId: publicIdSchema("attempt"),
     workspaceId: publicIdSchema("workspace"),
@@ -77,13 +79,17 @@ const bindingSchema = z
     token: z.string().min(32).max(256),
     expiresAt: z.number(),
     headSha: commitSchema,
-    indexHeadSha: commitSchema,
-    indexBranch: z.string().min(1),
-    project: publicIdSchema("workspace"),
   })
   .strict();
 
-type Binding = z.infer<typeof bindingSchema>;
+const indexedBindingSchema = sourceBindingSchema.extend({
+  indexHeadSha: commitSchema,
+  indexBranch: z.string().min(1),
+  project: publicIdSchema("workspace"),
+});
+
+type Binding =
+  z.infer<typeof sourceBindingSchema> | z.infer<typeof indexedBindingSchema>;
 
 type Completion = {
   result?: ReviewResult;
@@ -432,7 +438,10 @@ export class RunnerBroker {
    * Requests a revision-bound source workspace and stores its capability only after
    * validating the binding and current ownership.
    */
-  private async prepare(attempt: ActiveAttempt) {
+  private async prepare(
+    attempt: ActiveAttempt,
+    codebaseMemoryEnabled: boolean,
+  ) {
     const { endpoint, token } = indexConfiguration();
     const start = performance.now();
     const timeoutMs = Math.max(1, attempt.deadline - Date.now());
@@ -460,6 +469,10 @@ export class RunnerBroker {
       }),
     } as RequestInit & Pick<UndiciRequestInit, "dispatcher">);
     if (!response.ok) {
+      const memoryUnavailable =
+        codebaseMemoryEnabled &&
+        response.headers.get("x-razbor-error-code") ===
+          codebaseMemoryUnavailableCode;
       logger.warn(
         {
           reviewId: attempt.job.reviewId,
@@ -474,6 +487,16 @@ export class RunnerBroker {
         "runner source preparation rejected",
       );
       await response.body?.cancel().catch(() => {});
+      if (memoryUnavailable) {
+        this.record(attempt, {
+          time: new Date().toISOString(),
+          source: "app",
+          stage: "prepare",
+          level: "error",
+          message: codebaseMemoryUnavailableMessage,
+        });
+        throw new TerminalReviewError(codebaseMemoryUnavailableMessage);
+      }
       throw new Error("source preparation unavailable");
     }
     const body = await boundedRunnerBody(
@@ -485,7 +508,9 @@ export class RunnerBroker {
       16384,
       signal,
     );
-    const binding = bindingSchema.parse(JSON.parse(body.toString("utf8")));
+    const binding = (
+      codebaseMemoryEnabled ? indexedBindingSchema : sourceBindingSchema
+    ).parse(JSON.parse(body.toString("utf8")));
     if (
       binding.attemptId !== attempt.id ||
       binding.headSha !== attempt.job.headSha ||
@@ -610,7 +635,7 @@ export class RunnerBroker {
         level: "info",
         message: "Preparing source for the assigned runner",
       });
-      await this.prepare(attempt);
+      await this.prepare(attempt, reservation.codebaseMemoryEnabled);
       if (reservation.agent) {
         attempt.agent = {
           provider: reservation.agent.provider,
@@ -648,8 +673,11 @@ export class RunnerBroker {
       );
       if (!attempt.finalizing) {
         const terminal =
-          Date.now() >= attempt.deadline || job.retryCount >= job.retryLimit;
+          error instanceof TerminalReviewError ||
+          Date.now() >= attempt.deadline ||
+          job.retryCount >= job.retryLimit;
         await attempt.logs;
+        // A failed write must reach execute as a retryable error.
         await finishAttempt(
           this.database,
           attempt.job.reviewId,
@@ -657,7 +685,8 @@ export class RunnerBroker {
           this.owner,
           undefined,
           terminal,
-        ).catch(() => {});
+        );
+        if (error instanceof TerminalReviewError) throw error;
         if (terminal)
           throw new TerminalReviewError(
             "runner attempt deadline or retry limit reached",
@@ -745,7 +774,7 @@ export class RunnerBroker {
           leaseUntil: new Date(attempt.leaseUntil).toISOString(),
           deadline: new Date(attempt.deadline).toISOString(),
           ...(attempt.agent ? { agent: attempt.agent } : {}),
-          ...(attempt.binding
+          ...(attempt.binding && "project" in attempt.binding
             ? {
                 index: {
                   project: attempt.binding.project,
@@ -940,11 +969,7 @@ export class RunnerBroker {
       {
         redirect: "error",
         cache: "no-store",
-        signal: AbortSignal.any([
-          request.signal,
-          attempt.controller.signal,
-          AbortSignal.timeout(30000),
-        ]),
+        signal: AbortSignal.any([request.signal, attempt.controller.signal]),
         headers: { authorization: `Bearer ${attempt.binding!.token}` },
       },
     );
@@ -1276,7 +1301,8 @@ export class RunnerBroker {
    */
   async mcp(id: string, token: string, request: Request) {
     const attempt = await this.capability(id, token);
-    if (!attempt.binding) throw new RunnerRequestError(403);
+    if (!attempt.binding || !("project" in attempt.binding))
+      throw new RunnerRequestError(403);
     const config = indexConfiguration();
     const headers = new Headers({
       authorization: `Bearer ${attempt.binding.token}`,

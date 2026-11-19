@@ -14,7 +14,10 @@ import {
 } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 
-import { publicIdSchema } from "@razbor/contracts";
+import {
+  codebaseMemoryUnavailableMessage,
+  publicIdSchema,
+} from "@razbor/contracts";
 
 import { requireContextSession } from "@database/src/contexts.js";
 import type { Database } from "@database/src/connection.js";
@@ -55,6 +58,31 @@ const liveReviewWorkspace = sql`(not ${indexWorkspaces.temporary} or exists (
       and r.state <> 'revoked' and r.credential_hash is not null and r.session_expires_at > now()))
 ))`;
 
+/**
+ * Admit persistent indexing for an enabled repository or a live attempt that
+ * already reserved indexed tools. An exception is bound to its temporary workspace.
+ */
+function permitsIndex(pinnedAttemptId?: string) {
+  const enabled = eq(repositories.codebaseMemoryEnabled, true);
+  if (!pinnedAttemptId) return enabled;
+  publicIdSchema("attempt").parse(pinnedAttemptId);
+  return or(
+    enabled,
+    sql`exists (
+    select 1 from ${indexWorkspaces}
+    join ${reviewAttempts} on ${reviewAttempts.id} = ${indexWorkspaces.attemptId}
+    where ${reviewAttempts.publicId} = ${pinnedAttemptId}
+      and ${reviewAttempts.codebaseMemoryEnabled}
+      and ${indexWorkspaces.repositoryId} = ${repositories.id}
+      and ${indexWorkspaces.owner} = ${repositories.indexOwner}
+      and ${indexWorkspaces.temporary}
+      and ${indexWorkspaces.state} in ('ready','unready')
+      and ${indexWorkspaces.expiresAt} > now()
+      and ${liveReviewWorkspace}
+  )`,
+  );
+}
+
 const tokenWorkspaceBinding = and(
   sql`exists (
     select 1 from repositories candidate_repository
@@ -90,14 +118,15 @@ const tokenWorkspaceBinding = and(
 );
 
 /**
- * Create missing persistent workspace records for an indexer owner; reject
- * existing ownership or Git policy changes that require explicit migration.
+ * Provision missing persistent workspace mappings for an owner. Before serving
+ * an individual index, verify its stored ownership and Git policy.
  */
 export async function ensureDevelopmentWorkspaces(
   database: Database,
   owner: string,
   dataRoot: string,
   repositoryId?: string,
+  pinnedAttemptId?: string,
 ) {
   if (repositoryId) publicIdSchema("repository").parse(repositoryId);
   await database.transaction(async (tx) => {
@@ -109,6 +138,7 @@ export async function ensureDevelopmentWorkspaces(
         and(
           eq(repositories.indexOwner, owner),
           eq(repositories.status, "active"),
+          permitsIndex(pinnedAttemptId),
           repositoryId
             ? eq(repositories.publicId, repositoryId)
             : eq(repositories.persistent, true),
@@ -128,6 +158,9 @@ export async function ensureDevelopmentWorkspaces(
           ),
         );
       if (existing) {
+        // Bulk startup only provisions missing records. A stale mapping needs
+        // operator migration for this index, but cannot prevent other reviews.
+        if (!repositoryId) continue;
         if (existing.owner !== owner)
           throw new Error("workspace owner conflict");
         // Existing checkout remains bound to its declared Git policy. A policy change
@@ -155,12 +188,17 @@ export async function ensureDevelopmentWorkspaces(
  * Read an indexer's undeleted workspace mappings for internal filesystem
  * management, translating database IDs to public IDs.
  */
-export async function ownedWorkspaces(database: Database, owner: string) {
+export async function ownedWorkspaces(
+  database: Database,
+  owner: string,
+  workspaceId?: string,
+) {
   const rows = await database.db
     .select({
       workspace: indexWorkspaces,
       repositoryPublicId: repositories.publicId,
       repositoryStatus: repositories.status,
+      codebaseMemoryEnabled: repositories.codebaseMemoryEnabled,
       attemptPublicId: reviewAttempts.publicId,
     })
     .from(indexWorkspaces)
@@ -169,6 +207,12 @@ export async function ownedWorkspaces(database: Database, owner: string) {
     .where(
       and(
         eq(indexWorkspaces.owner, owner),
+        workspaceId === undefined
+          ? undefined
+          : eq(
+              indexWorkspaces.publicId,
+              publicIdSchema("workspace").parse(workspaceId),
+            ),
         sql`${indexWorkspaces.state} <> 'deleted'`,
       ),
     );
@@ -178,11 +222,13 @@ export async function ownedWorkspaces(database: Database, owner: string) {
       workspace: w,
       repositoryPublicId,
       repositoryStatus,
+      codebaseMemoryEnabled,
       attemptPublicId,
     }) => ({
       id: w.publicId,
       repositoryId: repositoryPublicId,
       repositoryStatus,
+      codebaseMemoryEnabled,
       attemptId: attemptPublicId,
       root: w.root,
       temporary: w.temporary,
@@ -275,7 +321,12 @@ export async function createReviewWorkspace(
       // validates their short renewable lease and current runner session.
       expiresAt: row.attempt.deadline ?? row.attempt.leaseUntil,
     });
-    return { id, root, git: row.review.source.git };
+    return {
+      id,
+      root,
+      git: row.review.source.git,
+      codebaseMemoryEnabled: row.attempt.codebaseMemoryEnabled,
+    };
   });
 }
 
@@ -290,7 +341,7 @@ export async function workspaceState(
   state: "unready" | "ready" | "deleted",
   headSha?: string,
   indexedAt?: Date,
-  indexSha = headSha,
+  indexSha: string | null | undefined = headSha,
 ) {
   publicIdSchema("workspace").parse(id);
   const result = await database.db
@@ -384,7 +435,8 @@ export async function issueToken(
           liveReviewWorkspace,
           sql`exists (select 1 from ${repositories}
             where ${repositories.id} = ${indexWorkspaces.repositoryId}
-              and ${repositories.status} = 'active')`,
+              and ${repositories.status} = 'active'
+              and (${indexWorkspaces.temporary} or ${repositories.codebaseMemoryEnabled}))`,
         ),
       )
       .for("update");
@@ -458,6 +510,10 @@ export async function authorizeHash(
         eq(indexWorkspaces.owner, owner),
         liveReviewWorkspace,
         eq(repositories.status, "active"),
+        or(
+          eq(indexWorkspaces.temporary, true),
+          eq(repositories.codebaseMemoryEnabled, true),
+        ),
         isNull(indexAccessTokens.revokedAt),
         or(
           isNull(indexAccessTokens.expiresAt),
@@ -686,6 +742,7 @@ export async function listIndexProjects(
       selector: repositories.selector,
       observed: repositories.observed,
       persistent: repositories.persistent,
+      codebaseMemoryEnabled: repositories.codebaseMemoryEnabled,
       workspaceId: indexWorkspaces.publicId,
       temporary: indexWorkspaces.temporary,
       state: indexWorkspaces.state,
@@ -713,8 +770,9 @@ export async function listIndexProjects(
     .orderBy(repositories.configKey, indexWorkspaces.createdAt);
   return rows.map((row) => {
     const defaultState = row.persistent ? "not-provisioned" : "on-demand";
-    let state = row.state ?? defaultState;
+    let state: string = row.state ?? defaultState;
     if (row.repositoryStatus === "deleting") state = "deleting";
+    else if (!row.codebaseMemoryEnabled) state = "disabled";
     else if (row.expiresAt && row.expiresAt <= new Date()) state = "expired";
     return {
       id: row.workspaceId,
@@ -723,16 +781,17 @@ export async function listIndexProjects(
       configKey: row.configKey,
       kind: row.temporary ? ("review" as const) : ("persistent" as const),
       state,
-      headSha: row.state === "ready" ? row.indexSha : null,
+      headSha: state === "ready" ? row.indexSha : null,
       // Persistent ready rows carry the MCP index's publication timestamp.
       // Temporary rows also change on token issuance, so their generic
       // update timestamp is NOT an indexing date. No new tracking is introduced.
       indexedAt:
-        !row.temporary && row.state === "ready" && row.indexSha
+        !row.temporary && state === "ready" && row.indexSha
           ? row.updatedAt!.toISOString()
           : null,
       canCreateToken:
         row.repositoryStatus === "active" &&
+        row.codebaseMemoryEnabled &&
         !!row.workspaceId &&
         !row.temporary &&
         !row.expiresAt &&
@@ -775,6 +834,7 @@ export async function createIndexToken(
       .where(
         and(
           inArray(indexWorkspaces.publicId, workspaceIds),
+          eq(repositories.codebaseMemoryEnabled, true),
           contextId === undefined
             ? undefined
             : sql`${repositories.contextId} = (select id from account_contexts where public_id = ${contextId})`,
@@ -828,11 +888,12 @@ export async function createIndexToken(
   return { ...record, token };
 }
 
-/** Require an active repository assigned to the supplied indexer owner. */
+/** Require an active owned repository and, for shared indexes, its expected Git policy. */
 export async function assertRepositoryActive(
   database: Database,
   owner: string,
   repositoryId: string,
+  expectedPolicy?: WorkspacePolicy,
 ) {
   publicIdSchema("repository").parse(repositoryId);
   const [repository] = await database.db
@@ -843,6 +904,9 @@ export async function assertRepositoryActive(
         eq(repositories.publicId, repositoryId),
         eq(repositories.indexOwner, owner),
         eq(repositories.status, "active"),
+        expectedPolicy
+          ? sql`${repositories.git} = ${JSON.stringify(expectedPolicy)}::jsonb`
+          : undefined,
       ),
     );
   if (!repository) throw new Error("repository unavailable");
@@ -864,6 +928,40 @@ export async function recoverRepositoryIndexSetup(
         eq(repositories.indexOwner, owner),
         eq(repositories.status, "active"),
         eq(repositories.setupState, "indexing"),
+        eq(repositories.codebaseMemoryEnabled, true),
+      ),
+    );
+}
+
+const setupAfterInterruption = sql`case when ${repositories.persistent} then 'pending' else 'ready' end`;
+
+/**
+ * Mark queued setup while the bundle is missing. When it returns, retry persistent setup
+ * and let on-demand repositories wait for their next request. Live jobs publish their own result.
+ */
+export async function reconcileIndexCapability(
+  database: Database,
+  owner: string,
+  available: boolean,
+) {
+  await database.db
+    .update(repositories)
+    .set({
+      setupState: available ? setupAfterInterruption : "error",
+      setupError: available ? null : codebaseMemoryUnavailableMessage,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(repositories.indexOwner, owner),
+        eq(repositories.status, "active"),
+        eq(repositories.codebaseMemoryEnabled, true),
+        available
+          ? and(
+              eq(repositories.setupState, "error"),
+              eq(repositories.setupError, codebaseMemoryUnavailableMessage),
+            )
+          : eq(repositories.setupState, "pending"),
       ),
     );
 }
@@ -881,6 +979,7 @@ export async function pendingRepositoryIndexes(
         eq(repositories.indexOwner, owner),
         eq(repositories.status, "active"),
         eq(repositories.setupState, "pending"),
+        eq(repositories.codebaseMemoryEnabled, true),
       ),
     )
     .orderBy(repositories.createdAt)
@@ -888,22 +987,50 @@ export async function pendingRepositoryIndexes(
 }
 
 /**
- * Update owned repository setup state only while lifecycle and optional Git
- * policy still match; return whether the guarded update succeeded.
+ * Update owned repository setup while its Git policy still matches. A preparation
+ * that completed across a preference change can publish its exact stored revision.
+ * A transient interruption returns only in-progress work to its configured setup mode.
  */
 export async function repositoryIndexSetup(
   database: Database,
   owner: string,
   repositoryId: string,
-  state: "pending" | "indexing" | "ready" | "error",
+  state: "pending" | "indexing" | "ready" | "error" | "interrupted",
   error?: string,
   policy?: GitPolicy,
+  pinnedAttemptId?: string,
+  prepared?: { project: string; headSha: string },
 ) {
   publicIdSchema("repository").parse(repositoryId);
+  const binding = and(
+    eq(repositories.publicId, repositoryId),
+    eq(repositories.indexOwner, owner),
+    eq(repositories.status, "active"),
+    policy
+      ? sql`${repositories.git} = ${JSON.stringify(policy)}::jsonb`
+      : undefined,
+  );
+  // Re-enabling can reset setup to pending (or ready for on-demand indexes) while
+  // the service still owns the single preparation. Only its matching ready index
+  // can satisfy that request; an error from old work cannot replace new setup.
+  const completedWorkspace =
+    state === "ready" && prepared && policy
+      ? and(
+          inArray(repositories.setupState, ["indexing", "pending", "ready"]),
+          sql`exists (select 1 from ${indexWorkspaces}
+            where ${indexWorkspaces.publicId} = ${prepared.project}
+              and ${indexWorkspaces.repositoryId} = ${repositories.id}
+              and ${indexWorkspaces.owner} = ${repositories.indexOwner}
+              and not ${indexWorkspaces.temporary}
+              and ${indexWorkspaces.state} = 'ready'
+              and ${indexWorkspaces.indexSha} = ${prepared.headSha}
+              and ${indexWorkspaces.git} = ${repositories.git})`,
+        )
+      : undefined;
   const updated = await database.db
     .update(repositories)
     .set({
-      setupState: state,
+      setupState: state === "interrupted" ? setupAfterInterruption : state,
       setupError:
         state === "error"
           ? (error?.slice(0, 256) ?? "Indexing failed; retry setup.")
@@ -912,17 +1039,26 @@ export async function repositoryIndexSetup(
     })
     .where(
       and(
-        eq(repositories.publicId, repositoryId),
-        eq(repositories.indexOwner, owner),
-        eq(repositories.status, "active"),
-        state === "ready" || state === "error"
-          ? eq(repositories.setupState, "indexing")
-          : undefined,
-        policy
-          ? sql`${repositories.git} = ${JSON.stringify(policy)}::jsonb`
+        binding,
+        eq(repositories.codebaseMemoryEnabled, true),
+        state === "ready" || state === "error" || state === "interrupted"
+          ? (completedWorkspace ?? eq(repositories.setupState, "indexing"))
           : undefined,
       ),
     )
     .returning({ id: repositories.publicId });
-  return updated.length > 0;
+  if (updated.length || !pinnedAttemptId) return updated.length > 0;
+  // A pinned review may finish preparation after a toggle. Do not publish
+  // repository-wide setup progress for a disabled repository.
+  const [lease] = await database.db
+    .select({ id: repositories.id })
+    .from(repositories)
+    .where(
+      and(
+        binding,
+        eq(repositories.codebaseMemoryEnabled, false),
+        permitsIndex(pinnedAttemptId),
+      ),
+    );
+  return !!lease;
 }

@@ -5,6 +5,7 @@ import {
   requestRepositoryDeletion,
   RepositoryManagementError,
   reconcileWebhook,
+  updateRepositoryCodebaseMemory,
 } from "@razbor/database";
 
 import { canManageResource } from "@web/lib/auth.js";
@@ -60,13 +61,13 @@ export async function GET(request: Request, { params }: Context) {
 }
 
 /**
- * Validates repository mutations and dispatches deletion or token replacement,
- * reconciling active webhooks after a token change.
+ * Applies repository mutations in the authenticated context and reconciles
+ * the webhook when its access credentials change.
  */
 async function change(
   request: Request,
   { params }: Context,
-  operation: "delete" | "token",
+  operation: "delete" | "update",
 ) {
   if (!managementRequest(request))
     return Response.json(
@@ -79,23 +80,20 @@ async function change(
   try {
     const database = await reviewDatabase();
     const input = await managementJson(request);
-    const result =
+    const mutate =
       operation === "delete"
-        ? await requestRepositoryDeletion(
-            database,
-            id,
-            input,
-            await requestContextId(request),
-            requestSessionToken(request),
-          )
-        : await replaceRepositoryToken(
-            database,
-            id,
-            input,
-            await requestContextId(request),
-            requestSessionToken(request),
-          );
-    if (operation === "token" && result?.status === "active")
+        ? requestRepositoryDeletion
+        : input && typeof input === "object" && "codebaseMemoryEnabled" in input
+          ? updateRepositoryCodebaseMemory
+          : replaceRepositoryToken;
+    const result = await mutate(
+      database,
+      id,
+      input,
+      await requestContextId(request),
+      requestSessionToken(request),
+    );
+    if (mutate === replaceRepositoryToken && result?.status === "active")
       await reconcileWebhook(database, id);
     return Response.json(result, {
       status: operation === "delete" ? 202 : 200,
@@ -129,9 +127,9 @@ export async function DELETE(request: Request, context: Context) {
   return change(request, context, "delete");
 }
 
-/** Replaces repository access credentials through the shared mutation boundary. */
+/** Updates repository indexing preferences or replaces access credentials. */
 export async function PATCH(request: Request, context: Context) {
   const denied = await apiAccessResponse(request, { resource: "repository" });
   if (denied) return denied;
-  return change(request, context, "token");
+  return change(request, context, "update");
 }

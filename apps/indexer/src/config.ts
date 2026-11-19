@@ -41,7 +41,8 @@ export const indexerConfigSchema = z
           .max(200000)
           .default(32768),
       })
-      .strict(),
+      .strict()
+      .optional(),
     embeddings: z
       .object({
         endpoint: z

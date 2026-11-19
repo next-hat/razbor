@@ -5,9 +5,88 @@ Use the production Dockerfiles in `docker/` and either the
 [Nanocl statefiles](../deploy/nanocl/). The root `compose.yml` is the development
 stack.
 
-Release images target Linux amd64. They include production dependencies, the
-pinned Codebase Memory bundle, and verified embedding models; startup does not
-download these artifacts. The web image runs Next.js standalone output.
+Release images target Linux amd64. The indexed service image contains the pinned
+Codebase Memory bundle. The optional embeddings image contains its verified
+models. The web image runs Next.js standalone output.
+
+## Deploy without Codebase Memory
+
+PostgreSQL with the base migrations, the web application, the private Git source
+service and an enrolled runner are required for reviews. Both service variants
+use the same Git policy, management token, data volume and attempt leases.
+The indexed variant adds graph navigation. Embeddings, pgvector and the embedding
+migrations add semantic code and document search.
+
+For a fresh source-only installation, build these images from this revision
+and set the same release tag in the deployment configuration:
+
+```sh
+bash scripts/publish-images.sh --tag YOUR_RELEASE_TAG web source runner postgres-core migrate
+```
+
+Use Compose 2.24.4+ and the source-only override with your private environment file:
+
+```sh
+docker compose --env-file "$HOME/razbor-deploy/compose.env" -f deploy/docker/docker-compose.yml -f deploy/docker/docker-compose.source.yml up -d
+```
+
+Add `--profile runner` before `up` to start the local runner after enrollment.
+The override selects the Git-only image, a PostgreSQL image without pgvector,
+base migrations, and `config/source.example.toml`. Omit the embeddings token.
+For Nanocl, substitute your built release tag in the private statefile and run:
+
+```sh
+nanocl state apply -s razbor-platform.yml -- --source-only
+```
+
+Use the same mode on subsequent applies. When the source service reports that
+Codebase Memory is unavailable, the connection wizard defaults new repositories
+to source-only. Existing repositories keep their preference. Disable indexing
+under **Settings → General** or install the supported bundle. Once the source
+service verifies the bundle, it automatically resumes setup for repositories
+whose setup failed because the bundle was unavailable.
+If the service temporarily cannot read the bundle, it reports graph capability
+as unknown. Affected indexed reviews can retry within their queue retry limit.
+For file-managed repositories, set `codebaseMemoryEnabled = false` under each
+repository table to choose source-only explicitly. Reapplying a registry with
+the setting omitted preserves the saved choice. For new registrations, point
+the management CLI's `RAZBOR_INDEX_CONFIG` to the mounted service TOML so it
+can use the matching owner's source-only default without contacting the
+service. New review attempts capture the saved preference.
+
+Existing indexed installations can switch individual repositories off while
+keeping their current images and PostgreSQL volume. Keep a pgvector-capable
+PostgreSQL image for databases that already contain vector columns. Disabling
+a repository stops new index grants and refreshes. Leased attempts keep their
+grants, and the existing index is retained.
+
+### Switch an existing NanoCL platform to source-only
+
+1. Disable Codebase Memory for the affected repositories and let active indexed
+   attempts finish. Back up PostgreSQL. Keep the existing namespace, group,
+   storage mounts, credentials and image tags in the private statefile. For a
+   database with pgvector installed, pin the PostgreSQL Cargo to its existing
+   pgvector-capable image even in source-only mode. Preserve the
+   `razbor_postgres_data` and index data volumes.
+2. Render the private statefile with `nanocl state render -s razbor-platform.yml -- --source-only`.
+   The output contains credentials. Inspect it locally and compare the declared
+   resources with the live `razbor-platform` group. The expected removals are
+   the `razbor-embeddings` Cargo and the `razbor-platform.embeddings` Secret.
+   Resolve any other differences before pruning the group.
+3. After inspection, run
+   `nanocl state apply -s razbor-platform.yml --remove-orphans -- --source-only`.
+   NanoCL 0.18.1 prunes omitted group members only with `--remove-orphans`.
+   Check the command output and verify both embeddings resources are gone and
+   the Git source service and database are healthy. Fresh installations use the
+   apply command above without pruning.
+
+To add indexed search to an existing source-only installation, keep its database
+and source volumes. Select the indexed service image and configure `[memory]`.
+For semantic and document search, also select the pgvector-capable database
+image, run `CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;` as the
+database administrator in the existing Razbor database, and run the embedding
+migrations. Start the embeddings service with the matching token and configure
+its endpoint under `[embeddings]` before enabling the repository setting.
 
 ## Build and publish
 
@@ -18,7 +97,7 @@ export RAZBOR_IMAGE_TAG=YOUR_RELEASE_TAG
 bash scripts/publish-images.sh --tag "$RAZBOR_IMAGE_TAG"
 ```
 
-The script builds six images, one at a time, and loads them into Docker. Append
+The script builds eight images, one at a time, and loads them into Docker. Append
 service names to build a subset, such as `web indexer`. It reuses BuildKit layers
 and the matching registry tag as cache sources. Use a new tag for each release.
 
@@ -34,7 +113,7 @@ implicit or empty tag fails before Docker runs. Local loads retain the `0.1.0`
 default. An explicitly selected existing tag can still be overwritten, so select
 a new release tag deliberately.
 
-The script publishes `ghcr.io/next-hat/razbor-{web,indexer,runner,embeddings,postgres,migrate}`
+The script publishes `ghcr.io/next-hat/razbor-{web,source,indexer,runner,embeddings,postgres-core,postgres,migrate}`
 and labels them with the source repository, version, and Git revision. For a fork,
 change the image namespace and source labels in the script and Dockerfiles, then
 update your deployment files. With an edited worktree, the revision label names
@@ -44,20 +123,14 @@ For private packages, the publishing account needs package write permission and
 the deployment account needs read permission for every image. See
 [GitHub's Container registry instructions](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry).
 
-The committed deployment examples pin all six services to the initial Razbor
-release, `0.1.0`: Compose defaults to that tag for every service, with a separate
-web override; Nanocl pins it directly. Commit `2fc6a06` changed these selections
-and the local-build default together, independently of the harness code. They
-remain template defaults, not a statement about the latest release.
+The committed deployment examples select `0.2.0` as the template release tag. Compose
+defaults to that tag, with a separate web override; Nanocl pins it directly.
+These are template selections; verify the published image revisions before applying
+an example to an existing installation.
 
-Source inspection cannot verify the registry contents, migration compatibility,
-or ordering of these artifacts relative to the earlier `0.1.11`/`0.1.12`
-deployment selections. The `0.1.0` tag alone does not establish that an image
-contains the autonomous harness. Verify the intended image revisions and matching
-control-plane/runner versions before applying these examples to an existing
-installation. Choose and publish your intended tags, then update all references.
-Upgrade the control plane before runners when a release changes their protocol or
-review limits.
+Use matching control-plane and runner releases and verify migration compatibility
+with your existing database. Upgrade the control plane before runners when a
+release changes their protocol or review limits.
 
 ## Nanocl 0.18
 
@@ -124,7 +197,7 @@ A fresh volume needs a fresh token. A consumed token cannot enroll a replacement
 identity.
 
 Follow [model and repository setup](getting-started.md#4-connect-your-model-and-repository),
-assign the runner, and check that the webhook and index are ready. Verify a
+assign the runner, and check the webhook and any enabled index. Verify a
 completed review before accepting the deployment.
 
 These statefiles run the platform on one host with an independently enrolled
@@ -141,8 +214,8 @@ Create a private environment file outside the checkout, for example
 `~/razbor-deploy/compose.env`:
 
 ```dotenv
-RAZBOR_IMAGE_TAG=0.1.0
-RAZBOR_WEB_IMAGE_TAG=0.1.0
+RAZBOR_IMAGE_TAG=0.2.0
+RAZBOR_WEB_IMAGE_TAG=0.2.0
 RAZBOR_PUBLIC_URL=https://razbor.example.com
 RAZBOR_ADMIN_USERNAME=admin
 RAZBOR_ADMIN_PASSWORD=REPLACE_WITH_A_PRIVATE_PASSWORD

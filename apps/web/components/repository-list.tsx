@@ -38,6 +38,8 @@ function RepositorySetupBadge({
 }: Readonly<{ repo: Repository; indexState?: string }>) {
   if (repo.status === "deleting")
     return <Badge variant="secondary">Deleting</Badge>;
+  if (!repo.codebaseMemoryEnabled)
+    return <Badge variant="secondary">Codebase Memory: Disabled</Badge>;
   const indexLabels: Record<
     string,
     {

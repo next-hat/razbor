@@ -1,0 +1,8 @@
+# Source service for repositories with Codebase Memory disabled.
+[service]
+owner = "local-indexer"
+host = "0.0.0.0"
+port = 8790
+data_root = "/index-data"
+management_token = { env = "RAZBOR_INDEX_MANAGEMENT_TOKEN" }
+max_reviews = 8

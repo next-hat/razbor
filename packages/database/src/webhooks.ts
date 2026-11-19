@@ -915,6 +915,8 @@ export async function acceptWebhook(
         const current = await context(database, row.repo.publicId);
         if (current.repo.status !== "active" || !current.hook.enabled)
           return outcome(404, "repository-unavailable");
+        if (!current.repo.codebaseMemoryEnabled)
+          return outcome(204, "index-disabled");
         const [duplicate] = await database.db
           .select({ id: webhookDeliveries.id })
           .from(webhookDeliveries)

@@ -8,6 +8,7 @@ import {
   indexPreparationSnapshotsSchema,
   indexPreparationStatusRequestSchema,
   publicIdSchema,
+  sourceHealthSchema,
 } from "@razbor/contracts";
 
 const state = globalThis as typeof globalThis & {
@@ -25,6 +26,50 @@ export const indexPreparationDispatcher =
       bodyTimeout: 0,
     }),
   ));
+
+/**
+ * Read the source owner's authenticated graph capability. A legacy response or failed
+ * probe leaves support unknown, so a transient outage cannot change the saved default.
+ */
+export async function deployedCodebaseMemory(): Promise<boolean | null> {
+  const endpoint = process.env.RAZBOR_INDEX_ENDPOINT;
+  const token = process.env.RAZBOR_INDEX_MANAGEMENT_TOKEN;
+  if (!endpoint || !token) return null;
+  try {
+    const signal = AbortSignal.timeout(3000);
+    const response = await fetch(new URL("/health", endpoint), {
+      headers: { authorization: `Bearer ${token}` },
+      cache: "no-store",
+      redirect: "error",
+      signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      return null;
+    }
+    const health = sourceHealthSchema.parse(
+      await indexerJson(response, signal, 4096),
+    );
+    return health.capabilities?.codebaseMemory ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** Fill an omitted console registration preference using the deployment, preserving explicit settings. */
+export async function withRegistrationIndexDefault(input: unknown) {
+  if (
+    !input ||
+    typeof input !== "object" ||
+    Array.isArray(input) ||
+    "codebaseMemoryEnabled" in input
+  )
+    return input;
+  return {
+    ...input,
+    codebaseMemoryEnabled: (await deployedCodebaseMemory()) ?? true,
+  };
+}
 
 /**
  * Provisions or refreshes a repository workspace through the configured indexer,

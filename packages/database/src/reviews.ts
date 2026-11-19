@@ -390,7 +390,11 @@ async function beginAttemptInTransaction(
     return { kind: "failed" as const };
   }
   const [repo] = await tx
-    .select({ publicId: repositories.publicId, status: repositories.status })
+    .select({
+      publicId: repositories.publicId,
+      status: repositories.status,
+      codebaseMemoryEnabled: repositories.codebaseMemoryEnabled,
+    })
     .from(repositories)
     .where(eq(repositories.id, row.repositoryId));
   if (repo?.status !== "active") return { kind: "failed" as const };
@@ -442,6 +446,7 @@ async function beginAttemptInTransaction(
       reviewId: row.id,
       version: row.version + 1,
       owner,
+      codebaseMemoryEnabled: repo.codebaseMemoryEnabled,
       status: "running",
       leaseUntil: new Date(
         Math.min(
@@ -470,6 +475,7 @@ async function beginAttemptInTransaction(
   return {
     kind: "started" as const,
     attemptId: attempt.publicId,
+    codebaseMemoryEnabled: attempt.codebaseMemoryEnabled,
     leaseUntil: attempt.leaseUntil.getTime(),
     ...(reservation
       ? {

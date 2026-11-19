@@ -209,6 +209,47 @@ function optionalCapabilities(): PreparedCapabilities {
   };
 }
 
+test("only an indexed assignment starts graph navigation and injects its pinned context", async (t) => {
+  const start = t.mock.method(
+    RemoteMemory.prototype,
+    "start",
+    async function (this: RemoteMemory) {
+      this.tools = [{ name: "search_graph", inputSchema: { type: "object" } }];
+    },
+  );
+  const graph = optionalCapabilities().codebaseMemory;
+  for (const codebaseMemory of [undefined, graph]) {
+    const capabilities = new ReviewCapabilities(
+      {
+        instructions: [],
+        skills: [],
+        limits: capabilityLimitsSchema.parse({}),
+        codebaseMemory,
+      },
+      log,
+      new AbortController().signal,
+    );
+    try {
+      await capabilities.start();
+      const names = capabilities.tools.map(
+        (tool) => tool.type === "function" && tool.function.name,
+      );
+      assert.deepEqual(names, codebaseMemory ? ["cbm_search_graph"] : []);
+      if (codebaseMemory) {
+        const prompt = capabilities.instructions.join("\n");
+        assert.ok(prompt.includes(codebaseMemory.indexHeadSha));
+        assert.ok(prompt.includes(codebaseMemory.indexBranch));
+      } else {
+        assert.deepEqual(capabilities.instructions, []);
+        assert.deepEqual(capabilities.limitations, []);
+      }
+      assert.equal(start.mock.callCount(), codebaseMemory ? 1 : 0);
+    } finally {
+      await capabilities.close();
+    }
+  }
+});
+
 test("unavailable optional services close partial clients and expose sanitized limitations", async (t) => {
   const originalMcpToken = process.env.RAZBOR_MCP_TOKEN;
   const originalMemoryToken = process.env.RAZBOR_MEMORY_TOKEN;

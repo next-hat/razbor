@@ -11,7 +11,7 @@ Review the recorded base and head using the available tools. This guide supplies
 
 - Inspect the actual changed hunks and account for the whole manifest. Group related behavior so you can investigate a group before collecting more unrelated source. Track unread changes and concrete blockers.
 - State the contract each significant change affects: accepted inputs, authorization, returned values, ownership, state transitions, externally visible outputs, or cleanup. Compare baseline and head when a regression depends on previous behavior.
-- Trace relevant callers and consumers beyond the diff. Inspect the recorded-head source for guards, helpers, and downstream handling; another changed file may already address the apparent problem. Graph results locate evidence but do not establish current PR behavior or exhaustive coverage.
+- Trace relevant callers and consumers beyond the diff. Inspect the recorded-head source for guards, helpers, and downstream handling; another changed file may already address the apparent problem.
 
 ## Investigate independent failure paths
 
@@ -27,7 +27,7 @@ For each candidate, establish a concrete trigger, the violated contract, the rea
 
 Use a focused existing test, analyzer, typecheck, or non-mutating command when feasible and useful for a specific uncertainty. Follow the project's execution rules and inspect the actual outcome. Do not install dependencies, edit tracked source, or change infrastructure merely to obtain a passing check. If execution is unavailable, continue with source evidence and state the limitation. Lack of a reproduction or an unavailable tool does not by itself disprove a reachable source-supported defect.
 
-Use authoritative external documentation only for material API or protocol questions that local versioned evidence cannot resolve. Keep private code and secrets out of external queries. Do not turn tool errors, empty searches, or partial index coverage into evidence of safety.
+Use authoritative external documentation only for material API or protocol questions that local versioned evidence cannot resolve. Keep private code and secrets out of external queries. Do not turn tool errors, empty searches, or incomplete inspection into evidence of safety.
 
 ## Challenge the conclusion
 

@@ -68,6 +68,7 @@ export type IndexData = {
 };
 
 const labels: Record<string, string> = {
+  disabled: "Disabled",
   ready: "Indexed",
   unready: "Refresh required",
   "not-provisioned": "Not indexed",
@@ -228,7 +229,10 @@ export function IndexPanel({
   const [copyStatus, setCopyStatus] = useState("");
   const [revoking, setRevoking] = useState<string>();
   const [revokeError, setRevokeError] = useState("");
-  const repositories = data?.repositories ?? [];
+  const repositories =
+    data?.repositories.filter(
+      (project) => !["disabled", "deleting", "expired"].includes(project.state),
+    ) ?? [];
   const selectedRepositories = allRepositories
     ? repositories
     : repositories.filter((p) => selectedIds.includes(p.repositoryId));
@@ -359,7 +363,13 @@ export function IndexPanel({
       <IndexTokens
         data={data}
         error={error}
-        repositories={repositories}
+        canGenerate={
+          repositoryId
+            ? repositories.some(
+                (project) => project.repositoryId === repositoryId,
+              )
+            : repositories.length > 0
+        }
         revoking={revoking}
         revokeError={revokeError}
         revoke={revoke}
@@ -529,7 +539,7 @@ export function IndexPanel({
                     ))}
                     {!repositories.length && (
                       <p className="p-3 text-sm text-muted-foreground">
-                        No repositories registered yet.
+                        No repositories have Codebase Memory enabled.
                       </p>
                     )}
                   </div>
@@ -710,30 +720,41 @@ function ProjectIndexes({
                   className="console-table-actions"
                   data-label="Access"
                 >
-                  <div className="flex flex-wrap justify-end gap-2">
-                    <Button
-                      size="sm"
-                      disabled={
-                        !!indexing ||
-                        preparationActive(p) ||
-                        p.state === "deleting" ||
-                        p.state === "expired"
-                      }
-                      onClick={() => void index(p.repositoryId)}
+                  {p.state === "disabled" ? (
+                    <Link
+                      className="text-sm hover:underline"
+                      href={`/repos/${p.repositoryId}/settings`}
                     >
-                      <RefreshCw data-icon="inline-start" />
-                      {indexButtonLabel(p, indexing)}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      disabled={p.state === "deleting" || p.state === "expired"}
-                      onClick={() => open(p.repositoryId)}
-                    >
-                      <KeyRound data-icon="inline-start" />
-                      Generate token
-                    </Button>
-                  </div>
+                      Repository settings
+                    </Link>
+                  ) : (
+                    <div className="flex flex-wrap justify-end gap-2">
+                      <Button
+                        size="sm"
+                        disabled={
+                          !!indexing ||
+                          preparationActive(p) ||
+                          p.state === "deleting" ||
+                          p.state === "expired"
+                        }
+                        onClick={() => void index(p.repositoryId)}
+                      >
+                        <RefreshCw data-icon="inline-start" />
+                        {indexButtonLabel(p, indexing)}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={
+                          p.state === "deleting" || p.state === "expired"
+                        }
+                        onClick={() => open(p.repositoryId)}
+                      >
+                        <KeyRound data-icon="inline-start" />
+                        Generate token
+                      </Button>
+                    </div>
+                  )}
                 </TableCell>
               </TableRow>
             ))}
@@ -799,7 +820,9 @@ function ProjectPreparation({
   starting,
   asOf,
 }: Readonly<{ project: Project; starting: boolean; asOf: string }>) {
-  const unavailable = ["deleting", "expired"].includes(project.state);
+  const unavailable = ["disabled", "deleting", "expired"].includes(
+    project.state,
+  );
   const preparation = unavailable ? null : project.preparation;
   let status;
   if (unavailable) {
@@ -909,7 +932,7 @@ function preparationError(preparation: IndexPreparation) {
 function IndexTokens({
   data,
   error,
-  repositories,
+  canGenerate,
   revoking,
   revokeError,
   revoke,
@@ -917,7 +940,7 @@ function IndexTokens({
 }: Readonly<{
   data?: IndexData;
   error: boolean;
-  repositories: Project[];
+  canGenerate: boolean;
   revoking?: string;
   revokeError: string;
   revoke: (id: string) => Promise<void>;
@@ -1029,11 +1052,7 @@ function IndexTokens({
           <span className="text-xs text-muted-foreground">
             Latest 100 tokens · secret shown only once
           </span>
-          <Button
-            size="sm"
-            disabled={!repositories.length}
-            onClick={() => open()}
-          >
+          <Button size="sm" disabled={!canGenerate} onClick={() => open()}>
             <KeyRound data-icon="inline-start" />
             Generate token
           </Button>

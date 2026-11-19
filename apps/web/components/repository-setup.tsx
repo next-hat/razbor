@@ -95,6 +95,7 @@ export function RepositorySetup({
   const [retrying, setRetrying] = useState(false);
   const [retryError, setRetryError] = useState("");
   const repo = repository.data;
+  const memoryDisabled = repo?.codebaseMemoryEnabled === false;
   const hook = webhook.data;
   const assigned = runners.data?.runners.filter(
     (runner) => runner.allRepositories || runner.repositoryIds.includes(id),
@@ -166,7 +167,7 @@ export function RepositorySetup({
         title="Setup"
         breadcrumbLabel="Setup"
         breadcrumbs={[{ label: "Repositories", href: "/repos" }]}
-        description="Finish the setup checklist. Indexing continues if you leave this page."
+        description="Check the connection, webhook and runner for this repository."
       >
         <span className="console-hero-status min-w-0 max-w-full">
           <GitBranch className="size-4 shrink-0" aria-hidden="true" />
@@ -330,18 +331,24 @@ export function RepositorySetup({
                 : "No delivery has been observed yet. A permitted comment on a pull or merge request will exercise the webhook."}
             </SetupItem>
             <SetupItem
-              title="Initial index"
+              title="Codebase Memory"
               status={
                 <Badge
                   variant={
-                    repo?.setupState === "ready"
-                      ? "success"
-                      : repo?.setupState === "error"
-                        ? "destructive"
-                        : "outline"
+                    memoryDisabled
+                      ? "outline"
+                      : repo?.setupState === "ready"
+                        ? "success"
+                        : repo?.setupState === "error"
+                          ? "destructive"
+                          : "outline"
                   }
                 >
-                  {repo ? indexLabels[repo.setupState] : "Loading"}
+                  {memoryDisabled
+                    ? "Disabled"
+                    : repo
+                      ? indexLabels[repo.setupState]
+                      : "Loading"}
                 </Badge>
               }
               action={
@@ -358,10 +365,12 @@ export function RepositorySetup({
                 )
               }
             >
-              {repo?.setupError ??
-                (repo?.setupState === "ready"
-                  ? "The repository index is ready."
-                  : "The indexer prepares the repository in the background.")}
+              {memoryDisabled
+                ? "Reviews use the repository checkout."
+                : (repo?.setupError ??
+                  (repo?.setupState === "ready"
+                    ? "The repository index is ready."
+                    : "The indexer prepares the repository in the background."))}
             </SetupItem>
             <SetupItem
               title="Reviewer"
@@ -424,7 +433,7 @@ export function RepositorySetup({
                       : "Register a runner or assign an existing host below. A runner executes reviews; the indexer does not replace it."}
             </SetupItem>
           </ul>
-          {(repo?.setupState === "error" ||
+          {((!memoryDisabled && repo?.setupState === "error") ||
             (hook &&
               !["ready", "pending", "disabled"].includes(hook.setup))) && (
             <div className="flex flex-col gap-3">
@@ -523,10 +532,14 @@ export function RepositorySetup({
           <AlertDescription>
             {repo?.reviewCommand ? (
               <>
-                Once the webhook and index are ready and a runner is available
-                with a configured reviewer, open a pull or merge request and
-                comment <code>{repo.reviewCommand}</code> as a permitted user.
-                The bot ignores its own comments.
+                Once{" "}
+                {memoryDisabled
+                  ? "the webhook is ready"
+                  : "the webhook and index are ready"}{" "}
+                and a runner is available with a configured reviewer, open a
+                pull or merge request and comment{" "}
+                <code>{repo.reviewCommand}</code> as a permitted user. The bot
+                ignores its own comments.
               </>
             ) : (
               "The review command will appear when repository access is available."

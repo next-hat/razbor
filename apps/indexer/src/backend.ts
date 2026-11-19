@@ -1,6 +1,13 @@
 import { createHash } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { mkdir, writeFile, lstat, realpath, rm } from "node:fs/promises";
+import { constants, createReadStream } from "node:fs";
+import {
+  access,
+  mkdir,
+  writeFile,
+  lstat,
+  realpath,
+  rm,
+} from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import path from "node:path";
@@ -24,6 +31,14 @@ export const releaseVersion = "0.11.0";
 export const binarySha256 =
   "ce11c141431aeadd788506c3a7e6942db8fd438dec369d0707a39ec9fd8c6510";
 
+/** An unsupported platform or bundle cannot pass verification until its identity changes. */
+export class UnsupportedExecutable extends Error {}
+
+/** Use a short, workspace-specific directory for the daemon's Unix sockets. */
+export function daemonRuntimeDirectory(state: string) {
+  return `/tmp/rdm-${createHash("sha256").update(state).digest("hex").slice(0, 20)}`;
+}
+
 export type BackendConfig = {
   executable: string;
   mode?: "fast" | "moderate" | "full";
@@ -39,15 +54,17 @@ export type BackendConfig = {
  */
 export async function verifyExecutable(executable: string) {
   if (process.platform !== "linux" || process.arch !== "x64")
-    throw new Error(
+    throw new UnsupportedExecutable(
       "configured Codebase Memory portable bundle requires linux/amd64",
     );
   if (!(await lstat(executable)).isFile())
-    throw new Error("Codebase Memory executable must be a regular file");
+    throw new UnsupportedExecutable(
+      "Codebase Memory executable must be a regular file",
+    );
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(executable)) hash.update(chunk);
   if (hash.digest("hex") !== binarySha256)
-    throw new Error(
+    throw new UnsupportedExecutable(
       "Codebase Memory binary does not match the pinned v0.11.0 portable release; run the documented provisioning command",
     );
 }
@@ -90,7 +107,7 @@ export class MemoryBackend {
       CBM_CACHE_DIR: path.join(state, "cache"),
       // Keep AF_UNIX rendezvous paths below the kernel's short path limit.
       // The namespace is private to this exact service-owned state directory.
-      CBM_RUNTIME_DIR: `/tmp/rdm-${createHash("sha256").update(state).digest("hex").slice(0, 20)}`,
+      CBM_RUNTIME_DIR: daemonRuntimeDirectory(state),
       CBM_ALLOWED_ROOT: repository,
       CBM_WORKERS: "2",
       CBM_MEM_BUDGET_MB: "512",
@@ -154,6 +171,7 @@ export class MemoryBackend {
         chunk.subarray(-8192),
       ]).subarray(-8192);
     });
+    await access(this.config.executable, constants.X_OK);
     await this.client.connect(transport, {
       signal: initSignal,
       timeout: this.config.startup_ms,
@@ -453,6 +471,9 @@ export class MemoryBackend {
    * time and output.
    */
   private async command(args: string[], signal?: AbortSignal) {
+    // A failed access check identifies the bundle. A spawn error can also
+    // refer to a missing checkout even when Node reports the executable path.
+    await access(this.config.executable, constants.X_OK);
     return (
       await exec(this.config.executable, args, {
         env: this.env,
@@ -462,6 +483,25 @@ export class MemoryBackend {
         signal,
       })
     ).stdout;
+  }
+
+  /** Require the daemon's explicit stopped status; retain OS errors when status could not run. */
+  private async daemonStopped(signal: AbortSignal) {
+    try {
+      await this.command(["daemon", "status"], signal);
+      return false;
+    } catch (error) {
+      const result = error as { code?: unknown; stdout?: string };
+      if (typeof result.code !== "number")
+        throw new Error(
+          "isolated Codebase Memory daemon status could not be confirmed",
+          { cause: error },
+        );
+      return (
+        result.code === 1 &&
+        String(result.stdout).includes("daemon: not running")
+      );
+    }
   }
 
   /**
@@ -482,24 +522,24 @@ export class MemoryBackend {
     const signal = AbortSignal.timeout(15000);
     try {
       await this.command(["daemon", "stop"], signal);
-    } catch {
-      const stopped = await this.command(["daemon", "status"], signal).then(
-        () => false,
-        (error) =>
-          error.code === 1 &&
-          String(error.stdout).includes("daemon: not running"),
-      );
-      if (!stopped)
-        throw new Error("isolated Codebase Memory daemon could not be stopped");
+    } catch (error) {
+      if (!(await this.daemonStopped(signal)))
+        throw new Error(
+          "isolated Codebase Memory daemon could not be stopped",
+          { cause: error },
+        );
     }
+    let statusError: unknown;
     for (let i = 0; i < 30; i++) {
+      if (signal.aborted && statusError) throw statusError;
       signal.throwIfAborted();
-      const stopped = await this.command(["daemon", "status"], signal).then(
-        () => false,
-        (error) =>
-          error.code === 1 &&
-          String(error.stdout).includes("daemon: not running"),
-      );
+      let stopped = false;
+      try {
+        stopped = await this.daemonStopped(signal);
+        statusError = undefined;
+      } catch (error) {
+        statusError = error;
+      }
       if (stopped) {
         await rm(this.env.CBM_RUNTIME_DIR, { recursive: true, force: true });
         this.log.info(
@@ -510,6 +550,7 @@ export class MemoryBackend {
       }
       await delay(100);
     }
+    if (statusError) throw statusError;
     throw new Error("isolated Codebase Memory daemon did not stop");
   }
 }

@@ -1,5 +1,6 @@
 import { publicIdSchema, type ReviewJobView } from "@razbor/contracts";
 import {
+  getRepository,
   getReview,
   listIndexProjects,
   listTokens,
@@ -56,7 +57,19 @@ export async function apiAccessResponse(
     }
     if (options.resource === "indexer" && segments[3]) {
       const database = await reviewDatabase();
-      if (segments[2] === "indexes") {
+      if (segments[2] === "repositories" && repositoryId) {
+        const repository = await getRepository(
+          database,
+          repositoryId,
+          user.context.id,
+        );
+        if (!repository) throw new AuthError(404, "Repository not found.");
+        if (!repository.codebaseMemoryEnabled)
+          throw new AuthError(
+            409,
+            "Codebase Memory is disabled for this repository.",
+          );
+      } else if (segments[2] === "indexes") {
         const projects = await listIndexProjects(database);
         if (
           !projects.some(

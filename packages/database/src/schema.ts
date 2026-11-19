@@ -274,6 +274,9 @@ export const repositories = pgTable(
     setupError: text("setup_error"),
     indexOwner: text("index_owner").notNull(),
     persistent: boolean("persistent").notNull(),
+    codebaseMemoryEnabled: boolean("codebase_memory_enabled")
+      .notNull()
+      .default(true),
     version: integer("version").notNull().default(1),
   },
   (t) => [
@@ -763,6 +766,9 @@ export const reviewAttempts = pgTable(
       .references(() => reviews.id),
     version: integer("version").notNull(),
     owner: text("owner").notNull(),
+    codebaseMemoryEnabled: boolean("codebase_memory_enabled")
+      .notNull()
+      .default(true),
     runnerId: uuid("runner_id").references(() => runners.id),
     runnerSessionId: uuid("runner_session_id"),
     deadline: timestamp("deadline", { withTimezone: true }),
@@ -858,7 +864,7 @@ export const indexWorkspaces = pgTable(
     ),
     check(
       "workspace_revision_binding",
-      sql`${t.state} <> 'ready' or (${t.headSha} is not null and ${t.indexSha} is not null and (${t.temporary} or ${t.indexSha} = ${t.headSha}))`,
+      sql`${t.state} <> 'ready' or (${t.headSha} is not null and (${t.temporary} or (${t.indexSha} is not null and ${t.indexSha} = ${t.headSha})))`,
     ),
   ],
 );

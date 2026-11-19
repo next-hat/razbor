@@ -7,5 +7,5 @@
     "scripts/**/*.ts",
     "tests/**/*.ts"
   ],
-  "exclude": ["apps/web"]
+  "exclude": ["apps/web", "tests/apps/web"]
 }

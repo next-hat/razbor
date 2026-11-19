@@ -1,0 +1,16 @@
+# Use with docker-compose.yml for a deployment without Codebase Memory.
+services:
+  embeddings:
+    profiles: [indexing]
+  postgres:
+    image: ghcr.io/next-hat/razbor-postgres-core:${RAZBOR_IMAGE_TAG:-0.2.0}
+  migrate:
+    environment:
+      RAZBOR_MIGRATE_EMBEDDINGS: "false"
+  indexer:
+    environment:
+      RAZBOR_EMBEDDINGS_TOKEN: !reset null
+    networks: !override [control, database]
+    image: ghcr.io/next-hat/razbor-source:${RAZBOR_IMAGE_TAG:-0.2.0}
+    volumes:
+      - ${RAZBOR_INDEX_CONFIG:-../../config/source.example.toml}:/index-config/indexer.toml:ro

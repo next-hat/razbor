@@ -1,89 +1,68 @@
-import { spawn } from "node:child_process";
-import { pipeline } from "node:stream/promises";
-import type { ServerResponse } from "node:http";
-import { mkdir, realpath, rm, lstat } from "node:fs/promises";
+import { rm, lstat, realpath, rmdir } from "node:fs/promises";
 import path from "node:path";
 
 import type { IndexPreparation } from "@razbor/contracts";
-import {
-  workspaceState,
-  assertRepositoryActive,
-  type Database,
-  type WorkspacePolicy,
-} from "@razbor/database";
+import { workspaceState, assertRepositoryActive } from "@razbor/database";
 import { deleteEmbeddingIndex } from "@razbor/database/embeddings";
-import { git, gitEnvironment, safeGitOptions } from "@razbor/harness/git";
 import { errorDetails, logger } from "@razbor/harness/logger";
 
-import { MemoryBackend } from "@indexer/src/backend.js";
+import {
+  daemonRuntimeDirectory,
+  MemoryBackend,
+  verifyExecutable,
+} from "@indexer/src/backend.js";
 import type { Embeddings } from "@indexer/src/embeddings.js";
 import { SemanticIndex, semanticSearchTool } from "@indexer/src/semantic.js";
 import { DocumentIndex, documentSearchTool } from "@indexer/src/documents.js";
-import type { IndexerConfig } from "@indexer/src/config.js";
-import { GitSource, WorkspaceDivergedError } from "@indexer/src/source.js";
+import { OwnedWorkspace } from "@indexer/src/review-source.js";
+import { WorkspaceDivergedError } from "@indexer/src/source.js";
 
-// One operation owns a workspace at a time, including queries and cleanup.
-export class IndexWorkspace {
-  private tail: Promise<unknown> = Promise.resolve();
+/** Persistent branch checkout with its own graph and optional semantic and document indexes. */
+export class IndexWorkspace extends OwnedWorkspace {
+  readonly temporary = false;
   private backend?: MemoryBackend;
   private backendInitialized = false;
-  private readonly stop = new AbortController();
   private readyHead?: string;
-  private readonly semantic?: SemanticIndex;
-  private readonly documents?: DocumentIndex;
-  readonly source: GitSource;
+  private semantic?: SemanticIndex;
+  private documents?: DocumentIndex;
 
-  readonly branch: string;
+  /** Retirement permanently cancels this handle, even when durable cleanup must be retried. */
+  get retired() {
+    return this.stop.signal.aborted;
+  }
 
-  /**
-   * Bind a workspace to approved Git policy and optional semantic/document indexes;
-   * temporary review checkouts remain separate from shared indexes.
-   */
-  constructor(
-    readonly id: string,
-    readonly root: string,
-    readonly repositoryId: string,
-    private readonly config: IndexerConfig,
-    readonly temporary: boolean,
-    readonly policy: WorkspacePolicy,
-    private readonly database: Database,
-    embeddings?: Embeddings,
-  ) {
-    this.branch = policy.branch;
-    this.source = new GitSource(
-      path.join(root, "repository"),
-      policy,
-      config.service.sync_ms,
-      database,
-    );
-    if (embeddings) {
+  /** Resolve the configured graph module for operations requiring a persistent index. */
+  private get memory() {
+    if (!this.config.memory)
+      throw new Error("Codebase Memory is not installed");
+    return this.config.memory;
+  }
+
+  /** Attach retrieval clients only when an enabled repository requests preparation. */
+  private bindEmbeddings(embeddings?: Embeddings) {
+    if (embeddings && !this.semantic) {
       this.semantic = new SemanticIndex(
-        database,
+        this.database,
         {
-          owner: config.service.owner,
-          workspaceId: id,
-          repositoryId,
+          owner: this.config.service.owner,
+          workspaceId: this.id,
+          repositoryId: this.repositoryId,
         },
-        config,
+        this.config,
         embeddings,
+        this.memory.mode,
       );
       this.documents = new DocumentIndex(
-        database,
-        { owner: config.service.owner, workspaceId: id, repositoryId },
-        config,
+        this.database,
+        {
+          owner: this.config.service.owner,
+          workspaceId: this.id,
+          repositoryId: this.repositoryId,
+        },
+        this.config,
         embeddings,
       );
     }
-  }
-
-  /**
-   * Queue one workspace operation at a time while allowing later cleanup or retries to
-   * proceed after a rejected operation.
-   */
-  private serial<T>(operation: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(operation);
-    this.tail = result.catch(() => {});
-    return result;
   }
 
   /**
@@ -93,124 +72,80 @@ export class IndexWorkspace {
   private async closeBackend() {
     const backend = this.backend;
     if (backend) {
+      // close() aborts the client even when daemon shutdown cannot be confirmed.
+      this.backendInitialized = false;
       await backend.close();
       this.backend = undefined;
     }
   }
 
-  /**
-   * Serialize creation of an exact temporary review checkout under repository authorization,
-   * cancellation, and the synchronization deadline.
-   */
-  async prepareReviewSource(
-    signal: AbortSignal,
-    revision: { baseSha: string; headSha: string },
-  ) {
-    return this.serial(async () => {
-      if (!this.temporary) throw new Error("review checkout required");
-      const active = AbortSignal.any([
-        signal,
-        this.stop.signal,
-        AbortSignal.timeout(this.config.service.sync_ms),
-      ]);
-      active.throwIfAborted();
-      await assertRepositoryActive(
-        this.database,
-        this.config.service.owner,
-        this.repositoryId,
-      );
-      return this.source.review(revision.baseSha, revision.headSha, active);
-    });
+  /** Stop a known local backend without reading the registry or deleting the checkout during failed shutdown. */
+  stopBackend() {
+    this.cancel();
+    return this.serial(() => this.closeBackend());
   }
 
   /**
-   * Serialize a bounded Git pack stream for the exact base and head commits, checking
-   * repository state and terminating the Git child before releasing workspace ownership.
+   * Recover the previous service's workspace-specific daemon before reusing or deleting its files.
+   * A source-only installation can retire an empty runtime, or preserve an ambiguous one for inspection.
    */
-  async streamReviewSource(
-    response: ServerResponse,
-    revision: { baseSha: string; headSha: string },
-    signal: AbortSignal,
-  ) {
-    return this.serial(async () => {
-      if (!this.temporary) throw new Error("review checkout required");
-      const active = AbortSignal.any([
-        signal,
-        this.stop.signal,
-        AbortSignal.timeout(30000),
-      ]);
-      active.throwIfAborted();
-      await assertRepositoryActive(
-        this.database,
-        this.config.service.owner,
-        this.repositoryId,
-      );
-      for (const sha of [revision.baseSha, revision.headSha])
-        if (
-          (await git(
-            this.source.repository,
-            ["rev-parse", "--verify", `${sha}^{commit}`],
-            active,
-          )) !== sha
-        )
-          throw new Error("source revision mismatch");
-      const format = await git(
-        this.source.repository,
-        ["rev-parse", "--show-object-format"],
-        active,
-      );
-      const child = spawn(
-        "git",
-        [
-          ...safeGitOptions,
-          "-C",
-          this.source.repository,
-          "pack-objects",
-          "--stdout",
-          "--revs",
-        ],
-        {
-          env: gitEnvironment,
-          stdio: ["pipe", "pipe", "ignore"],
-          signal: active,
-          timeout: 30000,
-        },
-      );
-      const done = new Promise<void>((resolve, reject) => {
-        child.once("error", reject);
-        child.once("close", (code) =>
-          code === 0 ? resolve() : reject(new Error("source pack failed")),
-        );
-      });
-      // Attach a rejection handler immediately while the stream is being consumed.
-      void done.catch(() => response.destroy());
-      child.stdin.end(`${revision.baseSha}\n${revision.headSha}\n`);
-      response.writeHead(200, {
-        "content-type": "application/x-git-packed-objects",
-        "cache-control": "no-store",
-        "x-razbor-object-format": format,
-      });
-      try {
-        await pipeline(
-          child.stdout,
-          async function* (chunks) {
-            let bytes = 0;
-            for await (const chunk of chunks) {
-              bytes += chunk.length;
-              if (bytes > 512 * 1024 * 1024)
-                throw new Error("source pack exceeds limit");
-              yield chunk;
-            }
-          },
-          response,
-          { signal: active },
-        );
-        await done;
-      } finally {
-        if (child.exitCode === null) child.kill("SIGKILL");
-        await done.catch(() => {});
-      }
+  private async recoverDaemon(retainWorkspace = false) {
+    if (this.backendInitialized) return;
+    if (this.backend) {
+      await this.closeBackend();
+      return;
+    }
+    const state = path.join(this.root, "state");
+    const runtime = daemonRuntimeDirectory(state);
+    const stat = await lstat(runtime).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+      return undefined;
     });
+    if (!stat) return;
+    if (
+      !stat.isDirectory() ||
+      stat.uid !== process.getuid!() ||
+      (stat.mode & 0o022) !== 0 ||
+      (await realpath(runtime)) !== runtime
+    )
+      throw new Error(
+        `Invalid daemon runtime ownership at ${runtime}. Verify the workspace-specific directory before retrying.`,
+      );
+
+    // Under the service storage lock an empty private namespace has no CBM
+    // listener or lifetime-lock files. rmdir atomically refuses any contents.
+    try {
+      await rmdir(runtime);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOTEMPTY") throw error;
+    }
+    const memory = this.config.memory;
+    let verificationError: unknown;
+    const verified =
+      memory &&
+      (await verifyExecutable(memory.executable).then(
+        () => true,
+        (error: unknown) => {
+          verificationError = error;
+          return false;
+        },
+      ));
+    if (!verified) {
+      const message = `Retained daemon state at ${runtime}. Stop the previous index service, verify its workspace daemon has exited, then remove only this runtime directory and retry cleanup.`;
+      if (!retainWorkspace)
+        throw new Error(message, { cause: verificationError });
+      logger.warn({ workspaceId: this.id }, message);
+      return;
+    }
+    this.backend = new MemoryBackend(
+      memory,
+      this.source.repository,
+      state,
+      this.id,
+      false,
+    );
+    await this.closeBackend();
   }
 
   /**
@@ -228,25 +163,6 @@ export class IndexWorkspace {
         "workspace diverged from upstream; rebuilding checkout and index",
       );
       const state = path.join(this.root, "state");
-      // A previous service process may have left an isolated daemon alive.
-      if (
-        !this.backend &&
-        !this.backendInitialized &&
-        (await lstat(state).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => {
-            if (error.code === "ENOENT") return false;
-            throw error;
-          },
-        ))
-      )
-        this.backend = new MemoryBackend(
-          this.config.memory,
-          this.source.repository,
-          state,
-          this.id,
-          false,
-        );
       await this.closeBackend();
       await rm(state, { recursive: true, force: true });
       // One recovery attempt; clone/index failures remain visible and unready.
@@ -261,16 +177,18 @@ export class IndexWorkspace {
    */
   async prepare(
     signal: AbortSignal,
+    embeddings: Embeddings | undefined,
     reuseReady = false,
     reportProgress?: (progress: Partial<IndexPreparation>) => void,
   ) {
     return this.serial(async () => {
-      if (this.temporary) throw new Error("shared index workspace required");
+      await this.validateStorage(true);
+      this.bindEmbeddings(embeddings);
       const timeoutMs = Math.min(
         3600000,
         this.config.service.sync_ms +
-          this.config.memory.index_ms +
-          this.config.memory.startup_ms +
+          this.memory.index_ms +
+          this.memory.startup_ms +
           (this.config.embeddings?.index_ms ?? 0) +
           30000,
       );
@@ -286,6 +204,7 @@ export class IndexWorkspace {
         this.database,
         this.config.service.owner,
         this.repositoryId,
+        this.policy,
       );
       if (reuseReady && this.backend && this.readyHead) {
         reportProgress?.({ phase: "source_validation" });
@@ -316,7 +235,7 @@ export class IndexWorkspace {
       );
       const started = performance.now();
       let phase = "graph_readiness";
-      let phaseTimeoutMs: number | undefined = this.config.memory.index_ms;
+      let phaseTimeoutMs: number | undefined = this.memory.index_ms;
       /** Record the current preparation phase without estimating corpus completeness. */
       const updatePhase = (
         next: IndexPreparation["phase"],
@@ -327,6 +246,7 @@ export class IndexWorkspace {
         reportProgress?.({ phase: next });
       };
       try {
+        await this.recoverDaemon();
         const previousIndex = await this.backend?.waitForIndex(active);
         updatePhase("source_sync", this.config.service.sync_ms);
         const head = await this.refreshSource(active);
@@ -334,19 +254,19 @@ export class IndexWorkspace {
         if (!this.backend) {
           updatePhase(
             "graph_bootstrap",
-            this.config.memory.startup_ms + this.config.memory.index_ms,
+            this.memory.startup_ms + this.memory.index_ms,
           );
-          this.backendInitialized = true;
           this.backend = new MemoryBackend(
-            this.config.memory,
+            this.memory,
             this.source.repository,
             path.join(this.root, "state"),
             this.id,
             true,
           );
           indexedAt = await this.backend.start(active);
+          this.backendInitialized = true;
         } else {
-          updatePhase("graph_readiness", this.config.memory.index_ms);
+          updatePhase("graph_readiness", this.memory.index_ms);
           await this.backend.validateSource(active);
           // Keep the MCP session alive: its Git watcher notices the new HEAD.
           // Queries remain serialized until a newer index has been published.
@@ -484,7 +404,7 @@ export class IndexWorkspace {
         head,
         input,
         signal,
-        this.config.memory.tool_output_bytes,
+        this.memory.tool_output_bytes,
       );
     }
     if (name === "semantic_search") {
@@ -493,7 +413,7 @@ export class IndexWorkspace {
         head,
         input,
         signal,
-        this.config.memory.tool_output_bytes,
+        this.memory.tool_output_bytes,
       );
     }
     const text = await backend.query(name, input, signal);
@@ -515,7 +435,7 @@ export class IndexWorkspace {
 
   /**
    * Run a serialized operation only against a clean ready index, rechecking repository
-   * activity and any review-pinned revision before granting backend access.
+   * activity, Git policy and any review-pinned revision before granting backend access.
    */
   async access<T>(
     signal: AbortSignal,
@@ -529,10 +449,12 @@ export class IndexWorkspace {
     return this.serial(async () => {
       const active = AbortSignal.any([signal, this.stop.signal]);
       active.throwIfAborted();
+      await this.validateStorage();
       await assertRepositoryActive(
         this.database,
         this.config.service.owner,
         this.repositoryId,
+        this.policy,
       );
       if (!this.backend || !this.readyHead)
         throw new Error("workspace index is not ready; refresh required");
@@ -543,50 +465,37 @@ export class IndexWorkspace {
         throw new Error("workspace revision changed; refresh required");
       }
       await this.source.clean(active);
-      return operation(this.backend, this.readyHead, active);
+      const result = await operation(this.backend, this.readyHead, active);
+      await assertRepositoryActive(
+        this.database,
+        this.config.service.owner,
+        this.repositoryId,
+        this.policy,
+      );
+      active.throwIfAborted();
+      return result;
     });
-  }
-
-  /** Abort current and queued workspace operations through the shared lifetime signal. */
-  cancel() {
-    this.stop.abort(new Error("workspace revoked"));
   }
 
   /**
    * Cancel and serialize teardown, stop the backend before removing source, and either
    * delete index/storage state or mark a retained workspace unready.
    */
-  async close(deleting = this.temporary) {
+  async close(deleting = false) {
     this.cancel();
     await this.serial(async () => {
+      await this.validateStorage();
       this.readyHead = undefined;
       this.semantic?.reset();
       this.documents?.reset();
+      await this.recoverDaemon(!deleting);
+      await this.closeBackend();
       if (deleting)
         await deleteEmbeddingIndex(
           this.database,
           this.config.service.owner,
           this.id,
         );
-      if (deleting && !this.backend && !this.backendInitialized) {
-        const state = path.join(this.root, "state");
-        const exists = await lstat(state).then(
-          () => true,
-          (error: NodeJS.ErrnoException) => {
-            if (error.code === "ENOENT") return false;
-            throw error;
-          },
-        );
-        if (exists)
-          this.backend = new MemoryBackend(
-            this.config.memory,
-            this.source.repository,
-            state,
-            this.id,
-            false,
-          );
-      }
-      await this.closeBackend();
       if (!deleting)
         await workspaceState(
           this.database,
@@ -600,22 +509,5 @@ export class IndexWorkspace {
         "workspace cleanup completed",
       );
     });
-  }
-}
-
-/**
- * Create private service and workspace parent directories, rejecting paths that resolve
- * through symlinks.
- */
-export async function prepareDataRoot(config: IndexerConfig) {
-  const root = config.service.data_root;
-  await mkdir(root, { recursive: true, mode: 0o700 });
-  if ((await realpath(root)) !== root)
-    throw new Error("index data root must not contain symlinks");
-  for (const directory of ["reviews", "development"]) {
-    const full = path.join(root, directory);
-    await mkdir(full, { recursive: true, mode: 0o700 });
-    if ((await realpath(full)) !== full)
-      throw new Error("index workspace parent must not contain symlinks");
   }
 }

@@ -42,18 +42,16 @@ export async function indexData(
   const projects = repositoryId
     ? repositories.filter((project) => project.repositoryId === repositoryId)
     : repositories;
+  const liveProjects = projects.filter(
+    (project) =>
+      project.id &&
+      !["disabled", "deleting", "expired"].includes(project.state),
+  );
   let preparations: Awaited<ReturnType<typeof indexPreparations>> = [];
   let preparationAvailable = true;
   try {
     preparations = await indexPreparations([
-      ...new Set(
-        projects
-          .filter(
-            (project) =>
-              !!project.id && !["deleting", "expired"].includes(project.state),
-          )
-          .map((project) => project.repositoryId),
-      ),
+      ...new Set(liveProjects.map((project) => project.repositoryId)),
     ]);
   } catch {
     preparationAvailable = false;
@@ -62,12 +60,10 @@ export async function indexData(
     preparations.map((entry) => [entry.repositoryId, entry]),
   );
   if (
-    projects.some(
+    liveProjects.some(
       (project) =>
-        project.id &&
-        !["deleting", "expired"].includes(project.state) &&
         preparationByRepository.get(project.repositoryId)?.workspaceId !==
-          project.id,
+        project.id,
     )
   )
     preparationAvailable = false;

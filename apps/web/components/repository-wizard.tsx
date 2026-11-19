@@ -118,6 +118,11 @@ export function RepositoryWizard({
   const [callbackBase, setCallbackBase] = useState("");
   const [senders, setSenders] = useState("");
   const [agentId, setAgentId] = useState<string | null>(null);
+  const [memoryChoice, setMemoryChoice] = useState<boolean>();
+  const [codebaseMemoryAvailable, setCodebaseMemoryAvailable] = useState<
+    boolean | null
+  >(null);
+  const codebaseMemoryEnabled = memoryChoice ?? codebaseMemoryAvailable ?? true;
   const [verified, setVerified] = useState<VerifiedRepository>();
   const [created, setCreated] = useState<{
     id: string;
@@ -148,8 +153,13 @@ export function RepositoryWizard({
     })
       .then(async (response) => {
         if (!response.ok) return;
-        const defaults = (await response.json()) as { callbackBase?: string };
-        if (!controller.signal.aborted && defaults.callbackBase) {
+        const defaults = (await response.json()) as {
+          callbackBase?: string;
+          codebaseMemoryAvailable?: boolean | null;
+        };
+        if (controller.signal.aborted) return;
+        setCodebaseMemoryAvailable(defaults.codebaseMemoryAvailable ?? null);
+        if (defaults.callbackBase) {
           setCallbackBase((current) => current || defaults.callbackBase || "");
         }
       })
@@ -249,6 +259,7 @@ export function RepositoryWizard({
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             ...connectionInput(),
+            codebaseMemoryEnabled,
             ...(agentId ? { agentId } : {}),
             callbackBase: selectedCallback.trim(),
             ...(forgeType === "github" && !usesGithubApp
@@ -604,6 +615,28 @@ export function RepositoryWizard({
                   }
                 />
                 <Field>
+                  <Field orientation="horizontal">
+                    <input
+                      id="repository-codebase-memory"
+                      type="checkbox"
+                      checked={codebaseMemoryEnabled}
+                      onChange={(event) =>
+                        setMemoryChoice(event.target.checked)
+                      }
+                      aria-describedby="repository-codebase-memory-description"
+                      className="size-4 accent-primary"
+                    />
+                    <FieldLabel htmlFor="repository-codebase-memory">
+                      Enable Codebase Memory
+                    </FieldLabel>
+                  </Field>
+                  <FieldDescription id="repository-codebase-memory-description">
+                    {codebaseMemoryAvailable === false
+                      ? "The source service has no usable Codebase Memory bundle. Leave this off for source-only reviews, or configure the service with the supported bundle before running indexed reviews."
+                      : "Index this repository for graph navigation and semantic search. Reviews always receive the full checkout."}
+                  </FieldDescription>
+                </Field>
+                <Field>
                   <FieldLabel htmlFor="repository-senders">
                     Who can request reviews?
                   </FieldLabel>
@@ -674,7 +707,13 @@ export function RepositoryWizard({
                       : []),
                     ["Repository", verified?.fullPath ?? repositoryUrl],
                     ["Bot account", verified?.botLogin],
-                    ["Index branch", verified?.branch],
+                    [
+                      "Codebase Memory",
+                      codebaseMemoryEnabled ? "Enabled" : "Disabled",
+                    ],
+                    ...(codebaseMemoryEnabled
+                      ? [["Index branch", verified?.branch]]
+                      : []),
                     [
                       "AI reviewer",
                       agentId
@@ -696,10 +735,14 @@ export function RepositoryWizard({
                 <Alert>
                   <AlertDescription>
                     {usesGithubApp
-                      ? "Connecting uses your installed GitHub App and starts indexing."
+                      ? "Connecting uses your installed GitHub App."
                       : forgeType === "github"
-                        ? "Connecting saves the bot token and starts indexing. Next, copy the webhook URL and generated secret into GitHub."
-                        : "Connecting saves the bot token, configures the webhook, and starts indexing. You can then copy the generated webhook secret."}{" "}
+                        ? "Connecting saves the bot token. Next, copy the webhook URL and generated secret into GitHub."
+                        : "Connecting saves the bot token and configures the webhook. You can then copy the generated webhook secret."}{" "}
+                    {codebaseMemoryEnabled && codebaseMemoryAvailable === false
+                      ? "Indexed reviews require a source service configured with the supported Codebase Memory bundle. "
+                      : codebaseMemoryEnabled &&
+                        "Indexing starts in the background. "}
                     {canManageRunners
                       ? "You can set up a runner after connecting."
                       : "A super admin manages runner assignments."}

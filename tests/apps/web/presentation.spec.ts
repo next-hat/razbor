@@ -4,10 +4,54 @@ import { test } from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
+import { IndexPanel, type IndexData } from "@razbor/web/index-panel";
 import { ReviewMarkdown } from "@razbor/web/review-markdown";
 import { ReviewResult } from "@razbor/web/review-result";
 import { ReviewLog } from "@razbor/web/review-log";
 import { highlightCode } from "@razbor/web/highlight";
+
+test("disabled Codebase Memory hides index actions and keeps token creation unavailable", () => {
+  const project: IndexData["projects"][number] = {
+    id: null,
+    repositoryId: "repo_fixture",
+    name: "owner/repository",
+    configKey: "fixture",
+    state: "disabled",
+    headSha: null,
+    indexedAt: null,
+    kind: "persistent",
+    canCreateToken: false,
+    preparation: {
+      state: "error",
+      phase: "error",
+      startedAt: "2026-10-20T09:59:00Z",
+      updatedAt: "2026-10-20T10:00:00Z",
+      code: { processed: 0 },
+      documents: { processed: 0 },
+    },
+  };
+  const html = renderToStaticMarkup(
+    createElement(IndexPanel, {
+      repositoryId: project.repositoryId,
+      initialData: {
+        asOf: "2026-10-20T10:00:00Z",
+        preparationAvailable: true,
+        projects: [project],
+        repositories: [project],
+        tokens: [],
+      },
+    }),
+  );
+  assert.match(html, />Disabled</);
+  assert.doesNotMatch(
+    html,
+    />Index repository<|>Refresh index<|>Indexing failed</,
+  );
+  assert.match(
+    html,
+    /<button[^>]*disabled[^>]*>(?:(?!<\/button>).)*Generate token<\/button>/s,
+  );
+});
 
 /** Render review Markdown as static HTML with a repository path for language inference. */
 function render(markdown: string, path = "a.ts") {

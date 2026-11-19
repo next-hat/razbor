@@ -102,3 +102,26 @@ test("local image loads retain their template tag without publishing", async (t)
     "ghcr.io/next-hat/razbor-web:0.1.0",
   );
 });
+
+test("release builds select the source-only stages only for source and postgres-core", async (t) => {
+  const f = await fixture(t);
+  const result = await f.run(["source", "postgres-core", "indexer"]);
+  assert.equal(result.status, 0, result.stderr);
+  const builds = result.docker.slice(1);
+  assert.deepEqual(
+    builds.map((args) => [
+      path.basename(args[args.indexOf("--file") + 1]),
+      args.includes("--target") ? args[args.indexOf("--target") + 1] : null,
+      args[args.indexOf("--tag") + 1],
+    ]),
+    [
+      ["indexer.Dockerfile", "source", "ghcr.io/next-hat/razbor-source:0.1.0"],
+      [
+        "postgres.Dockerfile",
+        "core",
+        "ghcr.io/next-hat/razbor-postgres-core:0.1.0",
+      ],
+      ["indexer.Dockerfile", null, "ghcr.io/next-hat/razbor-indexer:0.1.0"],
+    ],
+  );
+});

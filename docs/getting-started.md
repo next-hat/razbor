@@ -55,8 +55,8 @@ and reloads Docker. Compose does not install Kata for you.
 
 ### 2. Fill in `.env`
 
-Open `.env` in your editor. Generate a **different value for each** of these five
-settings by running `openssl rand -hex 32` five times:
+Open `.env` in your editor. Generate a distinct value with `openssl rand -hex 32`
+for each of these settings. Source-only installations can omit `RAZBOR_EMBEDDINGS_TOKEN`.
 
 ```text
 RAZBOR_DB_BOOTSTRAP_PASSWORD
@@ -72,11 +72,15 @@ keep the file private and reuse it when restarting.
 Uncomment `RAZBOR_ADMIN_PASSWORD` and set a password of at least 12 characters
 for your first console login. The default username is `admin`.
 
-Leave the storage paths at their defaults for this walkthrough, then prepare
-them and download Codebase Memory, the tool used to index repository code:
+Create the jobs and source directories.
 
 ```sh
 mkdir -p "$HOME/.local/share/razbor/jobs" "$HOME/.local/share/razbor/index"
+```
+
+For an indexed installation, download the pinned Codebase Memory binary.
+
+```sh
 bash scripts/provision-cbm.sh "$HOME/.local/share/razbor/cbm"
 ```
 
@@ -87,12 +91,24 @@ default; if your user has a different ID, follow the
 
 ### 3. Start the services and sign in
 
+For source-only development, use Docker Compose 2.24.4+ and run:
+
+```sh
+docker compose -f compose.yml -f compose.source.yml up --build -d
+docker compose -f compose.yml -f compose.source.yml ps -a
+```
+
+Use the same file pair for subsequent Compose commands. When the console detects
+the Git-only service, **Codebase Memory** defaults to off for new connections.
+
+For indexed development, run:
+
 ```sh
 docker compose up --build -d
 docker compose ps -a
 ```
 
-The first start downloads images and local search models, installs dependencies,
+The first indexed start downloads images and local search models, installs dependencies,
 and applies database migrations. It can take a while. Setup services such as
 `dependencies`, `migrate`, and `embedding-model` exit after finishing; an exit
 code of `0` is expected for them.
@@ -140,7 +156,7 @@ For `unknown runtime kata`, finish step 1. For a missing resolver file, see the
    manual webhook setup and check access using a repository URL and token.
    Forgejo and GitLab keep their token-based setup. Choose an agent, enter the
    callback address and allowed command senders, then confirm. Razbor starts
-   indexing. See the [provider setup guide](comment-reviews.md) for details.
+   indexing when **Codebase Memory** is enabled. See the [provider setup guide](comment-reviews.md) for details.
 4. For manual GitHub setup, copy the URL, events, and one-time secret from the
    finish screen into GitHub's repository webhook settings, then send or redeliver
    its ping. App webhooks are configured during App creation; Forgejo and GitLab
@@ -149,7 +165,7 @@ For `unknown runtime kata`, finish step 1. For a missing resolver file, see the
    or register a new runner and run its enrollment command on the runner host.
    A runner is the worker that executes reviews; Compose initially creates it
    with no repository assignments.
-5. Follow the setup checklist: the index and webhook must be ready, and a
+5. Follow the setup checklist: the webhook and any enabled index must be ready, and a
    configured reviewer and available assigned runner are needed for reviews.
    Webhook delivery is reported separately after the first event arrives.
 
@@ -230,7 +246,10 @@ environment, with private database connectivity. It does not load `.env`
 automatically or include uncommitted changes. See the
 [administration guide](persistence.md) for more CLI commands.
 
-The standalone `pnpm run agent` command needs `LLM_BASE_URL`, `LLM_MODEL`, and
-`LLM_API_KEY`, with optional `LLM_PROVIDER` (`openai`, the default, or `anthropic`)
-and `LLM_REASONING_EFFORT`. These host CLI settings are
-separate from agents saved in the console; the Compose setup does not need them.
+The standalone `pnpm run agent` command loads the project’s `.env`. Values already
+exported in your shell take precedence. For OpenAI, set `LLM_BASE_URL=https://api.openai.com/v1`,
+`LLM_MODEL`, and `OPENAI_API_KEY`. The agent appends `/responses` to the base URL.
+For a custom endpoint, set `LLM_BASE_URL`, `LLM_MODEL`, and `LLM_API_KEY`.
+`LLM_API_KEY` takes precedence when set. Optional settings include `LLM_PROVIDER`
+(`openai` by default, or `anthropic`) and `LLM_REASONING_EFFORT`. Reviews submitted
+through the console use the credentials in the assigned reviewer profile.

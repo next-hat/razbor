@@ -3,7 +3,9 @@ import {
   type IncomingMessage,
   type ServerResponse,
 } from "node:http";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
+import { constants } from "node:fs";
+import { access, lstat } from "node:fs/promises";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import path from "node:path";
@@ -20,11 +22,14 @@ import {
   workspaceState,
   assertRepositoryActive,
   recoverRepositoryIndexSetup,
+  reconcileIndexCapability,
   pendingRepositoryIndexes,
   repositoryIndexSetup,
   type Database,
 } from "@razbor/database";
 import {
+  codebaseMemoryUnavailableCode,
+  codebaseMemoryUnavailableMessage,
   reviewRequestSchema,
   publicIdSchema,
   indexPreparationStatusRequestSchema,
@@ -35,12 +40,42 @@ import {
 import { errorDetails, logger } from "@razbor/harness/logger";
 import { embeddingStorageReady } from "@razbor/database/embeddings";
 
-import { verifyExecutable } from "@indexer/src/backend.js";
+import {
+  UnsupportedExecutable,
+  verifyExecutable,
+} from "@indexer/src/backend.js";
 import type { IndexerConfig } from "@indexer/src/config.js";
-import { IndexWorkspace, prepareDataRoot } from "@indexer/src/workspaces.js";
+import { IndexWorkspace } from "@indexer/src/workspaces.js";
+import {
+  ReviewWorkspace,
+  prepareDataRoot,
+  validateWorkspaceStorage,
+} from "@indexer/src/review-source.js";
 import { Tokens, type AccessGrant } from "@indexer/src/tokens.js";
 import { SynchronizationError } from "@indexer/src/source.js";
 import { Embeddings } from "@indexer/src/embeddings.js";
+
+class CodebaseMemoryUnavailable extends Error {
+  /** Carry a public diagnostic without exposing local paths or dependency errors. */
+  constructor(readonly retryable: boolean) {
+    super(
+      retryable
+        ? "Codebase Memory is temporarily unavailable. Retry shortly."
+        : codebaseMemoryUnavailableMessage,
+    );
+  }
+}
+
+/** Identify a missing or permission-denied bundle from the filesystem operation itself. */
+function bundleAccessUnavailable(error: unknown) {
+  const code = (error as NodeJS.ErrnoException)?.code;
+  return (
+    code === "ENOENT" ||
+    code === "ENOTDIR" ||
+    code === "EACCES" ||
+    code === "EPERM"
+  );
+}
 
 const leaseSchema = reviewRequestSchema
   .extend({
@@ -98,31 +133,38 @@ export class IndexService {
   private readonly server = createServer((request, response) => {
     void this.handle(request, response);
   });
-  private readonly workspaces = new Map<string, IndexWorkspace>();
+  private readonly workspaces = new Map<
+    string,
+    IndexWorkspace | ReviewWorkspace
+  >();
   private readonly tokens: Tokens;
   private readonly stop = new AbortController();
   private readonly operations = new Set<Promise<unknown>>();
   private reaper?: ReturnType<typeof setInterval>;
-  private guard?: ChildProcessWithoutNullStreams;
+  private releaseGuard?: () => Promise<void>;
+  private startup?: Promise<number>;
   private closing?: Promise<void>;
   private readonly cleanupPending = new Set<string>();
   private readonly attempts = new Map<string, string>();
+  private readonly preparingIndexedAttempts = new Map<string, string>();
 
   // Review workspace records remain the durable token/attempt boundary. They
-  // lease a shared index revision. Their PR checkout supplies the runner's
-  // pinned Git objects but never gets its own graph or semantic index.
+  // optionally lease a shared index revision independently of their source checkout.
   private readonly reviewIndexes = new Map<
     string,
     {
       workspace: IndexWorkspace;
       headSha: string;
-      baseSha: string;
-      reviewHeadSha: string;
     }
   >();
   private reaping = false;
   private readonly removals = new Map<string, Promise<void>>();
-  private embeddings?: Embeddings;
+  private indexResources?: Promise<Embeddings | undefined>;
+  private binaryCheck?: {
+    identity: string;
+    available: Promise<boolean | null>;
+    retryAt: number;
+  };
   private readonly preparations = new Map<
     string,
     {
@@ -152,11 +194,20 @@ export class IndexService {
    * handling, and schedule token/deletion/index lifecycle maintenance.
    */
   async listen() {
-    await verifyExecutable(this.config.memory.executable);
     this.stop.signal.throwIfAborted();
+    try {
+      return await (this.startup ??= this.start());
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
+  }
+
+  /** Acquire storage and finish recovery before shutdown can reclaim its handles or release the lock. */
+  private async start() {
     await prepareDataRoot(this.config);
     this.stop.signal.throwIfAborted();
-    this.guard = spawn(
+    const guard = spawn(
       "flock",
       [
         "--nonblock",
@@ -167,105 +218,103 @@ export class IndexService {
       ],
       { stdio: ["pipe", "pipe", "pipe"] },
     );
-    this.guard.stderr.resume();
+    const guardClosed = new Promise<void>((resolve) => {
+      guard.once("close", () => resolve());
+    });
+    guard.stderr.resume();
     await new Promise<void>((resolve, reject) => {
-      this.guard!.once("error", reject);
-      this.guard!.once("exit", () =>
+      guard.once("error", reject);
+      guard.once("exit", () =>
         reject(new Error("index storage already active or flock unavailable")),
       );
-      this.guard!.stdout.once("data", () => resolve());
+      guard.stdout.once("data", () => resolve());
     });
-    this.guard.once("exit", () => {
+    /** Release ownership only after flock and its lock-holding child have exited. */
+    this.releaseGuard = () => {
+      guard.stdin.end();
+      return guardClosed;
+    };
+    guard.once("exit", () => {
       if (!this.stop.signal.aborted)
         void this.close().catch(() =>
           logger.error("index shutdown cleanup failed"),
         );
     });
+    this.stop.signal.throwIfAborted();
+    await this.database.ready();
     try {
-      await this.database.ready();
-      if (this.config.embeddings) {
-        await embeddingStorageReady(this.database);
-        this.embeddings = await Embeddings.create(this.config.embeddings);
-        await this.embeddings.ready(this.stop.signal);
-        await this.embeddings.readyDocuments(this.stop.signal);
-      }
       await recoverRepositoryIndexSetup(
         this.database,
         this.config.service.owner,
       );
-      await ensureDevelopmentWorkspaces(
-        this.database,
-        this.config.service.owner,
-        this.config.service.data_root,
-      );
-      for (const w of await ownedWorkspaces(
-        this.database,
-        this.config.service.owner,
-      )) {
-        const parent = path.join(
+      if (this.config.memory)
+        await ensureDevelopmentWorkspaces(
+          this.database,
+          this.config.service.owner,
           this.config.service.data_root,
-          w.temporary ? "reviews" : "development",
         );
-        if (path.dirname(w.root) !== parent)
-          throw new Error("workspace storage ownership mismatch");
-        this.workspaces.set(
+    } catch (error) {
+      // Individual index requests can retry provisioning after an optional setup failure.
+      logger.warn(
+        { error: errorDetails(error) },
+        "initial persistent index setup unavailable",
+      );
+    }
+    for (const w of await ownedWorkspaces(
+      this.database,
+      this.config.service.owner,
+    )) {
+      const workspace = await this.restoreWorkspace(w);
+      if (workspace && w.attemptId) this.attempts.set(w.attemptId, w.id);
+      if (
+        w.temporary ||
+        w.repositoryStatus === "deleting" ||
+        w.state === "deleting"
+      ) {
+        if (workspace)
+          await this.removeWorkspace(w.id).catch((error: unknown) =>
+            logger.warn(
+              { workspaceId: w.id, error: errorDetails(error) },
+              "workspace cleanup will retry",
+            ),
+          );
+      } else
+        await workspaceState(
+          this.database,
+          this.config.service.owner,
           w.id,
-          new IndexWorkspace(
-            w.id,
-            w.root,
-            w.repositoryId,
-            this.config,
-            w.temporary,
-            w.git,
-            this.database,
-            this.embeddings,
+          "unready",
+        ).catch((error: unknown) =>
+          logger.warn(
+            { workspaceId: w.id, error: errorDetails(error) },
+            "persistent index readiness reset failed",
           ),
         );
-        if (w.attemptId) this.attempts.set(w.attemptId, w.id);
-        if (
-          w.temporary ||
-          w.repositoryStatus === "deleting" ||
-          w.state === "deleting"
-        )
-          await this.removeWorkspace(w.id).catch(() =>
-            logger.warn({ workspaceId: w.id }, "workspace cleanup will retry"),
-          );
-        else
-          await workspaceState(
-            this.database,
-            this.config.service.owner,
-            w.id,
-            "unready",
-          );
-      }
-      this.stop.signal.throwIfAborted();
-      await new Promise<void>((resolve, reject) => {
-        this.server.once("error", reject);
-        this.server.listen(
-          this.config.service.port,
-          this.config.service.host,
-          resolve,
-        );
-      });
-      this.reaper = setInterval(() => {
-        if (!this.reaping) {
-          this.reaping = true;
-          this.track(this.reap())
-            .catch(() => logger.error("index lifecycle refresh unavailable"))
-            .finally(() => {
-              this.reaping = false;
-            });
-        }
-      }, 1000).unref();
-      const address = this.server.address();
-      if (!address || typeof address === "string")
-        throw new Error("index service did not bind a TCP port");
-      logger.info({ port: address.port }, "index service listening");
-      return address.port;
-    } catch (error) {
-      await this.close();
-      throw error;
     }
+    this.stop.signal.throwIfAborted();
+    await new Promise<void>((resolve, reject) => {
+      this.server.once("error", reject);
+      this.server.listen(
+        this.config.service.port,
+        this.config.service.host,
+        resolve,
+      );
+    });
+    this.reaper = setInterval(() => {
+      if (!this.reaping) {
+        this.reaping = true;
+        this.track(this.reap())
+          .catch(() => logger.error("index lifecycle refresh unavailable"))
+          .finally(() => {
+            this.reaping = false;
+          });
+      }
+    }, 1000).unref();
+    const address = this.server.address();
+    if (!address || typeof address === "string")
+      throw new Error("index service did not bind a TCP port");
+    logger.info({ port: address.port }, "index service listening");
+    return address.port;
   }
 
   /**
@@ -280,11 +329,135 @@ export class IndexService {
     return operation;
   }
 
+  /** Rebuild the correct workspace handle only after verifying ownership of its stored path. */
+  private async restoreWorkspace(
+    w: Awaited<ReturnType<typeof ownedWorkspaces>>[number],
+  ) {
+    try {
+      await validateWorkspaceStorage(this.config.service.data_root, w);
+    } catch (error) {
+      const firstFailure = !this.cleanupPending.has(w.id);
+      if (firstFailure)
+        logger.warn(
+          {
+            workspaceId: w.id,
+            repositoryId: w.repositoryId,
+            temporary: w.temporary,
+            error: errorDetails(error),
+          },
+          "workspace storage unavailable; verify its owned path before recovery",
+        );
+      if (
+        w.temporary ||
+        w.state === "deleting" ||
+        w.repositoryStatus === "deleting"
+      )
+        this.cleanupPending.add(w.id);
+      if (w.temporary) {
+        // Revoke by durable ID. Keep the unsafe path out of filesystem cleanup
+        // until an operator repairs the mapping and the reaper validates it.
+        if (firstFailure || w.state !== "deleting")
+          this.tokens.cancelWorkspace(w.id);
+        if (w.state !== "deleting") {
+          await startWorkspaceDeletion(
+            this.database,
+            this.config.service.owner,
+            w.id,
+          ).catch((cause: unknown) => {
+            if (firstFailure)
+              logger.warn(
+                { workspaceId: w.id, error: errorDetails(cause) },
+                "workspace revocation will retry",
+              );
+          });
+        }
+      }
+      return;
+    }
+    const Workspace = w.temporary ? ReviewWorkspace : IndexWorkspace;
+    const workspace = new Workspace(
+      w.id,
+      w.root,
+      w.repositoryId,
+      this.config,
+      w.git,
+      this.database,
+    );
+    this.workspaces.set(w.id, workspace);
+    return workspace;
+  }
+
+  /**
+   * Check the configured bundle without starting a graph or contacting embeddings.
+   * Return null for inconclusive I/O. Retry failed hash reads after a short cooldown
+   * and reuse completed digest checks while the file identity and change time match.
+   */
+  private async supportsCodebaseMemory() {
+    const executable = this.config.memory?.executable;
+    if (!executable) return false;
+    try {
+      const stat = await lstat(executable, { bigint: true });
+      if (!stat.isFile()) return false;
+      await access(executable, constants.X_OK);
+      const identity = `${stat.dev}:${stat.ino}:${stat.ctimeNs}`;
+      if (
+        this.binaryCheck?.identity !== identity ||
+        performance.now() >= this.binaryCheck.retryAt
+      ) {
+        const check = {
+          identity,
+          retryAt: Infinity,
+          available: verifyExecutable(executable).then(
+            () => true,
+            (error: unknown) => {
+              if (error instanceof UnsupportedExecutable) return false;
+              check.retryAt = performance.now() + 5000;
+              return bundleAccessUnavailable(error) ? false : null;
+            },
+          ),
+        };
+        this.binaryCheck = check;
+      }
+      // Callers sharing a live read get its fresh result. During the I/O cooldown
+      // the last denial cannot confirm whether the bundle is still inaccessible.
+      return this.binaryCheck.retryAt === Infinity
+        ? this.binaryCheck.available
+        : null;
+    } catch (error) {
+      return bundleAccessUnavailable(error) ? false : null;
+    }
+  }
+
+  /** Distinguish a confirmed deployment mismatch from an inconclusive capability probe. */
+  private async codebaseMemoryFailure() {
+    const available = await this.supportsCodebaseMemory();
+    if (available !== true)
+      return new CodebaseMemoryUnavailable(available === null);
+  }
+
+  /** Load embedding storage and credentials only for an indexed preparation, retrying failures. */
+  private async loadIndexResources() {
+    this.indexResources ??= (async () => {
+      if (!this.config.embeddings) return;
+      await embeddingStorageReady(this.database);
+      return Embeddings.create(this.config.embeddings);
+    })().catch((error: unknown) => {
+      this.indexResources = undefined;
+      throw error;
+    });
+    return this.indexResources;
+  }
+
   /**
    * Load or create the active repository’s shared workspace, replacing its backend when the
    * durable Git policy changes.
    */
-  private async developmentWorkspace(repositoryId: string) {
+  private async developmentWorkspace(
+    repositoryId: string,
+    attemptId?: string,
+  ): Promise<IndexWorkspace> {
+    const failure = await this.codebaseMemoryFailure();
+    if (failure) throw failure;
     await assertRepositoryActive(
       this.database,
       this.config.service.owner,
@@ -295,23 +468,29 @@ export class IndexService {
       this.config.service.owner,
       this.config.service.data_root,
       repositoryId,
+      attemptId,
     );
     const saved = (
       await ownedWorkspaces(this.database, this.config.service.owner)
     ).find((w) => !w.temporary && w.repositoryId === repositoryId);
     if (!saved || !["ready", "unready"].includes(saved.state))
       throw new Error("persistent workspace unavailable");
-    if (
-      path.dirname(saved.root) !==
-      path.join(this.config.service.data_root, "development")
-    )
-      throw new Error("workspace storage ownership mismatch");
+    await validateWorkspaceStorage(this.config.service.data_root, saved, true);
+    const removing = this.removals.get(saved.id);
+    if (removing) {
+      await removing;
+      return this.developmentWorkspace(repositoryId, attemptId);
+    }
     let workspace = this.workspaces.get(saved.id);
-    if (workspace && !isDeepStrictEqual(workspace.policy, saved.git)) {
-      await workspace.close();
-      this.workspaces.delete(saved.id);
-      this.preparationProgress.delete(repositoryId);
-      workspace = undefined;
+    if (workspace?.temporary) throw new Error("shared workspace required");
+    if (workspace && workspace.root !== saved.root)
+      throw new Error("workspace storage ownership mismatch");
+    if (
+      workspace &&
+      (workspace.retired || !isDeepStrictEqual(workspace.policy, saved.git))
+    ) {
+      await this.retireIndex(workspace);
+      return this.developmentWorkspace(repositoryId, attemptId);
     }
     if (!workspace) {
       workspace = new IndexWorkspace(
@@ -319,14 +498,51 @@ export class IndexService {
         saved.root,
         saved.repositoryId,
         this.config,
-        false,
         saved.git,
         this.database,
-        this.embeddings,
       );
       this.workspaces.set(saved.id, workspace);
     }
     return workspace;
+  }
+
+  /** Serialize admission with closure, rechecking the current setting and leases for reaper requests. */
+  private retireIndex(workspace: IndexWorkspace, onlyIfDisabled = false) {
+    const pending = this.removals.get(workspace.id);
+    if (pending) return pending;
+    const retiring = (async () => {
+      if (onlyIfDisabled) {
+        const [saved] = await ownedWorkspaces(
+          this.database,
+          this.config.service.owner,
+          workspace.id,
+        );
+        if (
+          !saved ||
+          (this.config.memory && saved.codebaseMemoryEnabled) ||
+          saved.state === "deleting" ||
+          saved.repositoryStatus === "deleting" ||
+          this.indexedAttempt(workspace.repositoryId) ||
+          [...this.reviewIndexes.values()].some(
+            (lease) => lease.workspace === workspace,
+          )
+        )
+          return;
+      }
+      if (this.workspaces.get(workspace.id) !== workspace) return;
+      await workspace.close();
+      this.workspaces.delete(workspace.id);
+      this.preparationProgress.delete(workspace.repositoryId);
+    })().finally(() => this.removals.delete(workspace.id));
+    this.removals.set(workspace.id, retiring);
+    return retiring;
+  }
+
+  /** Return a waiting indexed attempt whose durable snapshot can authorize shared preparation. */
+  private indexedAttempt(repositoryId: string) {
+    for (const [attemptId, repository] of this.preparingIndexedAttempts)
+      if (repository === repositoryId) return attemptId;
+    return undefined;
   }
 
   /**
@@ -340,45 +556,54 @@ export class IndexService {
       this.config.service.owner,
     )) {
       if (
+        !w.temporary &&
+        (!w.codebaseMemoryEnabled || !this.config.memory) &&
+        w.state !== "deleting" &&
+        w.repositoryStatus !== "deleting"
+      ) {
+        const workspace = this.workspaces.get(w.id);
+        if (workspace && !workspace.temporary && !this.removals.has(w.id)) {
+          void this.track(this.retireIndex(workspace, true)).catch(
+            (error: unknown) =>
+              logger.warn(
+                { workspaceId: w.id, error: errorDetails(error) },
+                "disabled index cleanup will retry",
+              ),
+          );
+        }
+        continue;
+      }
+      if (
         w.state !== "deleting" &&
         w.repositoryStatus !== "deleting" &&
         !(
           w.temporary &&
-          w.expiresAt !== undefined &&
-          w.expiresAt <= Date.now()
-        ) &&
-        !this.cleanupPending.has(w.id)
+          (this.cleanupPending.has(w.id) ||
+            (w.expiresAt !== undefined && w.expiresAt <= Date.now()))
+        )
       )
         continue;
       if (!this.workspaces.has(w.id)) {
-        const parent = path.join(
-          this.config.service.data_root,
-          w.temporary ? "reviews" : "development",
-        );
-        if (path.dirname(w.root) !== parent)
-          throw new Error("workspace storage ownership mismatch");
-        this.workspaces.set(
-          w.id,
-          new IndexWorkspace(
-            w.id,
-            w.root,
-            w.repositoryId,
-            this.config,
-            w.temporary,
-            w.git,
-            this.database,
-            this.embeddings,
-          ),
-        );
+        if (!(await this.restoreWorkspace(w))) continue;
       }
       // Cleanup cancels preparation before it waits for the workspace operation.
       // Keep the reaper available to discover further deletions while it runs.
       if (!this.removals.has(w.id))
-        void this.track(this.removeWorkspace(w.id)).catch(() =>
-          logger.warn({ workspaceId: w.id }, "workspace cleanup will retry"),
+        void this.track(this.removeWorkspace(w.id)).catch((error: unknown) =>
+          logger.warn(
+            { workspaceId: w.id, error: errorDetails(error) },
+            "workspace cleanup will retry",
+          ),
         );
     }
-    await this.preparePendingRepository();
+    const available = await this.supportsCodebaseMemory();
+    if (available === null) return;
+    await reconcileIndexCapability(
+      this.database,
+      this.config.service.owner,
+      available,
+    );
+    if (available) await this.preparePendingRepository();
   }
 
   /**
@@ -430,6 +655,29 @@ export class IndexService {
         },
       );
     });
+  }
+
+  /** Retain direct filesystem evidence of an inaccessible bundle after it recovers. */
+  private async graphPreparationFailure(cause: unknown) {
+    const unavailable = await this.codebaseMemoryFailure();
+    if (unavailable) return unavailable;
+    const executable = this.config.memory?.executable;
+    // Recovery diagnostics preserve the underlying verification or daemon command failure.
+    const error = (
+      cause instanceof Error && cause.cause instanceof Error
+        ? cause.cause
+        : cause
+    ) as NodeJS.ErrnoException | undefined;
+    if (
+      executable &&
+      bundleAccessUnavailable(error) &&
+      error?.path === executable &&
+      (error.syscall === "lstat" ||
+        error.syscall === "open" ||
+        error.syscall === "access")
+    )
+      return new CodebaseMemoryUnavailable(true);
+    return cause;
   }
 
   /**
@@ -492,10 +740,16 @@ export class IndexService {
               this.config.service.owner,
               repositoryId,
               "indexing",
+              undefined,
+              undefined,
+              this.indexedAttempt(repositoryId),
             ))
           )
             throw new Error("repository unavailable");
-          workspace = await this.developmentWorkspace(repositoryId);
+          workspace = await this.developmentWorkspace(
+            repositoryId,
+            this.indexedAttempt(repositoryId),
+          );
           entry.workspace = workspace;
           // Policy replacement discards old metadata; this job starts a fresh snapshot.
           if (!this.preparationProgress.has(repositoryId))
@@ -509,6 +763,7 @@ export class IndexService {
             });
           const binding = await workspace.prepare(
             this.stop.signal,
+            await this.loadIndexResources(),
             reuseReady,
             reportProgress,
           );
@@ -521,6 +776,8 @@ export class IndexService {
               "ready",
               undefined,
               workspace.policy,
+              this.indexedAttempt(repositoryId),
+              binding,
             ))
           )
             throw new Error("repository unavailable");
@@ -530,17 +787,31 @@ export class IndexService {
             finishedAt: new Date().toISOString(),
           });
           return binding;
-        } catch (error) {
+        } catch (cause) {
+          // The verified bundle can disappear between admission and graph startup.
+          const phase = this.preparationProgress.get(repositoryId)?.phase;
+          const error =
+            (phase === "graph_bootstrap" || phase === "graph_readiness") &&
+            !(cause instanceof SynchronizationError) &&
+            !this.stop.signal.aborted
+              ? await this.graphPreparationFailure(cause)
+              : cause;
           try {
             await repositoryIndexSetup(
               this.database,
               this.config.service.owner,
               repositoryId,
-              this.stop.signal.aborted ? "pending" : "error",
-              error instanceof SynchronizationError
+              this.stop.signal.aborted
+                ? "pending"
+                : error instanceof CodebaseMemoryUnavailable && error.retryable
+                  ? "interrupted"
+                  : "error",
+              error instanceof SynchronizationError ||
+                error instanceof CodebaseMemoryUnavailable
                 ? error.message
                 : "Indexing failed. Verify repository access and retry setup.",
               workspace?.policy,
+              this.indexedAttempt(repositoryId),
             );
           } catch (setupError) {
             logger.warn(
@@ -621,10 +892,14 @@ export class IndexService {
    */
   private async handle(request: IncomingMessage, response: ServerResponse) {
     const abort = new AbortController();
-    /** Cancel request work when the client aborts or its response connection closes. */
+    /** Stop work when the request body was interrupted. */
     const cancel = () => abort.abort();
+    /** A normal response close may precede the source pack child's exit notification. */
+    const disconnected = () => {
+      if (!response.writableFinished) cancel();
+    };
     request.once("aborted", cancel);
-    response.once("close", cancel);
+    response.once("close", disconnected);
     const signal = AbortSignal.any([abort.signal, this.stop.signal]);
     try {
       await this.track(this.route(request, response, signal));
@@ -639,17 +914,23 @@ export class IndexService {
         },
         "index request failed",
       );
-      if (!response.headersSent && !response.destroyed)
+      if (!response.headersSent && !response.destroyed) {
+        if (error instanceof CodebaseMemoryUnavailable && !error.retryable)
+          response.setHeader(
+            "x-razbor-error-code",
+            codebaseMemoryUnavailableCode,
+          );
         json(response, error instanceof z.ZodError ? 400 : 503, {
           error:
-            error instanceof SynchronizationError
+            error instanceof SynchronizationError ||
+            error instanceof CodebaseMemoryUnavailable
               ? error.message
               : "index operation failed or workspace is not ready",
         });
-      else response.destroy();
+      } else response.destroy();
     } finally {
       request.off("aborted", cancel);
-      response.off("close", cancel);
+      response.off("close", disconnected);
     }
   }
 
@@ -733,7 +1014,10 @@ export class IndexService {
         has_more: next < scopes.length,
         ...(next < scopes.length ? { next_offset: next } : {}),
       });
-      if (Buffer.byteLength(text) <= this.config.memory.tool_output_bytes)
+      if (
+        this.config.memory &&
+        Buffer.byteLength(text) <= this.config.memory.tool_output_bytes
+      )
         return text;
       if (projects.length <= 1)
         throw new Error("project list entry exceeds output limit");
@@ -787,26 +1071,25 @@ export class IndexService {
     if (request.method === "GET" && source && grant) {
       const id = this.attempts.get(source[1]);
       const workspace = id ? this.workspaces.get(id) : undefined;
-      const pinned = id ? this.reviewIndexes.get(id) : undefined;
-      if (
-        !workspace ||
-        !pinned ||
-        !workspace.temporary ||
-        grant.workspace !== id
-      )
-        throw new Error("source access does not match attempt");
-      const activeGrant = await this.tokens.authorizeWorkspace(
-        token,
-        workspace.id,
-        workspace.repositoryId,
-      );
+      if (!workspace || !workspace.temporary || grant.workspace !== id) {
+        json(response, 403, { error: "source access does not match attempt" });
+        return;
+      }
       await workspace.streamReviewSource(
         response,
-        {
-          baseSha: pinned.baseSha,
-          headSha: pinned.reviewHeadSha,
-        },
-        AbortSignal.any([signal, activeGrant.stop.signal]),
+        AbortSignal.any([
+          signal,
+          grant.stop.signal,
+          ...(grant.expiresAt
+            ? [AbortSignal.timeout(Math.max(1, grant.expiresAt - Date.now()))]
+            : []),
+        ]),
+        () =>
+          this.tokens.authorizeWorkspace(
+            token,
+            workspace.id,
+            workspace.repositoryId,
+          ),
       );
       return;
     }
@@ -824,7 +1107,7 @@ export class IndexService {
       );
       return;
     }
-    if (url.pathname === "/mcp" && grant) {
+    if (url.pathname === "/mcp" && grant && this.config.memory) {
       await this.serveMcp(request, response, url, signal, token, grant);
       return;
     }
@@ -843,7 +1126,13 @@ export class IndexService {
   ) {
     if (request.method === "GET" && url.pathname === "/health") {
       await this.database.ready();
-      json(response, 200, { status: "ready" });
+      const codebaseMemory = await this.supportsCodebaseMemory();
+      json(response, 200, {
+        status: "ready",
+        ...(codebaseMemory === null
+          ? {}
+          : { capabilities: { codebaseMemory } }),
+      });
       return true;
     }
     if (request.method === "POST" && url.pathname === "/index-progress") {
@@ -859,6 +1148,7 @@ export class IndexService {
         if (
           !requested.has(workspace.repositoryId) ||
           workspace.temporary ||
+          !workspace.codebaseMemoryEnabled ||
           workspace.repositoryStatus !== "active" ||
           !["ready", "unready"].includes(workspace.state)
         )
@@ -961,73 +1251,89 @@ export class IndexService {
       lease,
     );
     const id = saved.id;
-    const workspace = new IndexWorkspace(
+    const workspace = new ReviewWorkspace(
       id,
       saved.root,
       lease.repositoryId,
       this.config,
-      true,
       saved.git,
       this.database,
-      this.embeddings,
     );
     this.workspaces.set(id, workspace);
     this.attempts.set(lease.attemptId, id);
     const started = performance.now();
-    let phase = "shared_index";
+    let phase = "review_source";
     try {
-      const shared = await this.developmentWorkspace(lease.repositoryId);
-      const binding = await this.prepareRepository(
-        lease.repositoryId,
-        signal,
-        true,
-      );
-      // Git credentials stay indexer-side. The runner snapshots this exact PR
-      // checkout, while all graph/semantic queries use the shared branch index.
-      phase = "review_source";
+      if (saved.codebaseMemoryEnabled) {
+        const failure = await this.codebaseMemoryFailure();
+        if (failure) throw failure;
+      }
       await workspace.prepareReviewSource(signal, lease);
-      phase = "review_access";
-      const access = await shared.access(
-        signal,
-        async (_backend, head, active) => {
-          await workspaceState(
-            this.database,
-            this.config.service.owner,
-            id,
-            "ready",
-            lease.headSha,
-            undefined,
-            head,
-          );
-          active.throwIfAborted();
-          const access = await this.tokens.issue(id, lease.ttlMs);
-          this.reviewIndexes.set(id, {
-            workspace: shared,
-            headSha: head,
-            baseSha: lease.baseSha,
-            reviewHeadSha: lease.headSha,
-          });
-          active.throwIfAborted();
-          return access;
-        },
-        binding.headSha,
-      );
+
+      /** Publish the verified checkout before issuing its attempt-scoped token. */
+      const issue = async (indexSha: string | null, active: AbortSignal) => {
+        await workspaceState(
+          this.database,
+          this.config.service.owner,
+          id,
+          "ready",
+          lease.headSha,
+          undefined,
+          indexSha,
+        );
+        active.throwIfAborted();
+        const access = await this.tokens.issue(id, lease.ttlMs);
+        active.throwIfAborted();
+        return access;
+      };
+
+      let index:
+        | { project: string; indexHeadSha: string; indexBranch: string }
+        | undefined;
+      let access: Awaited<ReturnType<typeof issue>>;
+      if (saved.codebaseMemoryEnabled) {
+        phase = "shared_index";
+        this.preparingIndexedAttempts.set(lease.attemptId, lease.repositoryId);
+        const shared = await this.developmentWorkspace(
+          lease.repositoryId,
+          lease.attemptId,
+        );
+        const binding = await this.prepareRepository(
+          lease.repositoryId,
+          signal,
+          true,
+        );
+        access = await shared.access(
+          signal,
+          async (_backend, head, active) => {
+            const access = await issue(head, active);
+            this.reviewIndexes.set(id, { workspace: shared, headSha: head });
+            return access;
+          },
+          binding.headSha,
+        );
+        index = {
+          project: binding.project,
+          indexHeadSha: binding.headSha,
+          indexBranch: shared.policy.branch,
+        };
+      } else {
+        phase = "review_access";
+        access = await issue(null, signal);
+      }
       logger.info(
         {
           reviewId: lease.reviewId,
           attemptId: lease.attemptId,
           headSha: lease.headSha,
-          indexHeadSha: binding.headSha,
-          project: shared.id,
+          ...index,
           expiresAt: access.expiresAt,
         },
-        "review MCP access issued",
+        "review workspace access issued",
       );
       json(response, 201, {
-        project: binding.project,
         headSha: lease.headSha,
-        indexHeadSha: binding.headSha,
-        indexBranch: shared.branch,
+        ...index,
         ...access,
         attemptId: lease.attemptId,
       });
@@ -1048,6 +1354,8 @@ export class IndexService {
       );
       await this.removeWorkspace(id);
       throw error;
+    } finally {
+      this.preparingIndexedAttempts.delete(lease.attemptId);
     }
   }
 
@@ -1073,7 +1381,11 @@ export class IndexService {
       json(response, 403, { error: "refresh permission required" });
       return;
     }
-    const workspace = this.workspaces.get(workspaceId);
+    const [workspace] = await ownedWorkspaces(
+      this.database,
+      this.config.service.owner,
+      workspaceId,
+    );
     if (!workspace || workspace.temporary) {
       json(response, 404, { error: "unknown repository ID" });
       return;
@@ -1093,6 +1405,7 @@ export class IndexService {
         workspace.id,
         workspace.repositoryId,
       );
+    await this.developmentWorkspace(workspace.repositoryId);
     const binding = await this.prepareRepository(
       workspace.repositoryId,
       active,
@@ -1120,8 +1433,13 @@ export class IndexService {
     grant: AccessGrant,
   ) {
     const leased = this.reviewIndexes.get(grant.workspace);
-    const workspace = leased?.workspace ?? this.workspaces.get(grant.workspace);
-    if (!grant.multipleProjects && (!workspace || workspace.temporary)) {
+    const candidate = leased?.workspace ?? this.workspaces.get(grant.workspace);
+    if (candidate?.temporary) {
+      json(response, 403, { error: "index access not granted" });
+      return;
+    }
+    const workspace = candidate;
+    if (!grant.multipleProjects && !workspace) {
       json(response, 503, { error: "workspace unavailable" });
       return;
     }
@@ -1183,11 +1501,11 @@ export class IndexService {
             if (!authorized)
               throw new Error("token does not authorize this workspace");
             const selectedLease = this.reviewIndexes.get(project);
-            selectedWorkspace =
+            const selected =
               selectedLease?.workspace ?? this.workspaces.get(project);
-            const selected = selectedWorkspace;
             if (!selected || selected.temporary)
               throw new Error("workspace unavailable");
+            selectedWorkspace = selected;
             await this.tokens.authorizeWorkspace(
               token,
               project,
@@ -1276,6 +1594,9 @@ export class IndexService {
   close(): Promise<void> {
     this.closing ??= (async () => {
       this.stop.abort();
+      // A signal can arrive while startup is restoring files or binding HTTP.
+      await this.startup?.catch(() => {});
+      if (!this.releaseGuard) return;
       clearInterval(this.reaper);
       this.tokens.close();
       this.server.closeAllConnections();
@@ -1300,10 +1621,29 @@ export class IndexService {
             : workspace.close(),
         ),
       );
-      this.guard?.stdin.end();
       if (results.some((result) => result.status === "rejected"))
         throw new Error("index workspace cleanup failed");
-    })();
+    })()
+      .catch(async (error: unknown) => {
+        // An unavailable registry or invalid checkout must not bypass shutdown
+        // of clients we already own. Keep files and durable state for recovery.
+        await Promise.all(
+          [...this.workspaces.values()].map(async (workspace) => {
+            workspace.cancel();
+            if (!workspace.temporary)
+              await workspace
+                .stopBackend()
+                .catch((cause: unknown) =>
+                  logger.error(
+                    { workspaceId: workspace.id, error: errorDetails(cause) },
+                    "workspace backend shutdown could not be confirmed",
+                  ),
+                );
+          }),
+        );
+        throw error;
+      })
+      .finally(() => this.releaseGuard?.());
     return this.closing;
   }
 }

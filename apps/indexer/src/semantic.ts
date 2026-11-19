@@ -88,8 +88,9 @@ export class SemanticIndex {
     private readonly scope: EmbeddingScope,
     private readonly config: IndexerConfig,
     private readonly embeddings: Embeddings,
+    mode: NonNullable<IndexerConfig["memory"]>["mode"],
   ) {
-    this.chunkerVersion = `semantic-chunks-v1:cbm-${releaseVersion}:${config.memory.mode}`;
+    this.chunkerVersion = `semantic-chunks-v1:cbm-${releaseVersion}:${mode}`;
   }
 
   /**

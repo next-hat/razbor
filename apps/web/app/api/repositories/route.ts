@@ -18,6 +18,7 @@ import {
   requestSessionToken,
 } from "@web/lib/auth.js";
 import { reviewDatabase } from "@web/lib/review.js";
+import { withRegistrationIndexDefault } from "@web/lib/indexer.js";
 import {
   managementRequest,
   managementJson,
@@ -72,7 +73,7 @@ export async function POST(request: Request) {
     const database = await reviewDatabase();
     const repository = await createRepositoryFromUi(
       database,
-      await managementJson(request),
+      await withRegistrationIndexDefault(await managementJson(request)),
       requestSessionToken(request),
       await requestContextId(request),
     );

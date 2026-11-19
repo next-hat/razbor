@@ -123,11 +123,17 @@ test("agent explores callers and pinned source exclusively through exec before r
   const f = await diffFixture();
   try {
     const model = provider(t, [
-      () => [
-        command("diff", ["git", "diff", f.base, f.head, "--", "source.ts"]),
-        command("caller", ["cat", "related.ts"]),
-        command("source", ["git", "show", `${f.head}:source.ts`]),
-      ],
+      (body) => {
+        assert.doesNotMatch(
+          JSON.stringify([body.input, body.tools]),
+          /cbm_|Codebase Memory|shared graph|graph navigation|indexed branch/i,
+        );
+        return [
+          command("diff", ["git", "diff", f.base, f.head, "--", "source.ts"]),
+          command("caller", ["cat", "related.ts"]),
+          command("source", ["git", "show", `${f.head}:source.ts`]),
+        ];
+      },
       (body) => {
         const transcript = JSON.stringify(body.input);
         assert.match(transcript, /new implementation/);
@@ -1502,7 +1508,7 @@ for (const mode of ["fit", "oversized", "pressure"] as const) {
               return measuredReply(body, {
                 notes:
                   "Earlier exploration returned unverified observations. Prior obligations remain unresolved and retained separately. " +
-                  "n".repeat(oversizedNote ? 14000 : 6000),
+                  "n".repeat(oversizedNote ? 20000 : 6000),
                 evidenceIds: [],
               });
             }
