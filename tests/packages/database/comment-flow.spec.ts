@@ -165,6 +165,8 @@ test(
     let loseStatusDelete = true;
     let auditCommentBody: string | undefined;
     let auditCommentResolved = false;
+    let fixedReply:
+      { id: number; path: string; body: string; user: typeof bot } | undefined;
     let recapBody = "";
     let maskStatusEdit = false;
     const deletions: number[] = [];
@@ -348,7 +350,17 @@ test(
         }
         return reply(native);
       }
-      if (route.endsWith("/reviews/20/comments"))
+      if (route.endsWith("/reviews/20/comments")) {
+        if (req.method === "POST") {
+          assert.equal(fixedReply, undefined);
+          fixedReply = {
+            id: 22,
+            body: input.body,
+            path: input.path,
+            user: bot,
+          };
+          return reply({ id: fixedReply.id });
+        }
         return reply([
           {
             id: 21,
@@ -359,7 +371,9 @@ test(
             user: bot,
             resolver: auditCommentResolved ? bot : null,
           },
+          ...(fixedReply ? [fixedReply] : []),
         ]);
+      }
       const followup = /\/reviews\/(\d+)\/comments$/.exec(route);
       if (followup)
         return reply(followupComments.get(Number(followup[1])) ?? []);
@@ -1075,6 +1089,7 @@ test(
         "only the missing canonical finding requires evidence; its exact resolution retires the duplicate",
       );
       native.splice(missingNative, 0, missingReview);
+      auditCommentResolved = false;
       assert.equal(await deliver("recurrence-after-resolution", 18), 202);
       const [recurrence] = await listReviews(db);
       const recurrenceAttempt = await beginAttempt(
@@ -1084,7 +1099,15 @@ test(
         30000,
       );
       assert.equal(recurrenceAttempt.kind, "started");
-      const unanchored = { ...secondFinding, path: "outside-diff.ts" };
+      const moved = {
+        ...secondFinding,
+        title: "A second cache survives",
+        body: secondFinding.body.toUpperCase(),
+        lineStart: 2,
+        lineEnd: 2,
+      };
+      assert.equal(findingKey(moved), findingKey(secondFinding));
+      const unanchored = { ...moved, path: "outside-diff.ts" };
       await finishAttempt(
         db,
         recurrence.id,
@@ -1092,7 +1115,15 @@ test(
         "test",
         {
           summary: "The issue returned after the earlier resolution.",
-          findings: [secondFinding, unanchored],
+          findings: [moved, unanchored],
+          findingChecks: [
+            {
+              id: old.id,
+              status: "resolved",
+              evidence:
+                "The original location is fixed. A separate occurrence remains.",
+            },
+          ],
         },
       );
       await processInteraction(db, recurrence.id);
@@ -1100,6 +1131,12 @@ test(
         ?.publication;
       assert.equal(recurrencePublication?.state, "published");
       assert.deepEqual(recurrencePublication.openFindingOwners, {});
+      assert.ok(
+        fixedReply?.body.endsWith(
+          `<!-- razbor:${review.id}:${findingKey(secondFinding)}:fixed -->`,
+        ),
+      );
+      auditCommentResolved = true;
       const [recurrenceComment] = followupComments.get(
         Number(recurrencePublication.remoteId),
       )!;

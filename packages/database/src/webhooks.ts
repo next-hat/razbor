@@ -13,6 +13,7 @@ import {
 } from "@razbor/contracts";
 import { logger } from "@razbor/harness/logger";
 import {
+  approvedUrl,
   verifyRepository,
   renderReview,
   forgeMarkdown,
@@ -30,7 +31,9 @@ import {
 import {
   acceptReviewTrigger,
   allowsAutomaticAuthor,
+  consoleFindingSnapshot,
   lockReviewTriggerChanges,
+  previousConsoleFindings,
   reviewSubmissionLock,
   reviewTriggerSession,
   triggerDelivery,
@@ -208,6 +211,14 @@ export async function triageForge(database: Database, repositoryId: string) {
     .where(eq(repositories.id, repositoryId));
   if (!row?.repo.verifiedAt || row.repo.status !== "active")
     throw new ForgeOperationError("permission");
+  // The registry can allow HTTP for development. Triage authenticates even its
+  // preflight reads, so validate the destination before resolving credentials.
+  try {
+    approvedUrl(row.forge.apiUrl, false);
+    approvedUrl(row.forge.webUrl, false);
+  } catch {
+    throw new ForgeOperationError("permission");
+  }
   const api = await adapter(database, row, 30000, true);
   const bot = await api.identity();
   if (row.hook?.botId && row.hook.botId !== bot.id)
@@ -292,6 +303,13 @@ type MergeFindingAudit = {
   assessed: Map<string, "resolved" | "open" | "uncertain">;
 };
 
+/** Console result indexes distinguish same-key occurrences; provider publications retain their original marker identity. */
+function mergeFindingIdentity(old: PreviousFinding) {
+  return old.id.startsWith(`console:${old.reviewId}:`)
+    ? old.id
+    : `${old.reviewId}:${findingKey(old.finding)}`;
+}
+
 /** Record only assessments of exact prior finding identities captured by trusted review admission. */
 function recordMergeFindingChecks(
   audit: MergeFindingAudit,
@@ -302,12 +320,24 @@ function recordMergeFindingChecks(
   );
   for (const check of review.result?.findingChecks ?? []) {
     const old = snapshot.get(check.id);
-    if (old)
-      audit.assessed.set(
-        `${old.reviewId}:${findingKey(old.finding)}`,
-        check.status,
-      );
+    if (old) audit.assessed.set(mergeFindingIdentity(old), check.status);
   }
+}
+
+/** Identify representatives retired by this exact admission snapshot, including in older frozen publications. */
+function resolvedFindingOwners(
+  review: Pick<typeof reviews.$inferSelect, "result" | "source">,
+) {
+  const resolved = new Set(
+    review.result?.findingChecks
+      ?.filter((check) => check.status === "resolved")
+      .map((check) => check.id),
+  );
+  return new Set(
+    review.source.previousFindings
+      ?.filter((old) => resolved.has(old.id))
+      .map((old) => `${old.reviewId}:${findingKey(old.finding)}`),
+  );
 }
 
 /**
@@ -400,13 +430,19 @@ async function previousFindings(
   for (const { review, publication } of history) {
     if (review.publicId === excludeReviewId || review.source.conversation)
       continue;
+    const resolvedOwners = resolvedFindingOwners(review);
+    const savedOwners = new Map(
+      Object.entries(publication?.openFindingOwners ?? {}).filter(
+        ([key, owner]) => !resolvedOwners.has(`${owner}:${key}`),
+      ),
+    );
     // Publication may ignore an unseen remote comment. Merge authorization requires
     // a positive accounting for each persisted finding even if the actor or marker disappeared.
     if (mergeAudit)
       for (const finding of review.result?.findings ?? []) {
         const key = findingKey(finding);
         const identity = `${review.publicId}:${key}`;
-        const owner = publication?.openFindingOwners?.[key];
+        const owner = savedOwners.get(key);
         // The original identity is audited in its own right. Without a frozen
         // link to an earlier result, the absent marker still needs explicit proof.
         if (
@@ -446,7 +482,7 @@ async function previousFindings(
       for (const finding of review.result?.findings ?? []) {
         const key = findingKey(finding);
         const independent = publication.openFindingOwners
-          ? !publication.openFindingOwners[key]
+          ? !savedOwners.has(key)
           : publication.suppressedFindings?.[key] ||
             (!publishedKeys.has(key) && !snapshotKeys.has(key));
         publishedKeys.add(key);
@@ -479,7 +515,7 @@ async function previousFindings(
         if (
           publication.suppressedFindings?.[key] ||
           (publication.openFindingOwners &&
-            !publication.openFindingOwners[key] &&
+            !savedOwners.has(key) &&
             publication.reviewPayload &&
             !publication.reviewPayload.comments.some(
               (comment) =>
@@ -589,11 +625,20 @@ async function previousFindings(
   for (const old of recapFindings.values())
     rememberOpenOwner(findingKey(old.finding), old.reviewId);
   // Do not silently omit old findings and then congratulate an incomplete review.
+  const published = previousFindingsSchema.parse([
+    ...previous,
+    ...recapFindings.values(),
+  ]);
+  const consoleFindings = await previousConsoleFindings(
+    database.db,
+    repositoryId,
+    number,
+    excludeReviewId,
+  );
   return {
-    findings: previousFindingsSchema.parse([
-      ...previous,
-      ...recapFindings.values(),
-    ]),
+    findings: excludeReviewId
+      ? [...published, ...consoleFindings]
+      : consoleFindingSnapshot(consoleFindings, published),
     targets,
     openOwners,
     recapReviewId,
@@ -614,11 +659,7 @@ export async function triageOutstanding(
   review: Pick<typeof reviews.$inferSelect, "publicId" | "result" | "source">,
 ) {
   const audit: MergeFindingAudit = {
-    missing: new Set(
-      review.source.previousFindings?.map(
-        (old) => `${old.reviewId}:${findingKey(old.finding)}`,
-      ),
-    ),
+    missing: new Set(review.source.previousFindings?.map(mergeFindingIdentity)),
     assessed: new Map(),
   };
   const { findings } = await previousFindings(
@@ -651,7 +692,7 @@ export async function triageOutstanding(
           findingKey(old.finding) === key,
       )
     )
-      unresolved.add(`${finding.reviewId}:${key}`);
+      unresolved.add(mergeFindingIdentity(finding));
   }
   // Historical or incomplete results may predate validation at completion.
   // Unbound or missing assessments cannot be cleared by a provider read.
@@ -2677,10 +2718,12 @@ export async function processInteraction(database: Database, reviewId: string) {
         // A resolved original cannot represent a recurrence. Publish that
         // finding under this review's own revision and identity.
         const openFindingOwners: Record<string, string> = {};
+        const resolvedOwners = resolvedFindingOwners(review);
         for (const finding of review.result!.findings) {
           const key = findingKey(finding);
           const owner = openOwners.get(key);
-          if (owner) openFindingOwners[key] = owner;
+          if (owner && !resolvedOwners.has(`${owner}:${key}`))
+            openFindingOwners[key] = owner;
         }
         const prepared = preparePublication(
           {

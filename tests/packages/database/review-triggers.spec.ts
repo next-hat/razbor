@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 
 import { eq } from "drizzle-orm";
 
+import { mergePolicySchema } from "@razbor/contracts";
 import {
   acceptWebhook,
   abandonGitlabPublication,
@@ -522,11 +523,21 @@ test(
       // ready event must still start exactly one review in fully automatic mode.
       draft = true;
       await lifecycle("opened", 23);
+      /** Read the draft evidence and admission generation of the tracked PR. */
+      const draftFence = async () =>
+        (
+          await database.pool.query(
+            "select draft, trigger_generation from pull_requests where number=23",
+          )
+        ).rows[0];
+      const beforeReady = await draftFence();
+      assert.equal(beforeReady.draft, true);
       draft = false;
       assert.deepEqual(
         (await syncPullRequests(database, [repo.id])).failures,
         [],
       );
+      assert.deepEqual(await draftFence(), beforeReady);
       await lifecycle("edited", 23);
       assert.equal((await history()).length, priorCount + 2);
       /** Read both fences, branch names, and SHAs for this provider PR. */
@@ -591,7 +602,14 @@ test(
       release = barrier();
       pauseRead = true;
       const beforeDraftRefresh = lifecycle("synchronized", 23);
-      await observed.promise;
+      await Promise.race([
+        observed.promise,
+        beforeDraftRefresh.then((status) => {
+          throw new Error(
+            `Delivery returned HTTP ${status} before reading the PR`,
+          );
+        }),
+      ]);
       draft = true;
       assert.deepEqual(
         (await syncPullRequests(database, [repo.id])).failures,
@@ -619,6 +637,63 @@ test(
       );
       listDraft = true;
       draft = false;
+      // A completed automatic result may already have had its ready transition
+      // refreshed. The signed edit replaces the stale merge review just once.
+      config.repositories.project.mergePolicy = mergePolicySchema.parse({
+        enabled: true,
+      });
+      await applyRegistry(database, config);
+      await lifecycle("opened", 27);
+      const [priorReadyReview] = await history();
+      const readyAttempt = await beginAttempt(
+        database,
+        priorReadyReview.id,
+        "fixture",
+        30000,
+      );
+      assert.equal(readyAttempt.kind, "started");
+      await finishAttempt(
+        database,
+        priorReadyReview.id,
+        readyAttempt.attemptId,
+        "fixture",
+        {
+          summary: "Completed the prior ready revision",
+          findings: [],
+        },
+      );
+      draft = true;
+      await lifecycle("edited", 27);
+      draft = false;
+      assert.deepEqual(
+        (await syncPullRequests(database, [repo.id])).failures,
+        [],
+      );
+      const beforeReadyWebhook = (await history()).length;
+      const refreshedRevision = (
+        await database.pool.query(
+          "select draft, merge_revision from pull_requests where number=27",
+        )
+      ).rows[0];
+      assert.equal(refreshedRevision.draft, false);
+      assert.notEqual(
+        readyAttempt.source.mergeRevision,
+        refreshedRevision.merge_revision,
+      );
+      assert.equal(await lifecycle("edited", 27), 202);
+      assert.equal((await history()).length, beforeReadyWebhook + 1);
+      const [replacementReadyReview] = await history();
+      const captured = (
+        await database.pool.query(
+          "select (source->>'mergeRevision')::int as revision from reviews where public_id=$1",
+          [replacementReadyReview.id],
+        )
+      ).rows[0];
+      assert.equal(captured.revision, refreshedRevision.merge_revision);
+      await lifecycle("edited", 27);
+      assert.equal((await history()).length, beforeReadyWebhook + 1);
+      delete config.repositories.project.mergePolicy;
+      await applyRegistry(database, config);
       head = "6".repeat(40);
       await lifecycle("opened", 124);
       const [oldAutomatic] = await history();

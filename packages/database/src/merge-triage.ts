@@ -33,6 +33,7 @@ import {
   pullRequests,
   repositories,
   reviews,
+  reviewTriggers,
 } from "@database/src/schema.js";
 import {
   interactionLock,
@@ -207,7 +208,7 @@ async function writeGuardedMerge(
             mergeDecision: reason(
               "blocked",
               "provider_rate_limited",
-              `GitHub rate-limited the request. Razbor will retry after ${retryAt.toISOString()}.`,
+              `The provider rate-limited the request. Razbor will retry after ${retryAt.toISOString()}.`,
             ),
           })
           .where(
@@ -550,6 +551,7 @@ async function triagePullRequest(database: Database, prId: string) {
         const prior = await database.db
           .select({ id: reviews.id })
           .from(reviews)
+          .innerJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
           .innerJoin(dispatchOutbox, eq(dispatchOutbox.reviewId, reviews.id))
           .where(
             and(
@@ -995,6 +997,7 @@ async function triagePullRequest(database: Database, prId: string) {
         await tx
           .update(reviews)
           .set({
+            mergeAction: sql`nullif(${reviews.mergeAction}, 'dry_run')`,
             mergeDecision: reason(
               "blocked",
               "provider_unavailable",

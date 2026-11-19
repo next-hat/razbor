@@ -28,6 +28,8 @@ import { settleMergeAuthority } from "@database/src/merge-recovery.js";
 import { reviewView, reviewViewSelection } from "@database/src/review-view.js";
 import {
   automaticReviewReady,
+  consoleFindingSnapshot,
+  previousConsoleFindings,
   retireObsoleteAutomaticRetry,
 } from "@database/src/review-triggers.js";
 import { snapshotRepositoryAgent } from "@database/src/agents.js";
@@ -141,6 +143,9 @@ export async function submitReview(
           ...(target
             ? {
                 mergeRevision: target.mergeRevision,
+                previousFindings: consoleFindingSnapshot(
+                  await previousConsoleFindings(tx, repo.id, target.number),
+                ),
                 pullRequest: {
                   number: target.number,
                   title: target.title,

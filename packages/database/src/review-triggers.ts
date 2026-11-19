@@ -1,6 +1,20 @@
-import { and, count, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import {
+  and,
+  count,
+  desc,
+  eq,
+  inArray,
+  isNull,
+  ne,
+  or,
+  sql,
+} from "drizzle-orm";
 
-import type { PreviousFinding, ReviewConversation } from "@razbor/contracts";
+import {
+  previousFindingsSchema,
+  type PreviousFinding,
+  type ReviewConversation,
+} from "@razbor/contracts";
 import type {
   ForgeChange,
   ForgeType,
@@ -13,6 +27,7 @@ import type { Database, Transaction } from "@database/src/connection.js";
 import { publicId } from "@database/src/ids.js";
 import { snapshotRepositoryMcpServers } from "@database/src/mcp.js";
 import { latestMergeReview } from "@database/src/merge-policy.js";
+import { findingKey } from "@database/src/presentation.js";
 import { rearmStalePublication } from "@database/src/rearm-publication.js";
 import {
   dispatchOutbox,
@@ -51,6 +66,104 @@ type Observation = {
   automaticAuthorPermitted?: boolean;
   waitingForDiff?: boolean;
 };
+
+/**
+ * Rebuild outstanding console findings from immutable PR-bound results. Each
+ * result index identifies one occurrence even when two entries share a root
+ * cause. Only an assessment of its admission snapshot can retire it.
+ */
+export async function previousConsoleFindings(
+  db: Database["db"] | Transaction,
+  repositoryId: string,
+  number: number,
+  excludeReviewId?: string,
+) {
+  const history = await db
+    .select({
+      id: reviews.publicId,
+      head: reviews.headSha,
+      source: reviews.source,
+      result: reviews.result,
+      trigger: reviewTriggers.id,
+      current: sql<boolean>`${reviews.source}->>'mergeRevision' = ${pullRequests.mergeRevision}::text
+          and ${reviews.headSha} = ${pullRequests.headSha} and ${reviews.baseSha} = ${pullRequests.baseSha}`,
+    })
+    .from(reviews)
+    .innerJoin(pullRequests, eq(pullRequests.id, reviews.mergePullRequestId))
+    .leftJoin(reviewTriggers, eq(reviewTriggers.reviewId, reviews.id))
+    .leftJoin(dispatchOutbox, eq(dispatchOutbox.reviewId, reviews.id))
+    .where(
+      and(
+        eq(reviews.repositoryId, repositoryId),
+        eq(pullRequests.repositoryId, repositoryId),
+        eq(pullRequests.number, number),
+        eq(reviews.status, "completed"),
+        excludeReviewId ? ne(reviews.publicId, excludeReviewId) : undefined,
+        or(
+          and(
+            isNull(reviewTriggers.id),
+            sql`jsonb_array_length(${reviews.result}->'findings') > 0`,
+          ),
+          and(
+            sql`exists (select 1 from jsonb_array_elements(${reviews.result}->'findingChecks') as assessment
+                        where assessment->>'id' like 'console:%' and assessment->>'status' = 'resolved')`,
+            or(
+              isNull(reviewTriggers.id),
+              sql`${dispatchOutbox.publication}->>'state' = 'published'
+                  and ${dispatchOutbox.publication}->>'stale' is distinct from 'true'
+                  and ${dispatchOutbox.publication}->>'rearmed' is distinct from 'true'`,
+            ),
+          ),
+        ),
+      ),
+    )
+    .orderBy(reviews.createdAt, reviews.publicId);
+  const open = new Map<string, PreviousFinding>();
+  for (const row of history) {
+    if (row.source.conversation) continue;
+    // A console run has no confirmed publication. Its assessments must be
+    // repeated when the destination or revision changes.
+    for (const check of (row.trigger || row.current
+      ? row.result?.findingChecks
+      : undefined) ?? []) {
+      const old = open.get(check.id);
+      if (
+        check.status === "resolved" &&
+        old &&
+        row.source.previousFindings?.some(
+          (saved) =>
+            saved.id === old.id &&
+            saved.reviewId === old.reviewId &&
+            findingKey(saved.finding) === findingKey(old.finding),
+        )
+      )
+        open.delete(check.id);
+    }
+    if (!row.trigger) {
+      for (const [index, finding] of (row.result?.findings ?? []).entries()) {
+        const id = `console:${row.id}:${index}`;
+        open.set(id, { id, reviewId: row.id, originalHead: row.head, finding });
+      }
+    }
+  }
+  return [...open.values()];
+}
+
+/** Fill the remaining admission budget with console findings. The merge audit still reads every occurrence. */
+export function consoleFindingSnapshot(
+  consoleFindings: PreviousFinding[],
+  published: PreviousFinding[] = [],
+) {
+  const snapshot = previousFindingsSchema.parse(published);
+  for (const finding of consoleFindings) {
+    snapshot.push(finding);
+    if (!previousFindingsSchema.safeParse(snapshot).success) {
+      snapshot.pop();
+      if (previousFindingsSchema.safeParse([finding]).success) break;
+    }
+  }
+  return snapshot;
+}
 
 /** Match a redelivery or an already declined command replayed under a different delivery ID. */
 export function triggerDelivery(hookId: string, event: ChangeEvent) {
@@ -319,6 +432,18 @@ async function queueReview(
         change.baseSha &&
       (!entry.trigger ||
         (entry.trigger.startSha ?? null) === (change.startSha ?? null));
+    // A refresh may already have observed the ready transition. A title edit
+    // needs work only when an existing review is stale under merge automation.
+    if (
+      forge === "forgejo" &&
+      event.kind === "ready" &&
+      generation === observation.generation &&
+      (!repo.mergePolicy.enabled ||
+        !sameDiff ||
+        latest.source.mergeRevision === undefined ||
+        latest.source.mergeRevision === target.mergeRevision)
+    )
+      return;
     if (
       sameDiff &&
       !latest.source.conversation &&
@@ -786,10 +911,6 @@ export async function acceptReviewTrigger(
         .where(eq(webhookDeliveries.id, receipt.id));
       return { historyGeneration: sessionValues.triggerGeneration } as const;
     }
-    // Forgejo reports an edited title and the resulting draft flag. An
-    // unchanged, already-ready snapshot is an ordinary rename.
-    if (forge === "forgejo" && event.kind === "ready" && !changed)
-      return { reviewId: undefined } as const;
     if (!target) throw new Error("Missing persisted pull request for review");
     const reviewId = await queueReview(
       tx,

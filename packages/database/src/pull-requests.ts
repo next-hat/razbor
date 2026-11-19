@@ -703,13 +703,6 @@ export async function syncPullRequests(
               const revised = sql`row(${pullRequests.state}, ${pullRequests.headSha}, ${pullRequests.baseSha},
                 ${pullRequests.headBranch}, ${pullRequests.baseBranch}) is distinct from
                 row(excluded.state, excluded.head_sha, excluded.base_sha, ${headBranch}, ${baseBranch})`;
-              // A partial listing may omit readiness on an unchanged PR. A tracked
-              // detail read, including a pending GitLab diff, supersedes the old snapshot.
-              const draft = before?.tracked
-                ? sql`excluded.draft`
-                : sql`case when excluded.draft is null and not (${revised}) then ${pullRequests.draft} else excluded.draft end`;
-              const changed = sql`(${revised} or row(${pullRequests.draft}, ${pullRequests.mergeBase}, ${pullRequests.startSha})
-                is distinct from row(${draft}, excluded.merge_base, excluded.start_sha))`;
               const values = {
                 title: change.title,
                 url: change.url,
@@ -743,6 +736,13 @@ export async function syncPullRequests(
                 if (existing?.origin !== "automatic")
                   values.draft = before.draft;
               }
+              // Use the same guarded readiness for persistence and change detection.
+              // Only an unchanged partial listing may retain a previously observed draft flag.
+              const draft = before?.tracked
+                ? sql`${values.draft}::boolean`
+                : sql`case when excluded.draft is null and not (${revised}) then ${pullRequests.draft} else excluded.draft end`;
+              const changed = sql`(${revised} or row(${pullRequests.draft}, ${pullRequests.mergeBase}, ${pullRequests.startSha})
+                is distinct from row(${draft}, excluded.merge_base, excluded.start_sha))`;
               const [updated] = await tx
                 .insert(pullRequests)
                 .values({

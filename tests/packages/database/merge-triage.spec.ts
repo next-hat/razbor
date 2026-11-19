@@ -4,7 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { mergePolicySchema, type MergeAssessment } from "@razbor/contracts";
+import {
+  mergePolicySchema,
+  type MergeAssessment,
+  type PreviousFinding,
+  type ReviewResult,
+} from "@razbor/contracts";
 import {
   beginAttempt,
   connectDatabase,
@@ -15,6 +20,8 @@ import {
   processMergeTriage,
   findingKey,
   submitReview,
+  triageForge,
+  triageOutstanding,
   updateRepositoryMergePolicy,
 } from "@razbor/database";
 import { migrate } from "@razbor/database/migrate";
@@ -564,6 +571,10 @@ test(
     let denyNextSubmission = false;
     const inspections: number[] = [];
     const voteWrites: number[] = [];
+    const voteFailures = [
+      new ForgeOperationError("not-sent"),
+      new ForgeOperationError("unavailable", false, 200, Date.now() + 300_000),
+    ];
     const liveApprovalEvents: string[] = [];
     let visibleVote: "absent" | "approved" | "dismissed" = "absent";
     const approve = t.mock.method(
@@ -592,6 +603,8 @@ test(
         if (reconcileOnly) return visibleVote;
         await beforeWrite();
         assert.equal(await voteStatus(request.reviewId), "uncertain");
+        if (request.number === 9 && voteFailures.length)
+          throw voteFailures.shift();
         voteWrites.push(request.number);
         if (request.number === 12) {
           visibleVote = "approved";
@@ -713,6 +726,9 @@ test(
       pr: string,
       score: number,
       routing?: Pick<MergeAssessment, "suggestedReviewers" | "pathOwners">,
+      assessFindings?: (
+        previous: PreviousFinding[],
+      ) => Pick<ReviewResult, "findings" | "findingChecks">,
     ) {
       const review = await submitReview(
         db,
@@ -729,7 +745,9 @@ test(
       );
       await finishAttempt(db, review.id, attempt.attemptId, "test", {
         summary: "Read the guide",
-        findings: [],
+        ...(assessFindings?.(attempt.job.previousFindings ?? []) ?? {
+          findings: [],
+        }),
         mergeAssessment: { ...assessment, confidence: score, ...routing },
       });
       return review.id;
@@ -807,7 +825,90 @@ test(
         priorReviewId,
       ],
     );
-    const clean = await complete(second, 90);
+    // These two console findings share a root cause, but only one fits in each
+    // 200 KB admission snapshot. Resolve each immutable occurrence separately.
+    const largeFinding = {
+      ...priorFinding,
+      body: priorFinding.body.repeat(4000),
+    };
+    const reported = await complete(second, 90, undefined, () => ({
+      findings: [largeFinding, { ...largeFinding, lineStart: 4, lineEnd: 4 }],
+    }));
+    const partlyFixed = await complete(second, 90, undefined, (previous) => {
+      assert.deepEqual(
+        previous.map((f) => f.id),
+        [`console:${reported}:0`],
+      );
+      return {
+        findings: [],
+        findingChecks: [
+          {
+            id: previous[0].id,
+            status: "resolved",
+            evidence: "The first link is fixed.",
+          },
+        ],
+      };
+    });
+    const partial = await db.db.query.reviews.findFirst({
+      where: (row, { eq }) => eq(row.publicId, partlyFixed),
+    });
+    assert.ok(partial);
+    const client = await triageForge(db, partial.repositoryId);
+    assert.equal(
+      await triageOutstanding(
+        db,
+        partial.repositoryId,
+        2,
+        client.bot.id,
+        client.api,
+        partial,
+      ),
+      1,
+      "the occurrence outside the admission budget still blocks merging",
+    );
+    await db.pool.query(
+      "update pull_requests set head_sha=$1 where public_id=$2",
+      ["c".repeat(40), second],
+    );
+    await db.pool.query(
+      "update pull_requests set head_sha=$1 where public_id=$2",
+      [headSha, second],
+    );
+    await complete(second, 90, undefined, (previous) => {
+      assert.deepEqual(
+        previous.map((f) => f.id),
+        [`console:${reported}:0`],
+        "the stale console resolution needs a fresh check even after the same head returns",
+      );
+      return {
+        findings: [],
+        findingChecks: [
+          {
+            id: previous[0].id,
+            status: "resolved",
+            evidence: "Rechecked the first link on the current revision.",
+          },
+        ],
+      };
+    });
+    const clean = await complete(second, 90, undefined, (previous) => {
+      assert.deepEqual(
+        previous.map((f) => f.id),
+        [`console:${reported}:1`],
+      );
+      assert.equal(previous[0].finding.lineStart, 4);
+      return {
+        findings: [],
+        findingChecks: [
+          {
+            id: previous[0].id,
+            status: "resolved",
+            evidence: "The second link is now fixed as well.",
+          },
+        ],
+      };
+    });
     // The publication-time recap can predate a maintainer resolving a thread.
     // Only the current audit can determine whether historical findings still block.
     await db.pool.query(
@@ -843,6 +944,32 @@ test(
       checkedBeforeIdle,
     );
     assert.equal(nextOrdinaryNote, 201);
+    // A development HTTP setting must never send a triage preflight or retain
+    // the old eligible preview when the configured origin cannot be trusted.
+    const callsBeforeHttp = providerRequests.mock.callCount();
+    for (const forgeType of ["forgejo", "gitlab"]) {
+      await db.pool.query(
+        "update forge_instances set type=$1, api_url='http://forge.invalid/api', allow_http=true where config_key='test'",
+        [forgeType],
+      );
+      await due(second);
+      await processMergeTriage(restart);
+      assert.equal(providerRequests.mock.callCount(), callsBeforeHttp);
+      assert.deepEqual(await decision(clean), {
+        status: "blocked",
+        action: null,
+      });
+    }
+    await db.pool.query(
+      "update forge_instances set type='forgejo', api_url=$1, allow_http=false where config_key='test'",
+      [config.forges.test.api_url],
+    );
+    await due(second);
+    await processMergeTriage(db);
+    assert.deepEqual(await decision(clean), {
+      status: "auto_merge_eligible",
+      action: "dry_run",
+    });
     assert.equal((await decision(human)).status, "human_review_required");
     const [escalation] = (
       await db.pool.query(
@@ -1120,6 +1247,15 @@ test(
     assert.match(bodyFor(8), /approval was dismissed/);
     const deniedVotePr = await pull(9);
     const deniedVoteReview = await complete(deniedVotePr, 96);
+    for (const { retryAt } of [...voteFailures]) {
+      await processMergeTriage(restart);
+      assert.equal(await voteStatus(deniedVoteReview), null);
+      assert.ok(
+        (await deadline(deniedVotePr))!.getTime() >=
+          (retryAt ?? Date.now() + 30_000),
+      );
+      await due(deniedVotePr);
+    }
     await processMergeTriage(db);
     assert.equal(await voteStatus(deniedVoteReview), "unavailable");
     await due(deniedVotePr);
@@ -1158,6 +1294,7 @@ test(
     const withdrawalWrites: number[] = [];
     let lostVoteArrived = false;
     let policyWithdrawalConfirmed = false;
+    let expireWithdrawal = true;
     t.mock.method(
       ForgejoInteractions.prototype,
       "retireApproval",
@@ -1193,6 +1330,10 @@ test(
         ).rows;
         assert.equal(intent.forge_approval.retiring, true);
         assert.equal(intent.forge_approval.retirementSent, true);
+        if (request.number === 13 && expireWithdrawal) {
+          expireWithdrawal = false;
+          throw new ForgeOperationError("not-sent");
+        }
         withdrawn.add(request.number);
         withdrawalWrites.push(request.number);
         if (request.number !== 14)
@@ -1202,6 +1343,14 @@ test(
     );
     const humanAfterVote = await complete(escalatedPr, 70);
     const humanAfterLostVote = await complete(uncertainPr, 72);
+    await processMergeTriage(db);
+    assert.deepEqual(withdrawalWrites, []);
+    const unsent = await restart.pool.query(
+      "select forge_approval from reviews where public_id=$1",
+      [previousApproval],
+    );
+    assert.equal(unsent.rows[0].forge_approval.retirementSent, undefined);
+    await due(escalatedPr);
     await processMergeTriage(db);
     assert.deepEqual(withdrawalWrites, [13]);
     for (const reviewId of [humanAfterVote, humanAfterLostVote]) {
