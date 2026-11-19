@@ -345,6 +345,45 @@ test("current policy, reviewed revisions, provider restrictions and default dest
   );
 });
 
+test("member decisions replace stored native and triage messages and discard unknown reason codes", () => {
+  const privateNote = "Private policy guidance from a prior review.";
+  const stored = {
+    status: "blocked" as const,
+    reviewers: [],
+    reasons: [
+      { code: "merge_refused", message: privateNote },
+      { code: "unresolved_provider_merge", message: privateNote },
+      { code: "eligibility_check_unconfirmed", message: privateNote },
+      { code: privateNote, message: privateNote },
+    ],
+  };
+  const visible = publicMergeDecision(stored);
+  assert.ok(!JSON.stringify(visible).includes(privateNote));
+  assert.deepEqual(
+    visible.reasons.map(({ code }) => code),
+    [
+      "merge_refused",
+      "unresolved_provider_merge",
+      "eligibility_check_unconfirmed",
+    ],
+  );
+  assert.match(visible.reasons[0].message, /provider declined/);
+  assert.match(visible.reasons[1].message, /requires reconciliation/);
+  assert.match(visible.reasons[2].message, /no visible eligibility check/);
+  const unknown = publicMergeDecision({
+    ...stored,
+    status: "stale",
+    reasons: [{ code: privateNote, message: privateNote }],
+  });
+  assert.deepEqual(unknown.reasons, [
+    {
+      code: "decision_status",
+      message: "The previous merge decision is out of date.",
+    },
+  ]);
+  assert.equal(stored.reasons[0].message, privateNote);
+});
+
 test("reviewer selection, fallback, and comment reconciliation only mention bounded configured identities", () => {
   const humanReviewers = [
     {

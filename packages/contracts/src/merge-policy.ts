@@ -175,25 +175,6 @@ const humanReasons = {
     "This pull request was escalated to the provider's human-controlled merge workflow.",
 };
 
-/** Replace policy-derived messages from historical decisions before exposing a review to a reader. */
-export function publicMergeDecision(decision: MergeDecision): MergeDecision {
-  const seen = new Set<string>();
-  return {
-    ...decision,
-    reasons: decision.reasons.flatMap((reason) => {
-      if (!Object.hasOwn(humanReasons, reason.code)) return [reason];
-      if (seen.has(reason.code)) return [];
-      seen.add(reason.code);
-      return [
-        {
-          code: reason.code,
-          message: humanReasons[reason.code as keyof typeof humanReasons],
-        },
-      ];
-    }),
-  };
-}
-
 /** Expose the recorded score and readiness signals without the model's private policy-derived prose. */
 export function publicMergeAssessment(
   assessment: MergeAssessment,
@@ -381,6 +362,69 @@ function commentLiteral(text: string): string {
   );
 }
 
+export const forgeMergeReasonMessages = {
+  shared_head_check:
+    "GitHub could not establish that this PR is the only open request using the reviewed head. A commit-wide eligibility check could release another PR.",
+  app_pinned_strict_check_required:
+    "Require strict, administrator-enforced default-branch protection and pin the Razbor eligibility check to this GitHub App.",
+  conflicting_eligibility_check:
+    "This commit already has an eligibility check for another review. Inspect the existing check before using a fresh revision.",
+  destination_changed:
+    "The provider's repository or default branch has changed since this review.",
+  direct_child_required:
+    "This native operation requires a single-parent head commit directly on the reviewed destination tip.",
+  exclusive_destination_required:
+    "The provider cannot confirm that this automation identity can merge only into the default branch.",
+  existing_schedule:
+    "The provider already has a merge schedule that this review does not own.",
+  forgejo_schedule_does_not_pin_reviewed_head:
+    "Forgejo's native scheduler discards the reviewed head SHA. A maintainer must merge this PR.",
+  eligibility_check_unconfirmed:
+    "GitHub has no visible eligibility check for this review. Razbor will resume if it appears. If GitHub verifies the request was never accepted and cannot arrive, follow the operator recovery procedure in docs/merge-providers.md, then request a new review.",
+  conversation_resolution_required:
+    "Require resolution of all review conversations in the default branch protection or an active pull request ruleset that this App cannot bypass.",
+  immutable_source_required:
+    "GitHub requires a locked source branch in this repository with force pushes, deletions and fork syncing disabled.",
+  installed_github_app_required:
+    "Install or reconnect the repository's GitHub App so Razbor can verify the source of its eligibility check.",
+  merge_method_unavailable:
+    "The selected merge method is unavailable with this project's merge and squash settings.",
+  merge_restrictions:
+    "The provider reports an outstanding merge restriction. Check approvals, conversations, conflicts and native merge requirements.",
+  native_auto_merge_unavailable:
+    "GitHub reports that the installed App cannot enable native auto-merge for this PR.",
+  not_open_ready:
+    "Automatic merging requires an open PR that is ready for review.",
+  pipeline_failed: "The pipeline for the reviewed commit did not succeed.",
+  pipeline_pending:
+    "A successful pipeline for the reviewed commit is still required.",
+  project_bot_required:
+    "Use a GitLab project bot with the Developer role for guarded merging.",
+  protected_successful_pipeline_required:
+    "Protect the GitLab target, require a successful pipeline and disable merging after a skipped pipeline.",
+  provider_merged: "The provider confirmed the reviewed head was merged.",
+  provider_ready:
+    "The provider confirmed the revision and native merge requirements.",
+  provider_scheduled:
+    "The provider confirmed a native merge schedule for the reviewed head.",
+  required_check_failed:
+    "A required GitHub check finished without a successful conclusion.",
+  required_check_pending:
+    "A successful GitHub Check Run for every required context is still needed on the reviewed commit.",
+  retired_eligibility_check:
+    "The existing GitHub eligibility check has already finished and cannot authorize this operation.",
+  revision_changed:
+    "The provider's PR identity, destination or reviewed revision has changed.",
+  unowned_schedule:
+    "An existing GitHub auto-merge request has no eligibility check belonging to this review.",
+  unsupported_github_merge_strategy:
+    "Enable the selected native GitHub merge method on a supported default branch. Merge-queue targets require a human.",
+  unsupported_gitlab_merge_strategy:
+    "This GitLab version or strategy cannot enforce the revision guard. Use semi-linear or fast-forward merging with merge trains and automatic rebase off.",
+  verification_check_required:
+    "Configure a required GitHub verification check in addition to Razbor's eligibility check.",
+} as const;
+
 const publicEscalationReasons = {
   ...humanReasons,
   provider_merged: "The provider confirmed the reviewed revision was merged.",
@@ -408,6 +452,37 @@ const publicEscalationReasons = {
     "Provider restrictions or permissions prevent a guarded merge.",
 };
 
+const publicReasonMessages = {
+  ...forgeMergeReasonMessages,
+  ...publicEscalationReasons,
+  invalid_policy_snapshot: "The saved policy is invalid.",
+  review_superseded:
+    "The review revisions or saved policy are no longer current.",
+  change_not_ready: "The pull request must be open and ready for review.",
+  review_pending: "The current review has not finished.",
+  provider_pending: "Provider checks or native merge requirements are pending.",
+  requirements_met:
+    "The reviewed revision meets the configured merge requirements.",
+  native_submission_refused: "The provider refused the guarded merge request.",
+  provider_binding_missing:
+    "A verified repository and a saved destination branch are required.",
+  provider_rate_limited:
+    "The provider rate-limited the request. Razbor will retry after the provider's waiting period.",
+  publication_superseded: "Request a new review of the current revision.",
+  schedule_superseded: "The review was superseded before the merge request.",
+  schedule_invalidated: "The previous merge authorization was retired.",
+  eligibility_check_retired:
+    "GitHub confirmed retirement of the pending eligibility check.",
+  unresolved_provider_merge:
+    "An outstanding native merge request requires reconciliation. Check its outcome in the provider.",
+  obsolete_review:
+    "The previous review no longer matches this pull request or its current policy.",
+  previous_escalation:
+    "This pull request was escalated. A human reviewer must complete the forge review and merge workflow.",
+  escalation_delivery_unconfirmed:
+    "Razbor could not confirm delivery of its earlier escalation comment. Check the provider request log before retrying the notification.",
+};
+
 const statusReason: Record<MergeDecisionStatus, string> = {
   merged: "The provider confirmed the reviewed revision was merged.",
   human_review_required: "A human reviewer must assess this change.",
@@ -418,6 +493,35 @@ const statusReason: Record<MergeDecisionStatus, string> = {
     "The reviewed revision meets the configured merge requirements.",
   blocked: "The service could not confirm all conditions required for a merge.",
 };
+
+/** Resolve stored codes against the explanations allowed for this audience. */
+function publicReasons(
+  decision: MergeDecision,
+  catalog: Readonly<Record<string, string>>,
+) {
+  const reasons: MergeDecision["reasons"] = [];
+  for (const code of new Set(decision.reasons.map((reason) => reason.code))) {
+    if (Object.hasOwn(catalog, code))
+      reasons.push({
+        code,
+        message: catalog[code],
+      });
+  }
+  if (!reasons.length)
+    reasons.push({
+      code: "decision_status",
+      message: statusReason[decision.status],
+    });
+  return reasons;
+}
+
+/** Publish only service-owned reason codes and explanations, including for historical decisions. */
+export function publicMergeDecision(decision: MergeDecision): MergeDecision {
+  return {
+    ...decision,
+    reasons: publicReasons(decision, publicReasonMessages),
+  };
+}
 
 /** Build a revision-bound triage comment. Recheck the allowlist even for saved decisions and limit mentions to a first notification. */
 export function renderMergeEscalation(input: {
@@ -452,23 +556,8 @@ export function renderMergeEscalation(input: {
     "",
     ...(!human ? [`Decision: ${decision.status}`, ""] : []),
   ];
-  // Only service-owned explanations can leave the management boundary. Old
-  // decisions and valid model evidence can both contain verbatim policy prose.
-  const reasons = [
-    ...new Set(
-      decision.reasons.flatMap(({ code }) =>
-        Object.hasOwn(publicEscalationReasons, code)
-          ? [
-              publicEscalationReasons[
-                code as keyof typeof publicEscalationReasons
-              ],
-            ]
-          : [],
-      ),
-    ),
-  ];
-  if (!reasons.length) reasons.push(statusReason[decision.status]);
-  lines.push("Reasons:", ...reasons.map((message) => "- " + message));
+  const reasons = publicReasons(decision, publicEscalationReasons);
+  lines.push("Reasons:", ...reasons.map(({ message }) => "- " + message));
   const allowed = new Set(
     snapshot.policy.humanReviewers.map((candidate) => candidate.username),
   );
