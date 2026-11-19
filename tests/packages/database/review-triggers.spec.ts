@@ -515,6 +515,9 @@ test(
     let diffReady = false;
     let closed = false;
     let draftNote: { id: number; author_id: number; note: string } | undefined;
+    const closedCommandRead = barrier();
+    const releaseClosedCommand = barrier();
+    const postReopenTime = "2026-01-02T00:00:00.000Z";
     let summaryNote:
       | {
           id: number;
@@ -599,13 +602,20 @@ test(
               : []
             : { id: 51 },
         );
-      if (path.endsWith("/notes/92"))
+      const commandNote = /\/notes\/(92|93|94)$/.exec(path);
+      if (commandNote) {
+        const id = Number(commandNote[1]);
+        if (id === 93) {
+          closedCommandRead.resolve();
+          await releaseClosedCommand.promise;
+        }
         return send({
-          id: 92,
+          id,
           body: "/agentic_review",
           author: { id: 2, username: "alice" },
-          created_at: "2025-01-01T00:00:00Z",
+          created_at: id === 94 ? postReopenTime : "2025-01-01T00:00:00Z",
         });
+      }
       res.statusCode = 404;
       return send({});
     });
@@ -744,6 +754,7 @@ test(
                 ...payload.object_attributes,
                 iid,
                 action,
+                oldrev: ready ? undefined : payload.object_attributes.oldrev,
                 actioned_at: occurredAt,
               },
               ...(ready && {
@@ -1121,29 +1132,34 @@ test(
       assert.equal(receipt.boundary_at.toISOString(), resetTime);
       diffReady = true;
       const priorReviews = (await listReviews(database)).length;
-      const delayedCommand = Buffer.from(
-        JSON.stringify({
-          object_kind: "note",
-          user: payload.user,
-          project: payload.project,
-          merge_request: { iid },
-          object_attributes: {
-            id: 92,
-            author_id: 2,
-            note: "/agentic_review",
-            action: "create",
-            noteable_type: "MergeRequest",
+      /** Send a command that the GitLab adapter verifies against the note on this MR. */
+      function command(id: number, deliveryId: string) {
+        return acceptWebhook(
+          database,
+          hook!.id,
+          Buffer.from(
+            JSON.stringify({
+              object_kind: "note",
+              user: payload.user,
+              project: payload.project,
+              merge_request: { iid },
+              object_attributes: {
+                id,
+                author_id: 2,
+                note: "/agentic_review",
+                action: "create",
+                noteable_type: "MergeRequest",
+              },
+            }),
+          ),
+          {
+            "x-gitlab-token": secret,
+            "x-gitlab-event": "Note Hook",
+            "webhook-id": deliveryId,
           },
-        }),
-      );
-      assert.equal(
-        await acceptWebhook(database, hook.id, delayedCommand, {
-          "x-gitlab-token": secret,
-          "x-gitlab-event": "Note Hook",
-          "webhook-id": "mr-delayed-command",
-        }),
-        202,
-      );
+        );
+      }
+      assert.equal(await command(92, "mr-delayed-command"), 202);
       const {
         rows: [first],
       } = await database.pool.query(
@@ -1152,6 +1168,47 @@ test(
       assert.equal(first.continuous_review_since, null);
       assert.equal(first.review_session_reset_at.toISOString(), resetTime);
       assert.equal((await listReviews(database)).length, priorReviews + 1);
+
+      // Keep a closed observation in flight while an untracked MR reopens without a diff.
+      iid = 29;
+      closed = true;
+      diffReady = false;
+      const earlier = command(93, "mr-observed-closed");
+      try {
+        await Promise.race([
+          closedCommandRead.promise,
+          earlier.then((status) => {
+            throw new Error(
+              `Closed command returned HTTP ${status} before verifying its note`,
+            );
+          }),
+        ]);
+        closed = false;
+        assert.equal(
+          await deliver("mr-racing-reopen", "reopen", false, resetTime),
+          202,
+        );
+        diffReady = true;
+      } finally {
+        releaseClosedCommand.resolve();
+      }
+      const earlierStatus = await earlier;
+      assert.equal(await command(94, "mr-new-command"), 202);
+      const {
+        rows: [reopened],
+      } = await database.pool.query(
+        "select review_session_reset_at, continuous_review_since from pull_requests where number = 29",
+      );
+      assert.equal(reopened.review_session_reset_at.toISOString(), resetTime);
+      assert.equal(
+        reopened.continuous_review_since?.toISOString(),
+        postReopenTime,
+      );
+      assert.equal(earlierStatus, 202);
+      const beforePush = (await listReviews(database)).length;
+      start = "9".repeat(40);
+      assert.equal(await deliver("mr-opted-in-push", "update"), 202);
+      assert.equal((await listReviews(database)).length, beforePush + 1);
     } finally {
       delete process.env.RAZBOR_TEST_MR_SECRET;
       await new Promise<void>((resolve) => server.close(() => resolve()));

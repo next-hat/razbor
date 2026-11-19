@@ -974,6 +974,7 @@ async function handlePullRequest(
     database,
     row.repo.id,
     event.number,
+    row.forge.type === "gitlab" ? h.id : undefined,
   );
   const { api, metadata } = await openAdapter(database, row, 30000, true);
   setStage?.("read-pull-request");
@@ -996,7 +997,7 @@ async function handlePullRequest(
         row.forge.type,
         {
           event,
-          generation: session?.triggerGeneration ?? 0,
+          ...session.version,
           waitingForDiff: true,
         },
       );
@@ -1020,7 +1021,7 @@ async function handlePullRequest(
     event.kind !== "reopened" &&
     ((row.repo.reviewTriggerMode === "automatic" && automaticAuthorPermitted) ||
       (row.repo.reviewTriggerMode === "opt_in_continuous" &&
-        session?.continuousReviewSince));
+        session.continuousReviewSince));
   /** Read prior published findings only after the event is eligible to queue work. */
   const readHistory = () => {
     setStage?.("read-previous-findings");
@@ -1038,7 +1039,7 @@ async function handlePullRequest(
       event,
       change,
       automaticAuthorPermitted,
-      generation: session?.triggerGeneration ?? 0,
+      ...session.version,
       previous,
     },
   );
@@ -1281,11 +1282,11 @@ export async function acceptWebhook(
     );
   }
 
-  /** Admit the verified command at the observed generation before any closed-PR reply can be sent. */
+  /** Admit the verified command at the observed session version before any closed-PR reply can be sent. */
   async function handleClosedComment(
     api: Forge,
     event: Extract<ForgeWebhook, { kind: "comment" }>,
-    generation: number,
+    version: Awaited<ReturnType<typeof reviewTriggerSession>>["version"],
   ) {
     if (!reviewCommand(event.body)) return outcome(204, "closed-pull-request");
     stage = "verify-comment";
@@ -1303,7 +1304,7 @@ export async function acceptWebhook(
       row.repo,
       h,
       row.forge.type,
-      { event, generation },
+      { event, ...version },
     );
     if ("retry" in accepted) return 409;
     if (!accepted.closedReplyId) return outcome(202, "duplicate-delivery");
@@ -1399,6 +1400,7 @@ export async function acceptWebhook(
       database,
       row.repo.id,
       event.number,
+      row.forge.type === "gitlab" ? h.id : undefined,
     );
     stage = "read-pull-request";
     let change: ForgeChange;
@@ -1409,7 +1411,7 @@ export async function acceptWebhook(
         error instanceof ForgeOperationError &&
         error.reason === "change-closed"
       )
-        return handleClosedComment(api, event, session?.triggerGeneration ?? 0);
+        return handleClosedComment(api, event, session.version);
       throw error;
     }
     if (change.number !== event.number)
@@ -1472,7 +1474,7 @@ export async function acceptWebhook(
         previous,
         conversation,
         commandAt,
-        generation: session?.triggerGeneration ?? 0,
+        ...session.version,
       },
     );
     if ("retry" in accepted) return 409;

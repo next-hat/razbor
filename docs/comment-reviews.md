@@ -139,16 +139,20 @@ docker compose run --rm manage review abandon-gitlab-publication rev_ABCDEFGHIJK
 ```
 
 Older submissions may lack a saved bot ID. If GitLab has no visible summary,
-verify which bot submitted the original review, restore that bot's credential,
-and append `--original-bot-id <numeric-user-id>` to the command. The command
-checks the supplied ID against the authenticated GitLab account.
+verify which bot submitted the original review and restore that bot's credential.
+Select **Reconcile webhook** in the repository's webhook settings to refresh the
+saved bot ID. Then append `--original-bot-id <numeric-user-id>` to the command.
+The authenticated GitLab account must match both the supplied ID and the bot ID
+saved on the webhook.
 
 An `abandoned` outcome removes identifiable unpublished drafts owned by that
 review and records the verdict as unconfirmed. A visible marked summary yields
 `submitted` and the dispatcher continues normal reconciliation. An `ineligible`
 result means the command found no ambiguous GitLab bulk to abandon or could
 not confirm its owning identity. A `busy` result means another interaction is
-running for that repository. The command never posts a verdict. GitLab may
+running for that repository. The command checks up to 1,000 MR notes. If it
+cannot confirm it reached the end of the list, it leaves the review under
+reconciliation. The command never posts a verdict. GitLab may
 still complete an earlier request after the operator stops reconciliation.
 
 Before submitting, Razbor lists the bot's drafts again and checks their IDs,

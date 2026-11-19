@@ -91,7 +91,7 @@ export type ForgePublicationProgress = Record<
 
 export type ForgeReviewPublication = {
   progress: ForgePublicationProgress;
-  /** Full frozen result when the provider cannot confirm a follow-up verdict or update its earlier recap. */
+  /** Full frozen result for the GitLab follow-up summary when the verdict is unconfirmed. */
   unconfirmedBody?: string;
   /** Persisted review snapshot to verify before submitting a native review. */
   revision?: ForgeChange;

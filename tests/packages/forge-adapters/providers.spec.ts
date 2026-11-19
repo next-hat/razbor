@@ -688,7 +688,7 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
         : route.replace("/issues/comments/91", "/issues/12/comments");
     const user = { id: owner, login: "account", username: "account" };
     if (req.method === "GET" && url.pathname === listing) {
-      const page = url.searchParams.get("page");
+      const page = Number(url.searchParams.get("page"));
       const entry = {
         id: commentId,
         body,
@@ -696,15 +696,16 @@ test("status writes verify the exact top-level owner, marker, ID and PR on all t
         author: user,
         created_at: "2026-02-04T03:02:01Z",
       };
-      // Model a server with a one-item page-size cap, including a visible comment beyond page one.
+      // GitLab's final data page needs an empty-page probe even after deletion.
+      // The other providers model a server that caps each page at one comment.
+      const pageSize = provider === "gitlab" ? 50 : 1;
+      const entries = Array.from(
+        { length: provider === "gitlab" ? 999 : 1 },
+        (_, index) => ({ ...entry, id: String(1000 + index) }),
+      );
+      if (!absent) entries.push(entry);
       res.end(
-        JSON.stringify(
-          page === "1"
-            ? [{ ...entry, id: "88" }]
-            : page === "2" && !absent
-              ? [entry]
-              : [],
-        ),
+        JSON.stringify(entries.slice((page - 1) * pageSize, page * pageSize)),
       );
       return;
     }

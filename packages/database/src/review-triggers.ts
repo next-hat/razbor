@@ -1,4 +1,4 @@
-import { and, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, count, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
 
 import type { PreviousFinding, ReviewConversation } from "@razbor/contracts";
 import type {
@@ -36,6 +36,7 @@ type Observation = {
   event: ChangeEvent;
   change?: ForgeChange;
   generation: number;
+  unseenBoundaryCount?: number;
   previous?: PreviousFinding[];
   conversation?: ReviewConversation;
   commandAt?: string;
@@ -162,14 +163,36 @@ export async function resetRepositoryReviewTriggers(
   await supersedeQueuedAutomaticReviews(tx, repositoryId);
 }
 
-/** Read the observation generation before provider I/O. A concurrent webhook commit requires fresh provider data. */
+/** Count durable close/reopen receipts, including events with equal or out-of-order provider timestamps. */
+async function countUnseenBoundaries(
+  db: Pick<Transaction, "select">,
+  webhookId: string,
+  number: number,
+) {
+  const [row] = await db
+    .select({ total: count() })
+    .from(webhookDeliveries)
+    .where(
+      and(
+        eq(webhookDeliveries.webhookId, webhookId),
+        eq(webhookDeliveries.boundaryNumber, number),
+      ),
+    );
+  return row.total;
+}
+
+/** Snapshot the PR generation, or the boundary receipts for a GitLab MR without a PR row, before provider I/O. */
 export async function reviewTriggerSession(
   database: Database,
   repositoryId: string,
   number: number,
+  gitlabWebhookId: string | undefined,
 ) {
   const [session] = await database.db
-    .select()
+    .select({
+      generation: pullRequests.triggerGeneration,
+      continuousReviewSince: pullRequests.continuousReviewSince,
+    })
     .from(pullRequests)
     .where(
       and(
@@ -177,7 +200,16 @@ export async function reviewTriggerSession(
         eq(pullRequests.number, number),
       ),
     );
-  return session;
+  return {
+    continuousReviewSince: session?.continuousReviewSince,
+    version: {
+      generation: session?.generation ?? 0,
+      unseenBoundaryCount:
+        !session && gitlabWebhookId
+          ? await countUnseenBoundaries(database.db, gitlabWebhookId, number)
+          : undefined,
+    },
+  };
 }
 
 /** Snapshot a verified provider change and route both origins through the same immutable attempt and publication pipeline. */
@@ -374,7 +406,13 @@ export async function acceptReviewTrigger(
       .from(pullRequests)
       .where(scope)
       .for("update");
-    if ((session?.triggerGeneration ?? 0) !== observation.generation)
+    if (
+      (session?.triggerGeneration ?? 0) !== observation.generation ||
+      (observation.unseenBoundaryCount !== undefined &&
+        (session ||
+          (await countUnseenBoundaries(tx, hook.id, event.number)) !==
+            observation.unseenBoundaryCount))
+    )
       return { retry: true } as const;
     let [receipt] = await tx
       .select()

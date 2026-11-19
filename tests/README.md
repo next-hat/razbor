@@ -52,6 +52,8 @@ diff refs exist. It checks that the dispatcher recovers the first review after
 a restart, retries source and readiness changes, and ends old opt-ins while a diff
 is pending. Webhook settings edits revoke deferred work and retain the timestamp
 that prevents a pre-reopen command from activating a new continuous session.
+The fixture also holds a closed-command lookup open while an untracked MR
+reopens, then checks that a post-reopen command enables review of the next push.
 The delayed-delivery check inspects the queued head before sending another update.
 The public PR check uses different authors in the signed event and the forge response.
 Publication checks cover webhook disablement and opt-in revocation before submission,
@@ -62,6 +64,7 @@ duplicates, and that the management CLI can abandon an ambiguous bulk without
 resubmitting it or deleting another user's draft.
 The status-comment fixture covers masked 404s, deletion during an active review,
 and recovery after a bot rotation through restored credentials or manual removal.
+The GitLab provider fixture checks status-comment cleanup on a 1,000-note MR.
 These checks do not need model credentials.
 
 ## Autonomous review harness

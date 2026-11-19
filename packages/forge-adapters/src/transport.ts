@@ -82,25 +82,28 @@ export class HttpForgeTransport {
     }
   }
 
-  /** Read every page up to a fixed bound, failing rather than returning incomplete evidence. */
+  /** Read up to twenty data pages. A complete listing must also reach an empty page. */
   async list(
     route: string,
     pageSizeKey = "per_page",
     requireEmptyPage = false,
   ): Promise<unknown[]> {
     const all: unknown[] = [];
-    for (let page = 1; page <= 20; page++) {
+    const dataPageLimit = 20;
+    const pageSize = 50;
+    const pageRoute = `${route}${route.includes("?") ? "&" : "?"}${pageSizeKey}=${pageSize}&page=`;
+    for (let page = 1; page <= dataPageLimit; page++) {
       const rows = z
         .array(z.unknown())
-        .parse(
-          await this.request(
-            `${route}${route.includes("?") ? "&" : "?"}${pageSizeKey}=50&page=${page}`,
-          ),
-        );
+        .parse(await this.request(`${pageRoute}${page}`));
+      if (rows.length > pageSize)
+        throw new ForgeOperationError("invalid-response");
       all.push(...rows);
-      if (rows.length === 0 || (!requireEmptyPage && rows.length < 50))
+      if (rows.length === 0 || (!requireEmptyPage && rows.length < pageSize))
         return all;
     }
+    const finalPage = await this.request(`${pageRoute}${dataPageLimit + 1}`);
+    if (Array.isArray(finalPage) && finalPage.length === 0) return all;
     throw new ForgeOperationError("invalid-response");
   }
 }
