@@ -132,8 +132,8 @@ export function parseGithubComment(raw: Uint8Array, event: string | undefined) {
   };
 }
 
-/** Translate GitHub action names, ignoring reviews, label changes and other metadata. */
-function githubLifecycle(action: string) {
+/** Translate GitHub lifecycle actions and base-branch retargets into review triggers. */
+function githubLifecycle(action: string, baseChanged: boolean) {
   switch (action) {
     case "opened":
     case "reopened":
@@ -141,6 +141,8 @@ function githubLifecycle(action: string) {
       return action;
     case "synchronize":
       return "updated";
+    case "edited":
+      return baseChanged ? "updated" : undefined;
     case "ready_for_review":
       return "ready";
     case "converted_to_draft":
@@ -151,8 +153,19 @@ function githubLifecycle(action: string) {
 /** Normalize PR lifecycle events; their revisions and open/draft state are re-read from REST. */
 export function parseGithubPullRequest(raw: Uint8Array) {
   const value = parse(Buffer.from(raw).toString("utf8"));
-  const { action } = z.object({ action: z.string() }).parse(value);
-  const kind = githubLifecycle(action);
+  const { action, changes } = z
+    .object({
+      action: z.string(),
+      changes: z
+        .object({
+          base: z
+            .object({ ref: z.object({ from: z.string().min(1) }) })
+            .optional(),
+        })
+        .optional(),
+    })
+    .parse(value);
+  const kind = githubLifecycle(action, changes?.base !== undefined);
   if (!kind) return undefined;
   const payload = z
     .object({
@@ -773,20 +786,25 @@ export class GithubForge implements Forge {
   ) {
     sha.parse(head);
     if (publication) await reviewRevision(this, n, head, publication);
-    const result = await this.create(`${this.route}/pulls/${n}/reviews`, {
-      event,
-      commit_id: head,
-      body,
-      comments: comments.map((comment) => ({
-        path: comment.path,
-        line: comment.lineEnd,
-        side: "RIGHT",
-        ...(comment.lineStart < comment.lineEnd
-          ? { start_line: comment.lineStart, start_side: "RIGHT" }
-          : {}),
-        body: comment.body,
-      })),
-    });
+    /** Send the review after the provider revision and repository policy checks pass. */
+    const write = () =>
+      this.create(`${this.route}/pulls/${n}/reviews`, {
+        event,
+        commit_id: head,
+        body,
+        comments: comments.map((comment) => ({
+          path: comment.path,
+          line: comment.lineEnd,
+          side: "RIGHT",
+          ...(comment.lineStart < comment.lineEnd
+            ? { start_line: comment.lineStart, start_side: "RIGHT" }
+            : {}),
+          body: comment.body,
+        })),
+      });
+    const result = publication?.submit
+      ? await publication.submit(write)
+      : await write();
     this.commentsCache.delete(n);
     this.threadsCache.delete(n);
     return result;

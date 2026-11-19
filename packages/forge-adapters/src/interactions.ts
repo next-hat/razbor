@@ -72,7 +72,7 @@ export type ForgeReviewComment = {
 
 export type ForgePublicationProgress = Record<
   string,
-  { id?: string; writing?: boolean }
+  { id?: string; writing?: boolean; submitted?: boolean }
 >;
 
 export type ForgeReviewPublication = {
@@ -81,6 +81,8 @@ export type ForgeReviewPublication = {
   revision?: ForgeChange;
   /** Automatic reviews must still be ready when the provider receives the review. */
   requireReady?: boolean;
+  /** Serialize a new native verdict with changes to the policy that authorized it. */
+  submit?<T>(write: () => Promise<T>): Promise<T>;
   /** Persist before each remote mutation; retain uncertain writes for reconciliation. */
   save(progress: ForgePublicationProgress): Promise<void>;
 };
@@ -111,6 +113,7 @@ export class ForgeOperationError extends Error {
       | "permission"
       | "unsupported"
       | "unavailable"
+      | "diff-pending"
       | "invalid-response"
       | "change-closed",
     readonly uncertain = false,
@@ -265,6 +268,7 @@ export interface Forge {
     number: number,
     reviewId: string,
     progress: ForgePublicationProgress,
+    save: ForgeReviewPublication["save"],
   ): Promise<void>;
   /** Resolve a known thread; unsupported providers must report that explicitly. */
   resolveThread(number: number, threadId: string): Promise<void>;

@@ -118,8 +118,10 @@ and **Issues: write**. Older registrations with automatic hooks also need
 **GitLab:** use a bot personal or project token with `api` scope and Maintainer
 access for automatic hook setup. razbor uses the webhook's **Secret token**.
 The instance must support Draft Notes publication with a summary and
-`reviewer_state`, plus the merge request reviewer state API. Older instances that
-ignore these fields fail publication verification.
+`reviewer_state`. Razbor confirms the original submission from its bot-owned
+summary and revision-bound notes, including after a reviewer is requested again.
+GitLab may record a request for changes as reviewed if the bot lacks permission
+to request changes. [GitLab Draft Notes API](https://docs.gitlab.com/api/draft_notes/#publish-all-pending-draft-notes)
 
 Forgejo and GitLab hooks are created automatically. **Webhook → Remote hook
 setup** shows their callbacks and events. Forgejo needs `pull_request`,
@@ -212,8 +214,13 @@ source-only and indexed checkouts. Each review can consume inference tokens and
 incur charges from the configured model provider.
 
 GitHub sends `pull_request` actions, including `synchronize` and
-`ready_for_review`. GitLab sends merge request events, including updates with a
-previous source revision or draft transition. Forgejo sends pull request
+`ready_for_review`. Retargeting a PR to another base branch also triggers a
+revision check. Title and description edits alone do not queue a review.
+GitLab sends merge request events, including updates with a
+previous source revision or draft transition. If an opening event arrives while
+GitLab is preparing its diff, Razbor saves the delivery and retries automatically.
+It checks the current revisions and eligibility before queuing the review.
+Forgejo sends pull request
 lifecycle events and a separate synchronization subscription for source updates.
 For that subscription, Forgejo sends `pull_request` in `X-Forgejo-Event` and
 `pull_request_sync` in `X-Forgejo-Event-Type`.
@@ -261,6 +268,10 @@ response can delay status updates until the comment appears. During cleanup,
 Razbor checks the full comment list again after 30 seconds if the bot's marker
 is missing. Two complete reads without the marker finish cleanup. A fast review
 may finish before the status worker posts a comment.
+
+If a temporary comment disappears while the review is queued or running,
+Razbor detects it on the next status update. Once a complete PR comment listing
+confirms its absence, Razbor can post a replacement for the still-active review.
 
 Repository deletion waits for temporary comment cleanup before discarding
 credentials. If the forge is unavailable or rejects a delete, restore

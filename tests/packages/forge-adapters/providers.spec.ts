@@ -10,6 +10,7 @@ import {
   verifyRepository,
   ForgeReadError,
   type ForgeConnection,
+  type ForgePublicationProgress,
   type ForgeType,
 } from "@razbor/forge-adapters";
 
@@ -97,6 +98,27 @@ test("authenticated GitHub and Forgejo lifecycle events use the provider's actua
   assert.equal(
     lifecycleEvent("github", { ...base, action: "converted_to_draft" })?.kind,
     "draft",
+  );
+  assert.equal(
+    lifecycleEvent("github", {
+      ...base,
+      action: "edited",
+      changes: {
+        base: { ref: { from: "main" }, sha: { from: "a".repeat(40) } },
+      },
+    })?.kind,
+    "updated",
+  );
+  assert.equal(
+    lifecycleEvent("github", {
+      ...base,
+      action: "edited",
+      changes: {
+        title: { from: "Old title" },
+        body: { from: "Old description" },
+      },
+    }),
+    undefined,
   );
   assert.equal(
     lifecycleEvent("forgejo", {
@@ -199,13 +221,54 @@ test("current change reads use the target repository, immutable fork revisions a
   let draft = true;
   let outdatedDiff = false;
   let foreign = false;
+  let bulkOutcome: "accepted" | "lost" = "accepted";
+  let bulkPosts = 0;
+  let summaryBody = "";
+  let interruptSummaryRead = false;
   t.mock.method(globalThis, "fetch", async (input: URL, init: RequestInit) => {
-    assert.equal(init.method, "GET");
     assert.equal(input.origin, origin);
     const url = input.pathname;
+    if (url.endsWith("/draft_notes/bulk_publish") && init.method === "POST") {
+      const payload = JSON.parse(String(init.body));
+      assert.equal(payload.reviewer_state, "requested_changes");
+      summaryBody = payload.note;
+      bulkPosts++;
+      if (bulkOutcome === "lost") throw new Error("lost response");
+      interruptSummaryRead = true;
+      return new Response(null, { status: 204 });
+    }
+    if (url.endsWith("/notes/17") && init.method === "PUT") {
+      summaryBody = JSON.parse(String(init.body)).body;
+      return Response.json({
+        id: 17,
+        author: { id: 5, username: "razbor" },
+        created_at: "2026-02-04T03:02:01Z",
+        body: summaryBody,
+      });
+    }
+    assert.equal(init.method, "GET");
     if (url === "/api/v4/user")
       return Response.json({ id: 5, username: "razbor" });
-    if (url.endsWith("/merge_requests/12/notes")) return Response.json([]);
+    if (url.endsWith("/merge_requests/12/notes")) {
+      if (interruptSummaryRead) {
+        interruptSummaryRead = false;
+        return new Response(null, { status: 503 });
+      }
+      return Response.json(
+        summaryBody
+          ? [
+              {
+                id: 17,
+                author: { id: 5, username: "razbor" },
+                created_at: "2026-02-04T03:02:01Z",
+                body: summaryBody,
+              },
+            ]
+          : [],
+      );
+    }
+    if (url.endsWith("/merge_requests/12/discussions"))
+      return Response.json([]);
     if (url.endsWith("/merge_requests/12/draft_notes"))
       return Response.json([]);
     const project = foreign ? "fork/project" : "team/project";
@@ -270,7 +333,7 @@ test("current change reads use the target repository, immutable fork revisions a
         forge.change(12),
         (error: unknown) =>
           error instanceof ForgeOperationError &&
-          error.reason === "unavailable",
+          error.reason === "diff-pending",
       );
       outdatedDiff = false;
     }
@@ -306,6 +369,43 @@ test("current change reads use the target repository, immutable fork revisions a
     draft = type !== "gitlab";
     await rejectsPublication(base);
     assert.equal(draft, true);
+    if (type === "gitlab") {
+      // Recover both an acknowledged bulk write and a lost response from the original summary.
+      for (const outcome of ["accepted", "lost"] as const) {
+        bulkOutcome = outcome;
+        bulkPosts = 0;
+        summaryBody = "";
+        draft = false;
+        let saved: ForgePublicationProgress = {};
+        /** Resume exactly the provider checkpoint saved by the previous call. */
+        const publish = () =>
+          forge.postReview(
+            12,
+            head,
+            "<!-- razbor:rev_abcdefghijklmnop:result -->",
+            [],
+            "REQUEST_CHANGES",
+            {
+              revision: change,
+              progress: saved,
+              requireReady: true,
+              /** Model the durable outbox boundary. */
+              async save(value) {
+                saved = structuredClone(value);
+              },
+            },
+          );
+        await assert.rejects(publish());
+        assert.equal(
+          saved.bulk.submitted,
+          outcome === "accepted" ? true : undefined,
+        );
+        draft = true;
+        assert.equal(await publish(), "17");
+        assert.match(summaryBody, /:complete -->$/);
+        assert.equal(bulkPosts, 1);
+      }
+    }
     closed = true;
     await assert.rejects(
       forge.change(12),

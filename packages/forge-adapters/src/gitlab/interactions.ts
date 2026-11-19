@@ -35,6 +35,8 @@ const integer = z.preprocess(
 
 const sha = z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i);
 
+const pendingDiffSha = sha.or(z.literal("")).nullish();
+
 const actor = z.object({ id, username: z.string() });
 
 // GitLab 18.x also emits "YYYY-MM-DD HH:mm:ss UTC" in webhook attributes.
@@ -529,23 +531,29 @@ export class GitlabForge implements Forge {
         state: z.literal("opened"),
         draft: z.boolean().optional(),
         work_in_progress: z.boolean().optional(),
-        sha: sha.optional(),
+        sha: pendingDiffSha,
         title: z.string(),
         web_url: z.string().url(),
         author: actor,
         target_branch: z.string().min(1),
         source_branch: z.string().min(1).max(1024).optional(),
         diff_refs: z
-          .object({ base_sha: sha, head_sha: sha, start_sha: sha })
+          .object({
+            base_sha: pendingDiffSha,
+            head_sha: pendingDiffSha,
+            start_sha: pendingDiffSha,
+          })
           .nullish(),
       })
       .parse(response);
     // GitLab populates a new diff version asynchronously after a source branch update.
     if (
-      !result.diff_refs ||
-      (result.sha && result.sha !== result.diff_refs.head_sha)
+      !result.diff_refs?.base_sha ||
+      !result.diff_refs.head_sha ||
+      !result.diff_refs.start_sha ||
+      (result.sha !== undefined && result.sha !== result.diff_refs.head_sha)
     )
-      throw new ForgeOperationError("unavailable");
+      throw new ForgeOperationError("diff-pending");
     const target = z
       .object({
         name: z.string(),
@@ -802,18 +810,9 @@ export class GitlabForge implements Forge {
       );
   }
 
-  /** Read the explicit reviewer state, not the user-account state on the MR resource. */
-  private async reviewerState(n: number, botId: string) {
-    const reviewers = z
-      .array(z.object({ user: actor, state: z.string() }))
-      .max(1000)
-      .parse(await this.transport.request(`${this.changeRoute(n)}/reviewers`));
-    return reviewers.find((item) => item.user.id === botId)?.state;
-  }
-
   /**
    * Publish only this run's drafts, checkpointing each write and making the
-   * summary final only after notes and the native reviewer state are verified.
+   * summary final only after the submitted summary and revision-bound notes are verified.
    * An ambiguous absent write is never recreated automatically.
    */
   async postReview(
@@ -845,7 +844,12 @@ export class GitlabForge implements Forge {
       key: `draft-${index}`,
       body: `${comment.body}\n\n<!-- razbor-gitlab-draft:${run}:${index}:${head} -->`,
     }));
-    if (!summaries.length && !progress.bulk?.writing && !progress.bulk?.id) {
+    if (
+      !summaries.length &&
+      !progress.bulk?.writing &&
+      !progress.bulk?.submitted &&
+      !progress.bulk?.id
+    ) {
       const current = await reviewRevision(this, n, head, publication);
       const guard = {
         revision: publication.revision ?? current,
@@ -947,24 +951,25 @@ export class GitlabForge implements Forge {
         throw new ForgeOperationError("invalid-response");
       progress.bulk = { writing: true };
       await publication.save(progress);
-      try {
-        await reviewRevision(this, n, head, guard);
-      } catch (error) {
-        // The bulk request has not been sent. Recovery may still retire these drafts.
-        progress.bulk = {};
-        await publication.save(progress);
-        throw error;
-      }
-      try {
-        await this.transport.request(
+      let sent = false;
+      /** Submit the requested reviewer state and this run's summary as one GitLab operation. */
+      const write = () => {
+        sent = true;
+        return this.transport.request(
           `${this.changeRoute(n)}/draft_notes/bulk_publish`,
           "POST",
           { note: pendingBody, reviewer_state: state },
         );
+      };
+      try {
+        await reviewRevision(this, n, head, guard);
+        if (publication.submit) await publication.submit(write);
+        else await write();
       } catch (error) {
         if (
-          error instanceof ForgeOperationError &&
-          [401, 403, 404, 405].includes(error.status ?? 0)
+          !sent ||
+          (error instanceof ForgeOperationError &&
+            [401, 403, 404, 405].includes(error.status ?? 0))
         ) {
           progress.bulk = {};
           await publication.save(progress);
@@ -972,6 +977,8 @@ export class GitlabForge implements Forge {
         }
         throw new ForgeOperationError("unavailable", true);
       }
+      progress.bulk = { submitted: true };
+      await publication.save(progress);
       summaries = (await this.comments(n)).filter(
         (item) => item.user.id === bot.id && item.body.includes(metadata),
       );
@@ -995,19 +1002,17 @@ export class GitlabForge implements Forge {
             item.author.id === bot.id &&
             item.body === entry.body &&
             item.position?.head_sha === head &&
+            (!publication.revision ||
+              (item.position.base_sha === publication.revision.mergeBase &&
+                item.position.start_sha === publication.revision.startSha)) &&
             item.position.new_path === entry.comment.path &&
             matchesCommentRange(item.position, entry.comment),
         );
       if (published.length !== 1)
         throw new ForgeOperationError("invalid-response", true);
     }
-    if (
-      progress.summary?.id !== summary.id &&
-      (await this.reviewerState(n, bot.id)) !== state
-    )
-      throw new ForgeOperationError("unsupported", true);
-    // The bulk request already submitted the verdict and these revision-bound notes.
-    // Completing its existing summary is safe even if the MR has since changed.
+    // Only this bulk submission could create its exact marked summary and notes.
+    // A later review request can change the bot's reviewer state independently.
     progress.summary = { id: summary.id, writing: true };
     await publication.save(progress);
     const finalized = note.parse(
@@ -1075,29 +1080,54 @@ export class GitlabForge implements Forge {
     n: number,
     reviewPublicId: string,
     progress: ForgePublicationProgress,
+    save: ForgeReviewPublication["save"],
   ) {
     if (!/^[A-Za-z0-9_]+$/.test(reviewPublicId))
       throw new ForgeOperationError("invalid-response");
+    if (progress.bulk?.writing || progress.bulk?.submitted || progress.bulk?.id)
+      throw new ForgeOperationError("unavailable", true);
     const bot = await this.identity();
     const marker = new RegExp(
       `<!-- razbor-gitlab-draft:${reviewPublicId}:(\\d+):[a-f0-9]{40}(?:[a-f0-9]{24})? -->$`,
     );
-    for (const item of await this.drafts(n)) {
+    const drafts = await this.drafts(n);
+    for (const item of drafts) {
       const match = marker.exec(item.note);
-      if (!match || item.author_id !== bot.id) continue;
-      const step = progress[`draft-${match[1]}`];
-      if (!step || !(step.id === item.id || (!step.id && step.writing)))
-        continue;
-      try {
-        await this.transport.request(
-          `${this.changeRoute(n)}/draft_notes/${item.id}`,
-          "DELETE",
-        );
-      } catch (error) {
-        if (error instanceof ForgeOperationError && error.status === 404)
-          continue;
-        throw error;
+      const step = match && progress[`draft-${match[1]}`];
+      if (match && item.author_id === bot.id && !step?.id && !step?.writing)
+        throw new ForgeOperationError("invalid-response", true);
+    }
+    let saved = progress;
+    for (const [key, step] of Object.entries(progress)) {
+      const index = /^draft-(\d+)$/.exec(key)?.[1];
+      if (index === undefined || (!step.id && !step.writing)) continue;
+      const matches = drafts.filter(
+        (item) => item.id === step.id || marker.exec(item.note)?.[1] === index,
+      );
+      if (!matches.length && step.id) continue;
+      const item = matches[0];
+      if (
+        matches.length !== 1 ||
+        item.author_id !== bot.id ||
+        marker.exec(item.note)?.[1] !== index ||
+        (step.id && step.id !== item.id)
+      )
+        throw new ForgeOperationError("invalid-response", true);
+      if (!step.id) {
+        // Retain a recovered creation's identity before deletion, including across restarts.
+        saved = { ...saved, [key]: { id: item.id } };
+        await save(saved);
       }
+      await removeIfPresent(
+        item.id,
+        async () => {
+          await this.transport.request(
+            `${this.changeRoute(n)}/draft_notes/${item.id}`,
+            "DELETE",
+          );
+        },
+        () => this.drafts(n),
+      );
     }
   }
 

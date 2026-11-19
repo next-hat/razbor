@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
 
 import { and, eq, sql } from "drizzle-orm";
+import { drizzle } from "drizzle-orm/node-postgres";
+import type { PoolClient } from "pg";
 import { z } from "zod";
 
 import {
@@ -25,6 +27,7 @@ import {
 
 import {
   acceptReviewTrigger,
+  reviewSubmissionLock,
   reviewTriggerSession,
   triggerDelivery,
 } from "@database/src/review-triggers.js";
@@ -75,7 +78,7 @@ export { webhookSettingsSchema } from "@database/src/webhook-settings.js";
 export async function interactionLock<T>(
   database: Database,
   key: string,
-  action: () => Promise<T>,
+  action: (client: PoolClient) => Promise<T>,
 ): Promise<T | undefined> {
   const client = await database.pool.connect();
   let discard = false;
@@ -86,11 +89,10 @@ export async function interactionLock<T>(
     );
     if (!result.rows[0].locked) return;
     try {
-      return await action();
+      return await action(client);
     } finally {
-      await client.query("select pg_advisory_unlock(748322,hashtext($1))", [
-        key,
-      ]);
+      // Release the outer lock and any nested submission lock whose cleanup failed.
+      await client.query("select pg_advisory_unlock_all()");
     }
   } catch (error) {
     discard = true;
@@ -463,6 +465,29 @@ export async function webhookView(database: Database, repositoryId: string) {
   };
 }
 
+// Webhook admission compares millisecond timestamps across provider reads.
+// Make consecutive edits distinguishable even within the same clock tick.
+const nextHookRevision = sql`greatest(date_trunc('milliseconds', clock_timestamp()),
+  date_trunc('milliseconds', ${repositoryWebhooks.updatedAt}) + interval '1 millisecond')`;
+
+/** Advance the admission fence only when saved settings or the signing credential change. */
+function webhookSettingsRevision(
+  old: typeof repositoryWebhooks.$inferSelect | undefined,
+  settings: z.infer<typeof webhookSettingsSchema>,
+  rotated = false,
+) {
+  if (!old) return new Date();
+  if (
+    rotated ||
+    old.enabled !== settings.enabled ||
+    old.callbackBase !== settings.callback_base.replace(/\/$/, "") ||
+    JSON.stringify(old.secret) !== JSON.stringify(settings.secret) ||
+    JSON.stringify(old.senders) !== JSON.stringify(settings.permitted_senders)
+  )
+    return nextHookRevision;
+  return undefined;
+}
+
 /**
  * Save validated settings for an active hosted repository while enforcing
  * configuration ownership and preserving App-owned connection credentials.
@@ -505,7 +530,7 @@ export async function configureWebhook(
       callbackBase: settings.callback_base.replace(/\/$/, ""),
       secret: settings.secret,
       senders: settings.permitted_senders,
-      updatedAt: new Date(),
+      updatedAt: webhookSettingsRevision(old, settings),
       setup:
         old?.mode === "manual" &&
         old.callbackBase === settings.callback_base.replace(/\/$/, "") &&
@@ -659,7 +684,7 @@ export async function saveWebhookFromUi(
           : old?.mode === "manual"
             ? "manual"
             : "pending",
-      updatedAt: new Date(),
+      updatedAt: webhookSettingsRevision(old, settings, !!data.signing_secret),
     };
     if (old)
       await tx
@@ -701,8 +726,13 @@ export async function reconcileWebhook(
         const bot = await api.identity();
         await database.db
           .update(repositoryWebhooks)
-          .set({ botId: bot.id })
-          .where(eq(repositoryWebhooks.id, row.hook.id));
+          .set({ botId: bot.id, updatedAt: nextHookRevision })
+          .where(
+            and(
+              eq(repositoryWebhooks.id, row.hook.id),
+              sql`${repositoryWebhooks.botId} is distinct from ${bot.id}`,
+            ),
+          );
         const remoteId =
           row.hook.mode === "managed"
             ? await api.reconcileHook(
@@ -721,7 +751,8 @@ export async function reconcileWebhook(
               : row.hook.mode === "manual"
                 ? sql`case when ${repositoryWebhooks.setup} = 'ready' then 'ready' else 'manual' end`
                 : "ready",
-            updatedAt: new Date(),
+            updatedAt: sql`case when ${repositoryWebhooks.remoteId} is distinct from ${remoteId}
+              then ${nextHookRevision} else ${repositoryWebhooks.updatedAt} end`,
           })
           .where(eq(repositoryWebhooks.id, row.hook.id));
       } catch (error) {
@@ -732,7 +763,6 @@ export async function reconcileWebhook(
               error instanceof ForgeOperationError
                 ? error.reason
                 : "configuration-error",
-            updatedAt: new Date(),
           })
           .where(eq(repositoryWebhooks.id, row.hook.id));
       }
@@ -845,6 +875,143 @@ function webhookErrorReason(error: unknown) {
   if (error instanceof ForgeOperationError) return error.reason;
   if (error instanceof z.ZodError) return "invalid-data";
   return "unavailable";
+}
+
+/** Queue policy-authorized work for the current revision and greet a newly opened PR once. */
+async function handlePullRequest(
+  database: Database,
+  row: Awaited<ReturnType<typeof context>>,
+  event: Exclude<ForgeWebhook, { kind: "push" | "ping" | "comment" }>,
+  setStage?: (stage: string) => void,
+): Promise<[number, string]> {
+  const h = row.hook;
+  const botId = h.botId;
+  if (!botId) return [503, "bot-identity-unavailable"];
+  const session = await reviewTriggerSession(
+    database,
+    row.repo.id,
+    event.number,
+  );
+  const api = await adapter(database, row, 30000, true);
+  setStage?.("read-pull-request");
+  let change: ForgeChange | undefined;
+  try {
+    change = await api.change(event.number);
+    if (change.number !== event.number)
+      return [403, "pull-request-identity-mismatch"];
+  } catch (error) {
+    if (
+      event.kind === "opened" &&
+      row.forge.type === "gitlab" &&
+      error instanceof ForgeOperationError &&
+      error.reason === "diff-pending"
+    ) {
+      setStage?.("persist-deferred-open");
+      const saved = await acceptReviewTrigger(
+        database,
+        row.repo,
+        h,
+        row.forge.type,
+        {
+          event,
+          generation: session?.triggerGeneration ?? 0,
+          waitingForDiff: true,
+        },
+      );
+      if (saved.retry) return [409, "competing-observation"];
+      return [202, "merge-request-diff-pending"];
+    }
+    if (
+      !(error instanceof ForgeOperationError) ||
+      error.reason !== "change-closed"
+    )
+      throw error;
+  }
+  const eligible =
+    change?.draft === false &&
+    event.kind !== "closed" &&
+    event.kind !== "reopened" &&
+    (row.repo.reviewTriggerMode === "automatic" ||
+      (row.repo.reviewTriggerMode === "opt_in_continuous" &&
+        session?.continuousReviewSince));
+  /** Read prior published findings only after the event is eligible to queue work. */
+  const readHistory = () => {
+    setStage?.("read-previous-findings");
+    return previousFindings(database, row.repo.id, event.number, botId, api);
+  };
+  const previous = eligible ? (await readHistory()).findings : undefined;
+
+  setStage?.("persist-lifecycle");
+  let accepted = await acceptReviewTrigger(
+    database,
+    row.repo,
+    h,
+    row.forge.type,
+    {
+      event,
+      change,
+      generation: session?.triggerGeneration ?? 0,
+      previous,
+    },
+  );
+  if (accepted.historyGeneration !== undefined) {
+    const history = await readHistory();
+    setStage?.("persist-lifecycle");
+    accepted = await acceptReviewTrigger(
+      database,
+      row.repo,
+      h,
+      row.forge.type,
+      {
+        event,
+        change,
+        previous: history.findings,
+        generation: accepted.historyGeneration,
+      },
+    );
+  }
+  if ("retry" in accepted) return [409, "competing-observation"];
+  if ("duplicate" in accepted) return [202, "duplicate-delivery"];
+  if (event.kind === "opened" && change) {
+    const greeting = change.author ? `Hey @${change.author}! ` : "";
+    // Greeting is optional. Admission already committed, even if the bot lacks comment permissions.
+    try {
+      await interactionLock(
+        database,
+        `repository:${row.repo.publicId}`,
+        async () => {
+          const current = await context(database, row.repo.publicId);
+          if (
+            current.repo.status !== "active" ||
+            !current.hook.enabled ||
+            current.hook.updatedAt.getTime() !== h.updatedAt.getTime()
+          )
+            return;
+          const marker = `<!-- razbor:${row.repo.publicId}:${event.number}:welcome -->`;
+          const existing = (await api.comments(event.number)).some(
+            (c) => c.user.id === h.botId && c.body.includes(marker),
+          );
+          if (existing) return;
+          const instructions = {
+            manual: `Request a review by commenting \`${reviewCommandText()}\`.`,
+            opt_in_continuous: `Comment \`${reviewCommandText()}\` to start continuous review for this pull request. I'll review subsequent revisions automatically.`,
+            automatic:
+              "I'll review this pull request automatically when it is ready and when its source revision changes.",
+          };
+          await api.postComment(
+            event.number,
+            `${greeting}${instructions[current.repo.reviewTriggerMode]}\n\n${marker}`,
+          );
+        },
+      );
+    } catch (error) {
+      logger.warn(
+        { hookId: h.publicId, reason: webhookErrorReason(error) },
+        "pull request greeting unavailable",
+      );
+    }
+  }
+  return ["reviewId" in accepted ? 202 : 200, "pull-request-accepted"];
 }
 
 /**
@@ -998,116 +1165,6 @@ export async function acceptWebhook(
       },
     );
     return result ?? outcome(503, "push-refresh-in-progress");
-  }
-
-  /** Queue policy-authorized work for the current revision and greet a newly opened PR once. */
-  async function handlePullRequest(
-    event: Exclude<ForgeWebhook, { kind: "push" | "ping" | "comment" }>,
-  ) {
-    const botId = h.botId;
-    if (!botId) return outcome(503, "bot-identity-unavailable");
-    const session = await reviewTriggerSession(
-      database,
-      row.repo.id,
-      event.number,
-    );
-    const api = await adapter(database, row, 30000, true);
-    stage = "read-pull-request";
-    let change: ForgeChange | undefined;
-    try {
-      change = await api.change(event.number);
-      if (change.number !== event.number)
-        return outcome(403, "pull-request-identity-mismatch");
-    } catch (error) {
-      if (
-        !(error instanceof ForgeOperationError) ||
-        error.reason !== "change-closed"
-      )
-        throw error;
-    }
-    const eligible =
-      change?.draft === false &&
-      event.kind !== "closed" &&
-      event.kind !== "reopened" &&
-      (row.repo.reviewTriggerMode === "automatic" ||
-        (row.repo.reviewTriggerMode === "opt_in_continuous" &&
-          session?.continuousReviewSince));
-    /** Read prior published findings only after the event is eligible to queue work. */
-    const readHistory = () =>
-      previousFindings(database, row.repo.id, event.number, botId, api);
-    const previous = eligible ? (await readHistory()).findings : undefined;
-    stage = "persist-lifecycle";
-    let accepted = await acceptReviewTrigger(
-      database,
-      row.repo,
-      h,
-      row.forge.type,
-      {
-        event,
-        change,
-        generation: session?.triggerGeneration ?? 0,
-        previous,
-      },
-    );
-    if (accepted.historyGeneration !== undefined) {
-      stage = "read-previous-findings";
-      const history = await readHistory();
-      stage = "persist-lifecycle";
-      accepted = await acceptReviewTrigger(
-        database,
-        row.repo,
-        h,
-        row.forge.type,
-        {
-          event,
-          change,
-          previous: history.findings,
-          generation: accepted.historyGeneration,
-        },
-      );
-    }
-    if ("retry" in accepted) return 409;
-    if ("duplicate" in accepted) return outcome(202, "duplicate-delivery");
-    if (event.kind === "opened" && change) {
-      const greeting = change.author ? `Hey @${change.author}! ` : "";
-      // Greeting is optional. Admission already committed, even if the bot lacks comment permissions.
-      try {
-        await interactionLock(
-          database,
-          `repository:${row.repo.publicId}`,
-          async () => {
-            const current = await context(database, row.repo.publicId);
-            if (
-              current.repo.status !== "active" ||
-              !current.hook.enabled ||
-              current.hook.updatedAt.getTime() !== h.updatedAt.getTime()
-            )
-              return;
-            const marker = `<!-- razbor:${row.repo.publicId}:${event.number}:welcome -->`;
-            const existing = (await api.comments(event.number)).some(
-              (c) => c.user.id === h.botId && c.body.includes(marker),
-            );
-            if (existing) return;
-            const instructions = {
-              manual: `Request a review by commenting \`${reviewCommandText()}\`.`,
-              opt_in_continuous: `Comment \`${reviewCommandText()}\` to start continuous review for this pull request. I'll review subsequent revisions automatically.`,
-              automatic:
-                "I'll review this pull request automatically when it is ready and when its source revision changes.",
-            };
-            await api.postComment(
-              event.number,
-              `${greeting}${instructions[current.repo.reviewTriggerMode]}\n\n${marker}`,
-            );
-          },
-        );
-      } catch (error) {
-        log.warn(
-          { reason: webhookErrorReason(error) },
-          "pull request greeting unavailable",
-        );
-      }
-    }
-    return outcome("reviewId" in accepted ? 202 : 200, "pull-request-accepted");
   }
 
   /**
@@ -1366,7 +1423,16 @@ export async function acceptWebhook(
       const status =
         normalizedEvent.kind === "comment"
           ? await handleComment()
-          : await handlePullRequest(normalizedEvent);
+          : outcome(
+              ...(await handlePullRequest(
+                database,
+                row,
+                normalizedEvent,
+                (next) => {
+                  stage = next;
+                },
+              )),
+            );
       if (status !== 409) return status;
     }
     return outcome(503, "pull-request-changed-during-admission");
@@ -1406,7 +1472,7 @@ export async function processInteraction(database: Database, reviewId: string) {
     );
   if (!scope) return;
   const lock = `repository:${scope.repositoryId}`;
-  await interactionLock(database, lock, async () => {
+  await interactionLock(database, lock, async (lockClient) => {
     const [entry] = await database.db
       .select({
         review: reviews,
@@ -1450,6 +1516,7 @@ export async function processInteraction(database: Database, reviewId: string) {
           and(
             eq(pullRequests.repositoryId, review.repositoryId),
             eq(pullRequests.number, trigger.change.number),
+            eq(repositories.status, "active"),
           ),
         );
     }
@@ -1464,6 +1531,10 @@ export async function processInteraction(database: Database, reviewId: string) {
         session.pr.draft === false &&
         session.pr.headSha === review.headSha &&
         session.pr.baseSha === trigger.change.baseSha &&
+        (session.pr.mergeBase === null ||
+          session.pr.mergeBase === review.baseSha) &&
+        (session.pr.startSha === null ||
+          session.pr.startSha === trigger.change.startSha) &&
         (session.mode === "automatic" ||
           (session.mode === "opt_in_continuous" &&
             !!session.pr.continuousReviewSince))
@@ -2040,9 +2111,11 @@ export async function processInteraction(database: Database, reviewId: string) {
      */
     async function publishReview() {
       const bulk = api.type === "gitlab" && progress.providerProgress?.bulk;
-      if (bulk && (bulk.writing || bulk.id) && progress.reviewPayload) {
+      if (bulk && (bulk.writing || bulk.submitted || bulk.id)) {
         // A submitted GitLab verdict may already be visible. Recover its frozen
         // notes and summary before a fresh change observation can retire the run.
+        if (!progress.reviewPayload)
+          throw new ForgeOperationError("unavailable", true);
         await submitNativeReview(progress.reviewPayload);
         return;
       }
@@ -2073,6 +2146,7 @@ export async function processInteraction(database: Database, reviewId: string) {
             trigger.change.number,
             review.publicId,
             progress.providerProgress,
+            saveProviderProgress,
           );
         const app =
           row.hook.mode === "github-app"
@@ -2257,6 +2331,45 @@ export async function processInteraction(database: Database, reviewId: string) {
       await submitNativeReview(payload);
     }
 
+    /** Order the final native POST against committed trigger changes, without opening a transaction for provider I/O. */
+    async function submitUnderPolicy<T>(write: () => Promise<T>): Promise<T> {
+      const key = reviewSubmissionLock(trigger.repositoryId);
+      let started = false;
+      try {
+        const lock = await lockClient.query<{ locked: boolean }>(
+          "select pg_try_advisory_lock(748322, hashtext($1)) as locked",
+          [key],
+        );
+        if (!lock.rows[0].locked) throw new ForgeOperationError("unavailable");
+        try {
+          const [session] = await sessionQuery(drizzle(lockClient));
+          if (!sessionAllowsReview(session))
+            throw new ForgeOperationError("invalid-response");
+          started = true;
+          return await write();
+        } finally {
+          await lockClient.query(
+            "select pg_advisory_unlock(748322, hashtext($1))",
+            [key],
+          );
+        }
+      } catch (error) {
+        if (error instanceof ForgeOperationError) throw error;
+        throw new ForgeOperationError("unavailable", started);
+      }
+    }
+
+    /** Persist each provider operation before sending it and after confirming its identity or submission. */
+    async function saveProviderProgress(
+      providerProgress: NonNullable<Publication["providerProgress"]>,
+    ) {
+      progress = {
+        ...progress,
+        providerProgress: structuredClone(providerProgress),
+      };
+      await update({ publication: progress });
+    }
+
     /** Submit or reconcile the frozen provider payload, then record its remote review and inline identities. */
     async function submitNativeReview(
       payload: NonNullable<Publication["reviewPayload"]>,
@@ -2271,14 +2384,11 @@ export async function processInteraction(database: Database, reviewId: string) {
           progress: progress.providerProgress ?? {},
           revision: trigger.change,
           requireReady: trigger.origin === "automatic" || !!progress.rearmed,
-          /** Save each provider operation before sending it and after confirming its ID. */
-          async save(providerProgress) {
-            progress = {
-              ...progress,
-              providerProgress: structuredClone(providerProgress),
-            };
-            await update({ publication: progress });
-          },
+          submit:
+            trigger.origin === "automatic" || progress.rearmed
+              ? submitUnderPolicy
+              : undefined,
+          save: saveProviderProgress,
         },
       );
       progress = { ...progress, remoteId, writing: false };
@@ -2305,12 +2415,36 @@ export async function processInteraction(database: Database, reviewId: string) {
         error.reason === "change-closed" &&
         !progress.writing
       ) {
-        if (progress.providerProgress && api.discardPendingReview) {
+        const bulk = progress.providerProgress?.bulk;
+        const bulkStarted = bulk?.writing || bulk?.submitted || bulk?.id;
+        if (api.type === "gitlab" && bulkStarted && !progress.remoteId) {
+          await update({
+            publication: {
+              ...progress,
+              state: "uncertain",
+              error: "GitLab bulk submission pending reconciliation",
+            },
+          });
+          return;
+        }
+        const beforeGitlabSubmission =
+          api.type === "gitlab" &&
+          progress.mode === "review" &&
+          !progress.remoteId &&
+          !progress.inlineIds &&
+          !progress.providerProgress?.summary &&
+          !bulkStarted;
+        if (
+          beforeGitlabSubmission &&
+          progress.providerProgress &&
+          api.discardPendingReview
+        ) {
           try {
             await api.discardPendingReview(
               trigger.change.number,
               review.publicId,
               progress.providerProgress,
+              saveProviderProgress,
             );
           } catch {
             await update({
@@ -2326,6 +2460,12 @@ export async function processInteraction(database: Database, reviewId: string) {
         await update({
           publication: {
             ...progress,
+            ...(beforeGitlabSubmission && {
+              mode: undefined,
+              reviewPayload: undefined,
+              providerProgress: undefined,
+              staleGeneration: entry.generation ?? 0,
+            }),
             state: "stale",
             stale: true,
             writing: false,
@@ -2353,6 +2493,56 @@ export async function processInteraction(database: Database, reviewId: string) {
       });
     }
   });
+}
+
+/** Resume one authenticated GitLab opening once its exact diff version becomes available. */
+export async function processDeferredOpen(database: Database) {
+  const due = sql`${webhookDeliveries.openRetryAfter} <= now()`;
+  const [row] = await database.db
+    .select({
+      receipt: webhookDeliveries,
+      hook: repositoryWebhooks,
+      repo: repositories,
+      forge: forgeInstances,
+    })
+    .from(webhookDeliveries)
+    .innerJoin(
+      repositoryWebhooks,
+      eq(repositoryWebhooks.id, webhookDeliveries.webhookId),
+    )
+    .innerJoin(
+      repositories,
+      eq(repositories.id, repositoryWebhooks.repositoryId),
+    )
+    .innerJoin(forgeInstances, eq(forgeInstances.id, repositories.forgeId))
+    .where(due)
+    .orderBy(webhookDeliveries.openRetryAfter)
+    .limit(1);
+  if (!row?.receipt.pendingOpen) return;
+  const { receipt, repo, hook, forge } = row;
+  const event = row.receipt.pendingOpen;
+  // Settings and registration changes revoke this delivery's original binding.
+  if (
+    !hook.enabled ||
+    hook.updatedAt.toISOString() !== event.hookUpdatedAt ||
+    repo.status !== "active" ||
+    forge.type !== "gitlab" ||
+    repo.externalRepositoryId !== event.repositoryId
+  ) {
+    await database.db
+      .update(webhookDeliveries)
+      .set({ pendingOpen: null, openRetryAfter: null })
+      .where(eq(webhookDeliveries.id, receipt.id));
+    return;
+  }
+  // Set the next attempt before provider I/O. A restarted dispatcher can pick
+  // up this receipt again, and admission consumes it atomically with the job.
+  const [claimed] = await database.db
+    .update(webhookDeliveries)
+    .set({ openRetryAfter: sql`now() + interval '30 seconds'` })
+    .where(and(eq(webhookDeliveries.id, receipt.id), due))
+    .returning({ id: webhookDeliveries.id });
+  if (claimed) await handlePullRequest(database, row, event);
 }
 
 /**

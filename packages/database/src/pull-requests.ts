@@ -18,11 +18,14 @@ import {
   type ForgePullRequest,
 } from "@razbor/forge-adapters";
 
-import type { Database } from "@database/src/connection.js";
+import type { Database, Transaction } from "@database/src/connection.js";
 import { getRepositoryGithubApp } from "@database/src/github-apps.js";
 import { publicId } from "@database/src/ids.js";
 import { readSecret } from "@database/src/registry.js";
-import { supersedeQueuedAutomaticReviews } from "@database/src/review-triggers.js";
+import {
+  lockReviewTriggerChanges,
+  supersedeQueuedAutomaticReviews,
+} from "@database/src/review-triggers.js";
 import { reviewView, reviewViewSelection } from "@database/src/review-view.js";
 import {
   forgeInstances,
@@ -233,6 +236,14 @@ function validateListing(changes: ForgePullRequest[]) {
   }
 }
 
+/** Identify the closure to reread after a concurrent webhook invalidates the refresh transaction. */
+class ClosureChanged extends Error {
+  /** Retain the provider PR number so other confirmed closures keep their original observation times. */
+  constructor(readonly number: number) {
+    super("Pull request changed during closure verification");
+  }
+}
+
 /**
  * Refresh granted, active and verified forge repositories under per-repository
  * interaction locks. Confirm absent PRs are closed with a direct provider read;
@@ -321,7 +332,6 @@ export async function syncPullRequests(
               and(
                 eq(pullRequests.repositoryId, repo.id),
                 eq(pullRequests.state, "open"),
-                lte(pullRequests.syncedAt, listingStartedAt),
                 changes.length
                   ? notInArray(
                       pullRequests.number,
@@ -330,19 +340,36 @@ export async function syncPullRequests(
                   : undefined,
               ),
             );
-          const closedObservations: { number: number; observedAt: Date }[] = [];
-          // Offset pagination can skip an open PR when earlier rows close mid-list.
-          // Only its direct closed-state response permits removing it from the queue.
-          for (const missing of absent) {
+          const closedObservations = new Map<
+            number,
+            { rowVersion: string; observedAt: Date }
+          >();
+
+          /** Fence each authoritative close read against concurrent observations, including a same-revision open. */
+          async function observeClosure(number: number) {
+            closedObservations.delete(number);
+            const [before] = await database.db
+              // A same-revision open keeps the trigger generation and can even
+              // share its timestamp with another webhook. Each write still has a new xmin.
+              .select({ rowVersion: sql<string>`xmin::text` })
+              .from(pullRequests)
+              .where(
+                and(
+                  eq(pullRequests.repositoryId, repo.id),
+                  eq(pullRequests.number, number),
+                  eq(pullRequests.state, "open"),
+                ),
+              );
+            if (!before) return;
             try {
-              await api.change(missing.number);
+              await api.change(number);
             } catch (error) {
               if (
                 error instanceof ForgeOperationError &&
                 error.reason === "change-closed"
               ) {
-                closedObservations.push({
-                  number: missing.number,
+                closedObservations.set(number, {
+                  ...before,
                   observedAt: new Date(),
                 });
               } else {
@@ -350,8 +377,11 @@ export async function syncPullRequests(
               }
             }
           }
-          const syncedAt = new Date();
-          await database.transaction(async (tx) => {
+          for (const { number } of absent) await observeClosure(number);
+
+          /** Either commit the entire provider snapshot or roll back the batch for a fresh close observation. */
+          async function saveSnapshot(tx: Transaction) {
+            const syncedAt = new Date();
             // Also fence admission for a first observation, before a PR row exists to lock.
             const [current] = await tx
               .select({ id: repositories.id })
@@ -371,6 +401,7 @@ export async function syncPullRequests(
               )
               .for("update");
             if (!current) throw new Error("Repository changed during refresh");
+            await lockReviewTriggerChanges(tx, repo.id);
             const [currentForge] = await tx
               .select({ updatedAt: forgeInstances.updatedAt })
               .from(forgeInstances)
@@ -413,31 +444,42 @@ export async function syncPullRequests(
                   setWhere: lte(pullRequests.syncedAt, listingStartedAt),
                 });
             }
-            for (const { number, observedAt } of closedObservations) {
+            for (const [number, observation] of closedObservations) {
               const [closed] = await tx
                 .update(pullRequests)
                 .set({
                   state: "closed",
                   syncedAt,
                   continuousReviewSince: null,
-                  reviewSessionResetAt: sql`greatest(${pullRequests.reviewSessionResetAt}, ${observedAt.toISOString()}::timestamptz)`,
+                  reviewSessionResetAt: sql`greatest(${pullRequests.reviewSessionResetAt}, ${observation.observedAt.toISOString()}::timestamptz)`,
                   triggerGeneration: sql`${pullRequests.triggerGeneration}+1`,
                 })
                 .where(
                   and(
                     eq(pullRequests.repositoryId, repo.id),
                     eq(pullRequests.state, "open"),
-                    // A webhook can capture a new PR after this provider snapshot began.
-                    lte(pullRequests.syncedAt, listingStartedAt),
+                    sql`xmin = ${observation.rowVersion}::xid`,
                     eq(pullRequests.number, number),
                   ),
                 )
                 .returning({ number: pullRequests.number });
-              if (closed)
-                await supersedeQueuedAutomaticReviews(tx, repo.id, number);
+              if (!closed) throw new ClosureChanged(number);
+              await supersedeQueuedAutomaticReviews(tx, repo.id, number);
             }
-          });
-          return true;
+          }
+          for (;;) {
+            try {
+              await database.transaction(saveSnapshot);
+              return true;
+            } catch (error) {
+              if (
+                !(error instanceof ClosureChanged) ||
+                Date.now() - listingStartedAt.getTime() >= 20000
+              )
+                throw error;
+              await observeClosure(error.number);
+            }
+          }
         },
       );
       if (!completed) failures.push(repo.publicId);

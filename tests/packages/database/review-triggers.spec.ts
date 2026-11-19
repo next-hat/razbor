@@ -13,6 +13,9 @@ import {
   listRepositories,
   listReviews,
   pendingDispatches,
+  processDeferredOpen,
+  processInteraction,
+  publicationView,
   listPullRequests,
   submitReview,
   webhookView,
@@ -483,6 +486,11 @@ test(
       target = "2".repeat(40),
       head = "3".repeat(40);
     let start = target;
+    let diffReady = false;
+    let closed = false;
+    let draftNote: { id: number; author_id: number; note: string } | undefined;
+    let hideDeletion = true;
+    let hookUrl: string | undefined;
     let origin = "";
     const server = createServer((req, res) => {
       const path = decodeURIComponent(
@@ -500,8 +508,14 @@ test(
           archived: false,
           visibility: "private",
         });
-      if (path.endsWith("/hooks"))
-        return send(req.method === "GET" ? [] : { id: 1 });
+      if (path.endsWith("/hooks") || path.endsWith("/hooks/1"))
+        return send(
+          req.method === "GET"
+            ? hookUrl
+              ? [{ id: 1, url: hookUrl }]
+              : []
+            : { id: 1 },
+        );
       if (path.endsWith("/merge_requests/27"))
         return send({
           iid: 27,
@@ -509,17 +523,26 @@ test(
           source_project_id: 2,
           target_project_id: 1,
           sha: head,
-          state: "opened",
+          state: closed ? "closed" : "opened",
           draft: false,
           title: "Fork MR",
           author: { id: 2, username: "alice" },
           web_url: origin + "/team/project/-/merge_requests/27",
           target_branch: "main",
           source_branch: "fork-branch",
-          diff_refs: { start_sha: start, base_sha: base, head_sha: head },
+          diff_refs: diffReady
+            ? { start_sha: start, base_sha: base, head_sha: head }
+            : {},
         });
       if (path.endsWith("/repository/branches/main"))
         return send({ name: "main", commit: { id: target } });
+      if (path.endsWith("/draft_notes"))
+        return send(draftNote ? [draftNote] : []);
+      if (path.endsWith("/draft_notes/41") && req.method === "DELETE") {
+        if (!hideDeletion) draftNote = undefined;
+        res.statusCode = 404;
+        return send({});
+      }
       if (path.endsWith("/notes"))
         return send(req.method === "GET" ? [] : { id: 51 });
       res.statusCode = 404;
@@ -568,21 +591,52 @@ test(
       const [repo] = await listRepositories(database);
       const hook = await webhookView(database, repo.id);
       assert.ok(hook);
-      const event = Buffer.from(
+      hookUrl = hook.callbackUrl;
+      const payload = {
+        object_kind: "merge_request",
+        project: { id: 1 },
+        user: { id: 2, username: "alice" },
+        object_attributes: {
+          action: "update",
+          iid: 27,
+          author_id: 2,
+          target_project_id: 1,
+          source_project_id: 2,
+          oldrev: "0".repeat(40),
+        },
+      };
+      const event = Buffer.from(JSON.stringify(payload));
+      const opening = Buffer.from(
         JSON.stringify({
-          object_kind: "merge_request",
-          project: { id: 1 },
-          user: { id: 2, username: "alice" },
-          object_attributes: {
-            action: "update",
-            iid: 27,
-            author_id: 2,
-            target_project_id: 1,
-            source_project_id: 2,
-            oldrev: "0".repeat(40),
-          },
+          ...payload,
+          object_attributes: { ...payload.object_attributes, action: "open" },
         }),
       );
+      assert.equal(
+        await acceptWebhook(database, hook.id, opening, {
+          "x-gitlab-token": secret,
+          "x-gitlab-event": "Merge Request Hook",
+          "webhook-id": "mr-open",
+        }),
+        202,
+      );
+      await processDeferredOpen(database);
+      assert.equal((await listReviews(database)).length, 0);
+      const restarted = connectDatabase(fixture.url);
+      try {
+        // Reapply identical webhook settings and confirm that the owned hook is still ready.
+        await applyWebhookSettings(restarted, config);
+        assert.equal((await webhookView(restarted, repo.id))?.setup, "ready");
+        // Make the saved retry due without waiting for the dispatcher interval.
+        await restarted.pool.query(
+          "update webhook_deliveries set open_retry_after = now() where delivery_id = 'mr-open' and pending_open is not null",
+        );
+        diffReady = true;
+        await processDeferredOpen(restarted);
+        assert.equal((await listReviews(restarted)).length, 1);
+      } finally {
+        await restarted.close();
+      }
       assert.equal(
         await acceptWebhook(database, hook.id, event, {
           "x-gitlab-token": secret,
@@ -617,6 +671,100 @@ test(
         "webhook-id": "mr-new-diff",
       });
       assert.equal((await listReviews(database)).length, 2);
+      // Disabling and re-enabling the hook revokes a deferred delivery even if
+      // the dispatcher is offline for both transitions.
+      start = "5".repeat(40);
+      diffReady = false;
+      assert.equal(
+        await acceptWebhook(database, hook.id, opening, {
+          "x-gitlab-token": secret,
+          "x-gitlab-event": "Merge Request Hook",
+          "webhook-id": "mr-revoked",
+        }),
+        202,
+      );
+      config.repositories.project.webhook!.enabled = false;
+      await applyWebhookSettings(database, config);
+      config.repositories.project.webhook!.enabled = true;
+      await applyWebhookSettings(database, config);
+      diffReady = true;
+      await processDeferredOpen(database);
+      const {
+        rows: [revoked],
+      } = await database.pool.query(
+        "select pending_open from webhook_deliveries where delivery_id = 'mr-revoked'",
+      );
+      assert.equal(revoked.pending_open, null);
+      const {
+        rows: [unchanged],
+      } = await database.pool.query(
+        "select start_sha from pull_requests where number = 27",
+      );
+      assert.equal(unchanged.start_sha, "4".repeat(40));
+      // Resume a closed MR after a draft creation lost its response, before any native submission.
+      await finishAttempt(
+        database,
+        review.id,
+        reservation.attemptId,
+        "fixture",
+        {
+          summary: "Saved result",
+          findings: [],
+        },
+      );
+      await database.pool.query(
+        "update dispatch_outbox set acknowledged_at = now(), publication = $1::jsonb where review_id = (select id from reviews where public_id = $2)",
+        [
+          JSON.stringify({
+            state: "failed",
+            mode: "review",
+            reviewPayload: {
+              body: "Saved result",
+              comments: [],
+              event: "COMMENT",
+            },
+            providerProgress: { "draft-0": { writing: true } },
+          }),
+          review.id,
+        ],
+      );
+      closed = true;
+      draftNote = {
+        id: 41,
+        author_id: 9,
+        note: `Finding\n\n<!-- razbor-gitlab-draft:${review.id}:0:${head} -->`,
+      };
+      await processInteraction(database, review.id);
+      const blocked = (await publicationView(database, review.id))?.publication;
+      assert.equal(blocked?.state, "failed");
+      assert.deepEqual(blocked?.providerProgress?.["draft-0"], { id: "41" });
+      draftNote.author_id = 8;
+      hideDeletion = false;
+      await processInteraction(database, review.id);
+      assert.equal(
+        (await publicationView(database, review.id))?.publication?.state,
+        "failed",
+      );
+      assert.ok(draftNote);
+      draftNote.author_id = 9;
+      await processInteraction(database, review.id);
+      assert.equal(draftNote, undefined);
+      const stale = (await publicationView(database, review.id))?.publication;
+      assert.equal(stale?.state, "stale");
+      assert.equal(stale?.mode, undefined);
+      assert.equal(stale?.providerProgress, undefined);
+      assert.equal(stale?.reviewPayload, undefined);
+      closed = false;
+      start = target;
+      await acceptWebhook(database, hook.id, event, {
+        "x-gitlab-token": secret,
+        "x-gitlab-event": "Merge Request Hook",
+        "webhook-id": "mr-restore-after-draft-cleanup",
+      });
+      const restored = (await publicationView(database, review.id))
+        ?.publication;
+      assert.equal(restored?.state, "pending");
+      assert.equal(restored?.rearmed, true);
     } finally {
       delete process.env.RAZBOR_TEST_MR_SECRET;
       await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -41,6 +41,7 @@ import type {
   ForgeType,
   ForgeChange,
   ForgePublicationProgress,
+  ForgeWebhook,
   InlineComment,
 } from "@razbor/forge-adapters";
 
@@ -1086,6 +1087,10 @@ export const webhookDeliveries = pgTable(
       .references(() => repositoryWebhooks.id),
     deliveryId: text("delivery_id").notNull(),
     closedCommandId: text("closed_command_id"),
+    pendingOpen: jsonb("pending_open").$type<
+      Extract<ForgeWebhook, { kind: "opened" }> & { hookUpdatedAt: string }
+    >(),
+    openRetryAfter: timestamp("open_retry_after", { withTimezone: true }),
     pendingAction: text("pending_action").$type<
       "review-history" | "closed-reply" | "posting-closed-reply"
     >(),
@@ -1095,6 +1100,9 @@ export const webhookDeliveries = pgTable(
   },
   (t) => [
     uniqueIndex("delivery_identity").on(t.webhookId, t.deliveryId),
+    index("delivery_due_open")
+      .on(t.openRetryAfter)
+      .where(sql`${t.openRetryAfter} is not null`),
     uniqueIndex("delivery_closed_command")
       .on(t.webhookId, t.closedCommandId)
       .where(sql`${t.closedCommandId} is not null`),

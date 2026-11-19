@@ -165,13 +165,32 @@ export async function syncStatusComment(
     if (latest?.phase !== phase || latest.head !== head) return;
     const body = statusBody(reviewId, phase, head, marker);
     if (state.remoteId) {
-      await api.editStatusComment(
-        change.number,
-        state.remoteId,
-        botId,
-        marker,
-        body,
-      );
+      try {
+        await api.editStatusComment(
+          change.number,
+          state.remoteId,
+          botId,
+          marker,
+          body,
+        );
+      } catch (error) {
+        if (!(error instanceof ForgeOperationError) || error.status !== 404)
+          throw error;
+        // A forge may conceal a permission error behind a 404. Only release the
+        // ID when the complete PR listing confirms both it and our marker are absent.
+        const visible = await api.comments(change.number, { complete: true });
+        if (
+          visible.some(
+            (comment) =>
+              comment.id === state.remoteId ||
+              (comment.user.id === botId &&
+                comment.body.endsWith(`\n${marker}`)),
+          )
+        )
+          throw error;
+        await save(null);
+        return;
+      }
     } else {
       const creating = { botId, creatingBody: body };
       await save(creating);

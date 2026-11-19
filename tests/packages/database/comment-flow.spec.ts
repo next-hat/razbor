@@ -144,11 +144,14 @@ test(
     let nextNoteId = 100;
     let loseStatusCreate = true;
     let loseStatusDelete = true;
+    let maskStatusEdit = false;
     const deletions: number[] = [];
     let head = "b".repeat(40);
     let open = true;
     let observedAt = new Date();
     let privateRepo = true;
+    let resetAtSubmission:
+      { reviewId: string; reset(): Promise<void> } | undefined;
     const bot = { id: 9, login: "razbor" };
     const server = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
@@ -195,7 +198,7 @@ test(
         if (id >= 100) {
           const index = posted.findIndex((note) => note.id === id);
           const note = posted[index];
-          if (!note) {
+          if (!note || (maskStatusEdit && req.method === "PATCH")) {
             res.statusCode = 404;
             return reply({});
           }
@@ -223,7 +226,16 @@ test(
           pull_request_url: `${origin}/team/project/pulls/7`,
         });
       }
-      if (route.endsWith("/pulls/7"))
+      if (route.endsWith("/pulls/7")) {
+        if (
+          resetAtSubmission &&
+          (await publicationView(db, resetAtSubmission.reviewId))?.publication
+            ?.writing
+        ) {
+          const reset = resetAtSubmission.reset;
+          resetAtSubmission = undefined;
+          await reset();
+        }
         return reply({
           number: 7,
           state: open ? "open" : "closed",
@@ -235,6 +247,7 @@ test(
           head: { sha: head },
           merge_base: "a".repeat(40),
         });
+      }
       if (route.endsWith("/issues/7/comments")) {
         if (req.method === "POST") {
           assert.equal((await listReviews(db)).length > 0, true);
@@ -435,7 +448,12 @@ test(
       assert.equal(attempt.kind, "started");
       if (attempt.kind !== "started") throw new Error();
       assert.equal(attempt.codebaseMemoryEnabled, false);
+      // A masked 404 with the original still visible must preserve its ID for a later edit.
+      maskStatusEdit = true;
       await processStatusComments(db);
+      assert.match(status.body, /Razbor review queued/);
+      maskStatusEdit = false;
+      await retryStatus();
       assert.match(status.body, /Razbor is reviewing/);
       assert.match(human.body, /Razbor review queued/);
       await finishAttempt(db, review.id, attempt.attemptId, "test", {
@@ -492,9 +510,22 @@ test(
       assert.equal(await deliver("fresh", 11), 202);
       const next = (await listReviews(db))[0];
       await processStatusComments(db);
+      const missingIndex = posted.findIndex((note) =>
+        note.body.endsWith(`<!-- razbor:${next.id}:status -->`),
+      );
+      assert.ok(missingIndex >= 0);
+      const [removed] = posted.splice(missingIndex, 1);
       const second = await beginAttempt(db, next.id, "test", 30000);
       assert.equal(second.kind, "started");
       if (second.kind !== "started") throw new Error();
+      await processStatusComments(db);
+      await processStatusComments(db);
+      const replacements = posted.filter((note) =>
+        note.body.endsWith(`<!-- razbor:${next.id}:status -->`),
+      );
+      assert.equal(replacements.length, 1);
+      assert.notEqual(replacements[0].id, removed.id);
+      assert.match(replacements[0].body, /Razbor is reviewing/);
       await finishAttempt(db, next.id, second.attemptId, "test", {
         summary: "",
         findings: [],
@@ -595,6 +626,9 @@ test(
         (await lifecycle("reopened", "reopen-at-reviewed-revision")) < 300,
       );
       assert.equal((await listReviews(db)).length, count);
+      const reopened = (await publicationView(db, next.id))?.publication;
+      assert.equal(reopened?.state, "pending");
+      assert.equal(reopened.rearmed, true);
       // The provider moved again before the rearmed result could be published.
       head = "c".repeat(40);
       await processInteraction(db, next.id);
@@ -657,16 +691,29 @@ test(
       const running = await beginAttempt(db, beforeClose.id, "test", 30000);
       assert.equal(running.kind, "started");
       if (running.kind !== "started") throw new Error();
-      open = false;
-      observedAt = new Date(observedAt.getTime() + 1000);
-      assert.ok((await lifecycle("closed", "close-running")) < 300);
-      open = true;
-      observedAt = new Date(observedAt.getTime() + 1000);
-      assert.ok((await lifecycle("reopened", "reopen-without-opt-in")) < 300);
+      resetAtSubmission = {
+        reviewId: beforeClose.id,
+        /** Close and reopen at the same revision after the publisher saves its native-write checkpoint. */
+        async reset() {
+          open = false;
+          observedAt = new Date(observedAt.getTime() + 1000);
+          assert.ok(
+            (await lifecycle("closed", "close-before-submission")) < 300,
+          );
+          open = true;
+          observedAt = new Date(observedAt.getTime() + 1000);
+          assert.ok(
+            (await lifecycle("reopened", "reopen-without-opt-in")) < 300,
+          );
+        },
+      };
       await finishAttempt(db, beforeClose.id, running.attemptId, "test", {
         summary: "From the previous open session",
         findings: [],
       });
+      await processInteraction(db, beforeClose.id);
+      assert.equal(resetAtSubmission, undefined);
+      assert.equal(reviewWrites, 3);
       await processInteraction(db, beforeClose.id);
       assert.equal(
         (await publicationView(db, beforeClose.id))?.publication?.state,

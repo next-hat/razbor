@@ -218,6 +218,13 @@
       "when": 1790000000030,
       "tag": "0030_webhook_delivery_actions",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790000000031,
+      "tag": "0031_deferred_open_deliveries",
+      "breakpoints": true
     }
   ]
 }

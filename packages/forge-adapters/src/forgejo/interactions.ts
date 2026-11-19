@@ -739,28 +739,35 @@ export class ForgejoInteractions implements Forge {
       comments.some((comment) => comment.lineStart < comment.lineEnd) &&
       (await this.supportsLineRanges());
     if (publication) await reviewRevision(this, n, head, publication);
-    try {
-      return z.object({ id }).parse(
-        await this.request(`${this.route}/pulls/${n}/reviews`, "POST", {
-          event,
-          commit_id: head,
-          body: reviewBody,
-          comments: comments.map((comment) => ({
-            path: comment.path,
-            body: comment.body,
-            new_position: ranges ? comment.lineStart : comment.lineEnd,
-            old_position: 0,
-            ...(ranges
-              ? { extra_lines_count: comment.lineEnd - comment.lineStart }
-              : {}),
-          })),
-        }),
-      ).id;
-    } catch (error) {
-      if (error instanceof ForgeOperationError && error.reason === "permission")
-        throw error;
-      throw new ForgeOperationError("unavailable", true);
-    }
+    /** Send the native review and classify an ambiguous response conservatively. */
+    const write = async () => {
+      try {
+        return z.object({ id }).parse(
+          await this.request(`${this.route}/pulls/${n}/reviews`, "POST", {
+            event,
+            commit_id: head,
+            body: reviewBody,
+            comments: comments.map((comment) => ({
+              path: comment.path,
+              body: comment.body,
+              new_position: ranges ? comment.lineStart : comment.lineEnd,
+              old_position: 0,
+              ...(ranges
+                ? { extra_lines_count: comment.lineEnd - comment.lineStart }
+                : {}),
+            })),
+          }),
+        ).id;
+      } catch (error) {
+        if (
+          error instanceof ForgeOperationError &&
+          error.reason === "permission"
+        )
+          throw error;
+        throw new ForgeOperationError("unavailable", true);
+      }
+    };
+    return publication?.submit ? publication.submit(write) : write();
   }
   /**
    * Replace the bot-owned review's timeline comment, preserving the native

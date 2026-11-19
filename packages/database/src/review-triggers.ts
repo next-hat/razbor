@@ -39,6 +39,7 @@ type Observation = {
   previous?: PreviousFinding[];
   conversation?: ReviewConversation;
   commandAt?: string;
+  waitingForDiff?: boolean;
 };
 
 /** Match a redelivery or an already declined command replayed under a different delivery ID. */
@@ -111,11 +112,43 @@ export async function supersedeQueuedAutomaticReviews(
       );
 }
 
+/** Name the session lock held only while submitting a new policy-authorized native verdict. */
+export function reviewSubmissionLock(repositoryId: string) {
+  return `review-submission:${repositoryId}`;
+}
+
+/** Allow concurrent session writers, ordered before or after a native submission for this repository. */
+export async function lockReviewTriggerChanges(
+  tx: Transaction,
+  repositoryId: string,
+) {
+  await tx.execute(
+    sql`select pg_advisory_xact_lock_shared(748322, hashtext(${reviewSubmissionLock(repositoryId)}))`,
+  );
+}
+
 /** Reset opt-ins and retire waiting automatic jobs under the caller's owning repository lock when policy changes. */
 export async function resetRepositoryReviewTriggers(
   tx: Transaction,
   repositoryId: string,
 ) {
+  await lockReviewTriggerChanges(tx, repositoryId);
+  // A later policy applies to new deliveries, including when the previous one has not obtained its diff yet.
+  await tx
+    .update(webhookDeliveries)
+    .set({ pendingOpen: null, openRetryAfter: null })
+    .where(
+      and(
+        sql`${webhookDeliveries.openRetryAfter} is not null`,
+        inArray(
+          webhookDeliveries.webhookId,
+          tx
+            .select({ id: repositoryWebhooks.id })
+            .from(repositoryWebhooks)
+            .where(eq(repositoryWebhooks.repositoryId, repositoryId)),
+        ),
+      ),
+    );
   await tx
     .update(pullRequests)
     .set({
@@ -319,6 +352,7 @@ export async function acceptReviewTrigger(
       active.reviewTriggerMode !== repo.reviewTriggerMode
     )
       throw new Error("Repository policy changed");
+    await lockReviewTriggerChanges(tx, repo.id);
     const [current] = await tx
       .select()
       .from(repositoryWebhooks)
@@ -344,7 +378,19 @@ export async function acceptReviewTrigger(
       .select()
       .from(webhookDeliveries)
       .where(triggerDelivery(hook.id, event));
-    if (receipt && receipt.pendingAction !== "review-history") {
+    if (
+      receipt?.pendingOpen &&
+      (event.kind !== "opened" ||
+        receipt.pendingOpen.number !== event.number ||
+        receipt.pendingOpen.repositoryId !== event.repositoryId ||
+        receipt.pendingOpen.hookUpdatedAt !== hook.updatedAt.toISOString())
+    )
+      return { duplicate: true } as const;
+    if (
+      receipt &&
+      !receipt.pendingOpen &&
+      receipt.pendingAction !== "review-history"
+    ) {
       if (
         receipt.pendingAction &&
         event.kind === "comment" &&
@@ -360,16 +406,32 @@ export async function acceptReviewTrigger(
         .onConflictDoNothing()
         .returning();
       if (!receipt) return { duplicate: true } as const;
-    } else {
-      await tx
-        .update(webhookDeliveries)
-        .set({ pendingAction: null })
-        .where(eq(webhookDeliveries.id, receipt.id));
     }
+    if (observation.waitingForDiff && receipt.pendingOpen)
+      return { waitingForDiff: true } as const;
     await tx
       .update(repositoryWebhooks)
       .set({ lastDelivery: "accepted", lastDeliveryAt: new Date() })
       .where(eq(repositoryWebhooks.id, hook.id));
+    if (observation.waitingForDiff && event.kind === "opened") {
+      await tx
+        .update(webhookDeliveries)
+        .set({
+          pendingOpen: {
+            ...event,
+            hookUpdatedAt: hook.updatedAt.toISOString(),
+          },
+          openRetryAfter: new Date(),
+        })
+        .where(eq(webhookDeliveries.id, receipt.id));
+      return { waitingForDiff: true } as const;
+    }
+    if (receipt.pendingAction || receipt.pendingOpen) {
+      await tx
+        .update(webhookDeliveries)
+        .set({ pendingAction: null, pendingOpen: null, openRetryAfter: null })
+        .where(eq(webhookDeliveries.id, receipt.id));
+    }
     if (event.kind === "comment") {
       const [prior] = await tx
         .select({ id: reviews.publicId })

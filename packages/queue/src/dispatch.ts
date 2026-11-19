@@ -1,4 +1,5 @@
 import {
+  processDeferredOpen,
   processInteractions,
   processStatusComments,
   pendingDispatches,
@@ -164,12 +165,19 @@ export function startDispatcher(
   let stopping = false;
   let current: Promise<void> | undefined;
   let comments: Promise<void> | undefined;
+  let deferredOpen: Promise<void> | undefined;
   /**
    * Run one reconciliation pass unless stopping or already busy, forwarding
    * failures to the caller's handler.
    */
   const tick = () => {
     if (stopping) return;
+    if (!deferredOpen)
+      deferredOpen = processDeferredOpen(database)
+        .catch(onError)
+        .finally(() => {
+          deferredOpen = undefined;
+        });
     // Optional forge writes use the same timer but never gate execution or
     // publication. Each branch has at most one outstanding batch per process.
     if (!comments)
@@ -195,6 +203,6 @@ export function startDispatcher(
   return async () => {
     stopping = true;
     clearInterval(timer);
-    await Promise.all([current, comments]);
+    await Promise.all([current, comments, deferredOpen]);
   };
 }
