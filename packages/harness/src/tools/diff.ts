@@ -176,9 +176,11 @@ function hunkPosition(patch: string, offset: number) {
 
 /** Identify a file's full change even when Git uses a different number of context lines. */
 function patchIdentity(patch: string) {
-  const changes = patch
-    .split("\n")
-    .filter((line) => !line.startsWith(" ") && !line.startsWith("@@"));
+  const changes = patch.split("\n").filter((line, i, lines) => {
+    if (line === "\\ No newline at end of file")
+      return /^[+-]/.test(lines[i - 1] ?? "");
+    return !line.startsWith(" ") && !line.startsWith("@@");
+  });
   return createHash("sha256").update(changes.join("\n")).digest("hex");
 }
 

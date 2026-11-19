@@ -273,10 +273,20 @@ for (const provider of ["openai", "anthropic"] as const) {
         },
         (payload) => {
           assertFinalization(provider, payload, definitions);
-          return {};
+          return {
+            text: JSON.stringify({
+              ...result,
+              mergeAssessment: readyAssessment,
+            }),
+          };
         },
       ]);
-      assert.equal((await f.review({ maxTurns: 2 })).findings.length, 0);
+      const review = await f.review({
+        maxTurns: 2,
+        mergePolicy: { version: 1, policy: mergePolicySchema.parse({}) },
+      });
+      assert.equal(review.findings.length, 0);
+      assert.deepEqual(review.mergeAssessment, readyAssessment);
       assert.equal(f.calls, 2);
     },
   );
@@ -529,6 +539,14 @@ for (const inspection of [
   test("lazy merge assessment after inspecting " + inspection, async (t) => {
     const complete = inspection.startsWith("both");
     const steps: ((payload: Payload) => Reply)[] = [];
+    if (inspection.includes("read_diff"))
+      steps.push(() => ({
+        call: {
+          id: "bad-cursor",
+          name: "read_diff",
+          args: { paths: ["source.ts"], cursor: "unknown" },
+        },
+      }));
     if (inspection !== "manifest only") {
       steps.push(() => {
         if (inspection === "one head file")
@@ -582,6 +600,17 @@ for (const inspection of [
       };
     });
     const f = await fixture(t, "openai", steps);
+    if (inspection === "both pinned exec patches") {
+      // Only the prepared five-line context reaches the unterminated last line.
+      const lines = Array.from(
+        { length: 10 },
+        (_, i) => "unchanged " + (i + 1),
+      );
+      await f.files.write("source.ts", lines.join("\n"));
+      f.files.base = await f.files.commit();
+      lines[4] = "new implementation";
+      await f.files.write("source.ts", lines.join("\n"));
+    }
     await f.files.write("related.ts", "new related behavior\n");
     f.files.head = await f.files.commit();
     const snapshot = {
@@ -683,15 +712,32 @@ test("failed verification is retained even when the model claims full merge read
         /"exitCode":1\b/,
       );
       return {
+        call: {
+          id: "bad-cursor",
+          name: "read_diff",
+          args: { paths: ["source.ts"], cursor: "unknown" },
+        },
+      };
+    },
+    () => ({
+      call: { id: "retry", name: "read_diff", args: { paths: ["source.ts"] } },
+    }),
+    () => {
+      return {
         text: JSON.stringify({ ...result, mergeAssessment: readyAssessment }),
       };
     },
   ]);
   const returned = await f.review({
+    initialDiffMaxBytes: 0,
     mergePolicy: { version: 1, policy: mergePolicySchema.parse({}) },
   });
   assert.equal(returned.mergeAssessment?.reviewComplete, false);
   assert.equal(returned.mergeAssessment?.requiresHumanReview, true);
+  assert.doesNotMatch(
+    returned.mergeAssessment!.verificationGaps.join(" "),
+    /read_diff tool failed/,
+  );
   assert.match(
     returned.mergeAssessment!.verificationGaps.join(" "),
     /exec tool failed/,

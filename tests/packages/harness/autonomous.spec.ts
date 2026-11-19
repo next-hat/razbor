@@ -372,6 +372,16 @@ test("an oversized tool batch is rejected before its first command side effect",
         return {
           summary:
             "Inspection incomplete: requested commands were not executed because of the tool limit.",
+          mergeAssessment: {
+            confidence: 95,
+            riskLevel: "low",
+            reviewComplete: true,
+            requiresHumanReview: false,
+            reasons: ["The model reported a complete review."],
+            criticalAreas: [],
+            verificationGaps: [],
+            suggestedReviewers: [],
+          },
           findings: [],
         };
       },
@@ -380,6 +390,11 @@ test("an oversized tool batch is rejected before its first command side effect",
       ...options,
       reviewBudget: { maxToolCalls: 1 },
     });
+    assert.equal(limited.mergeAssessment?.requiresHumanReview, true);
+    assert.match(
+      limited.mergeAssessment!.verificationGaps.join(" "),
+      /requested tool batch/,
+    );
     assert.match(limited.summary, /Inspection limitation/);
     assert.equal(model.calls, 2);
     await assert.rejects(access(marker));

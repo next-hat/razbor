@@ -604,6 +604,7 @@ export async function reviewRepository(
     };
     let budgetNotice: ModelMessage | undefined;
     let finalizationReason: string | undefined;
+    let declinedToolBatch: string | undefined;
     let boundedOutput = false;
     const failedTools = new Set<string>();
     /** Replaces the transient budget note so repeated status never grows the transcript. */
@@ -786,6 +787,9 @@ export async function reviewRepository(
       }
       config.signal?.throwIfAborted();
       if (failed) failedTools.add(toolName);
+      // A valid diff retry recovers the operation. The final per-file evidence
+      // check still blocks partial coverage, including missed continuation pages.
+      else if (call.name === "read_diff") failedTools.delete("read_diff");
       const evidenceId = `tool-${toolNumber}`;
       /** Serializes one correlated observation so headroom includes JSON escaping. */
       const messageFor = (value: string) => ({
@@ -1023,6 +1027,7 @@ export async function reviewRepository(
         ) {
           finalizationReason =
             "requested tool batch would consume the remaining tool budget or final-response headroom";
+          declinedToolBatch = finalizationReason;
           // Correlate every unexecuted request without inventing command outcomes.
           for (const call of response.calls)
             input.push({
@@ -1142,7 +1147,7 @@ export async function reviewRepository(
             ? ["A requested source range was only partially inspected."]
             : []),
           ...(boundedOutput ? ["Tool evidence was truncated."] : []),
-          ...(finalizationReason ? [finalizationReason] : []),
+          ...(declinedToolBatch ? [declinedToolBatch] : []),
           ...[...failedTools]
             .sort()
             .map((name) => `The ${name} tool failed during investigation.`),
