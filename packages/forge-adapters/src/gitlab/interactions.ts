@@ -969,7 +969,8 @@ export class GitlabForge implements Forge {
         if (
           !sent ||
           (error instanceof ForgeOperationError &&
-            [401, 403, 404, 405].includes(error.status ?? 0))
+            ((!error.uncertain && error.status === undefined) ||
+              [401, 403, 404, 405].includes(error.status ?? 0)))
         ) {
           progress.bulk = {};
           await publication.save(progress);

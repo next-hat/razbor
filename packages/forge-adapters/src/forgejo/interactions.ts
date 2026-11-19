@@ -741,6 +741,8 @@ export class ForgejoInteractions implements Forge {
     if (publication) await reviewRevision(this, n, head, publication);
     /** Send the native review and classify an ambiguous response conservatively. */
     const write = async () => {
+      if (Date.now() >= this.deadline)
+        throw new ForgeOperationError("unavailable");
       try {
         return z.object({ id }).parse(
           await this.request(`${this.route}/pulls/${n}/reviews`, "POST", {
